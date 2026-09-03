@@ -1,5 +1,6 @@
 package com.immineal.hdri360.core.pano
 
+import com.immineal.hdri360.core.Parallel
 import com.immineal.hdri360.core.image.ImageF
 import com.immineal.hdri360.core.image.ImageOps
 import com.immineal.hdri360.core.math.Vec3
@@ -133,7 +134,8 @@ object PanoramaRenderer {
             cosLimit[i] = Math.cos(Math.min(Math.PI, f.intrinsics.maxAngleFromAxisRad() + 1e-3))
         }
 
-        for (y in 0 until sh) {
+        Parallel.forRanges(sh, 512) { bandFrom, bandTo ->
+        for (y in bandFrom until bandTo) {
             for (x in 0 until sw) {
                 val i = y * sw + x
                 val dir = Equirect.direction(x.toDouble(), y.toDouble(), sw, sh)
@@ -170,6 +172,7 @@ object PanoramaRenderer {
                 }
             }
         }
+        }
 
         val solved = SeamFinder.solve(problem, cfg.seam)
         val share = featherRegions(problem, solved.labels, cfg.seamFeather)
@@ -191,7 +194,8 @@ object PanoramaRenderer {
         val radius = Math.max(1, Math.ceil(featherPx).toInt())
         val w = p.width
         val h = p.height
-        for (y in 0 until h) {
+        Parallel.forRanges(h, 512) { bandFrom, bandTo ->
+        for (y in bandFrom until bandTo) {
             for (x in 0 until w) {
                 val i = y * w + x
                 val n = p.count[i]
@@ -223,6 +227,7 @@ object PanoramaRenderer {
                 // Normalise so the shares of a direction always sum to one.
                 if (total > 0) for (c in 0 until n) share[base + c] = (share[base + c] / total).toFloat()
             }
+        }
         }
         return share
     }
@@ -259,8 +264,6 @@ object PanoramaRenderer {
         val out = ImageF(w, rows, channels)
         val coverage = FloatArray(w * rows)
         val contributors = ShortArray(w * rows)
-        val acc = DoubleArray(channels)
-
         // Precompute each frame's viewing cone so the inner loop can reject the
         // frames that cannot possibly see a direction with one dot product. With
         // thirty-odd frames on a sphere this is the difference between a few
@@ -274,7 +277,9 @@ object PanoramaRenderer {
             cosLimit[i] = Math.cos(Math.min(Math.PI, f.intrinsics.maxAngleFromAxisRad() + 1e-3))
         }
 
-        for (y in rowStart until rowEnd) {
+        Parallel.forRanges(rowEnd - rowStart) { bandFrom, bandTo ->
+        val acc = DoubleArray(channels)
+        for (y in rowStart + bandFrom until rowStart + bandTo) {
             for (x in 0 until w) {
                 val dir = Equirect.direction(x.toDouble(), y.toDouble(), w, h)
                 Arrays.fill(acc, 0.0)
@@ -322,6 +327,7 @@ object PanoramaRenderer {
                 if (wsum > 0)
                     for (c in 0 until channels) out.data[i * channels + c] = (acc[c] / wsum).toFloat()
             }
+        }
         }
         return Result(out, coverage, contributors)
     }

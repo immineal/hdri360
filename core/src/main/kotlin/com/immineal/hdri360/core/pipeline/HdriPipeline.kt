@@ -1,5 +1,6 @@
 package com.immineal.hdri360.core.pipeline
 
+import com.immineal.hdri360.core.Parallel
 import com.immineal.hdri360.core.camera.Intrinsics
 import com.immineal.hdri360.core.hdr.Exposure
 import com.immineal.hdri360.core.hdr.HdrMerger
@@ -159,40 +160,56 @@ object HdriPipeline {
         report(progress, "merging", 0.0)
 
         // 1. Merge brackets.
-        val merges = ArrayList<MergeResult>(n)
-        for (i in 0 until n) {
-            merges.add(HdrMerger.merge(inputs[i].bracket, opt.merge))
-            report(progress, "merging", (i + 1) / n.toDouble())
+        val mergedArr = arrayOfNulls<MergeResult>(n)
+        val mergeDone = java.util.concurrent.atomic.AtomicInteger()
+        Parallel.forEach(n) { i ->
+            mergedArr[i] = HdrMerger.merge(inputs[i].bracket, opt.merge)
+            report(progress, "merging", mergeDone.incrementAndGet() / n.toDouble())
         }
+        val merges = ArrayList<MergeResult>(n)
+        for (i in 0 until n) merges.add(mergedArr[i]!!)
 
         // 2. Features.
         report(progress, "features", 0.0)
         val features = arrayOfNulls<FeatureSet>(n)
         val workingIntrinsics = arrayOfNulls<Intrinsics>(n)
-        for (i in 0 until n) {
+        val featureDone = java.util.concurrent.atomic.AtomicInteger()
+        Parallel.forEach(n) { i ->
             val det = DetectionImage.build(merges[i].radiance, opt.featureWorkingWidth)
             val fc = FastCornerDetector.Config()
             fc.threshold = opt.fastThreshold
             fc.maxFeatures = opt.maxFeaturesPerFrame
             features[i] = FeatureSet.describe(det.image, FastCornerDetector.detect(det.image, fc))
             workingIntrinsics[i] = inputs[i].intrinsics.scaled(det.scale)
-            report(progress, "features", (i + 1) / n.toDouble())
+            report(progress, "features", featureDone.incrementAndGet() / n.toDouble())
         }
 
         // 3. Pairwise rotations.
         report(progress, "matching", 0.0)
-        val pairs = ArrayList<PairResult>()
-        val correspondences = ArrayList<RotationBundleAdjuster.Correspondence>()
         val mc = BriefMatcher.Config()
         val totalPairs = n * (n - 1) / 2
-        var donePairs = 0
-        for (i in 0 until n) {
-            for (j in i + 1 until n) {
-                donePairs++
-                report(progress, "matching", donePairs / Math.max(1, totalPairs).toDouble())
-                val matches = BriefMatcher.match(features[i]!!, features[j]!!, mc)
-                if (matches.size < opt.minPairMatches) continue
 
+        // Enumerate the pairs first, keeping each one's sequential position. The
+        // RANSAC seed is derived from that position, so the result of a pair does
+        // not depend on when it happens to be scheduled.
+        val pairI = IntArray(totalPairs)
+        val pairJ = IntArray(totalPairs)
+        run {
+            var k = 0
+            for (i in 0 until n) for (j in i + 1 until n) { pairI[k] = i; pairJ[k] = j; k++ }
+        }
+
+        val solvedPair = arrayOfNulls<PairResult>(totalPairs)
+        val pairCorr = arrayOfNulls<List<RotationBundleAdjuster.Correspondence>>(totalPairs)
+        val matchDone = java.util.concurrent.atomic.AtomicInteger()
+
+        Parallel.forEach(totalPairs) { k ->
+            val i = pairI[k]
+            val j = pairJ[k]
+            report(progress, "matching",
+                matchDone.incrementAndGet() / Math.max(1, totalPairs).toDouble())
+            val matches = BriefMatcher.match(features[i]!!, features[j]!!, mc)
+            if (matches.size >= opt.minPairMatches) {
                 val from = ArrayList<Vec3>(matches.size)
                 val to = ArrayList<Vec3>(matches.size)
                 val pixelsFrom = ArrayList<DoubleArray>(matches.size)
@@ -207,17 +224,30 @@ object HdriPipeline {
                 }
                 val ransac = RotationSolver.ransac(from, to,
                     Math.toRadians(opt.ransacThresholdDeg), opt.ransacIterations,
-                    opt.seed + 31L * donePairs)
-                if (ransac == null || ransac.inlierCount < opt.minPairInliers) continue
-
-                pairs.add(PairResult(i, j, matches.size, ransac.inlierCount, ransac.rotation))
-                for (m in from.indices)
-                    if (ransac.inliers[m])
-                        correspondences.add(RotationBundleAdjuster.Correspondence(
-                            i, j, from[m], to[m], 1.0,
-                            if (opt.solveDistortion) pixelsFrom[m] else null,
-                            if (opt.solveDistortion) pixelsTo[m] else null))
+                    opt.seed + 31L * (k + 1))
+                if (ransac != null && ransac.inlierCount >= opt.minPairInliers) {
+                    solvedPair[k] = PairResult(i, j, matches.size, ransac.inlierCount,
+                        ransac.rotation)
+                    val cs = ArrayList<RotationBundleAdjuster.Correspondence>()
+                    for (m in from.indices)
+                        if (ransac.inliers[m])
+                            cs.add(RotationBundleAdjuster.Correspondence(
+                                i, j, from[m], to[m], 1.0,
+                                if (opt.solveDistortion) pixelsFrom[m] else null,
+                                if (opt.solveDistortion) pixelsTo[m] else null))
+                    pairCorr[k] = cs
+                }
             }
+        }
+
+        // Assembled in pair order, never in completion order: the spanning tree and
+        // the bundle adjustment both depend on it.
+        val pairs = ArrayList<PairResult>()
+        val correspondences = ArrayList<RotationBundleAdjuster.Correspondence>()
+        for (k in 0 until totalPairs) {
+            val pr = solvedPair[k] ?: continue
+            pairs.add(pr)
+            pairCorr[k]?.let { correspondences.addAll(it) }
         }
 
         // 4. Initial poses from a maximum spanning tree over the pair graph.
@@ -442,8 +472,10 @@ object HdriPipeline {
         return w - (w % 2)
     }
 
+    /** Progress can now be reported from several threads; serialise it for callers. */
     private fun report(p: Progress?, stage: String, fraction: Double) {
-        p?.stage(stage, fraction)
+        if (p == null) return
+        synchronized(p) { p.stage(stage, fraction) }
     }
 
     /** Convenience for callers that just want the frames in capture order. */

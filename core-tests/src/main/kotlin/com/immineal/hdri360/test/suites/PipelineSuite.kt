@@ -1,5 +1,6 @@
 package com.immineal.hdri360.test.suites
 
+import com.immineal.hdri360.core.Parallel
 import com.immineal.hdri360.core.camera.Intrinsics
 import com.immineal.hdri360.core.hdr.Exposure
 import com.immineal.hdri360.core.image.ImageF
@@ -192,6 +193,50 @@ class PipelineSuite : TestCase {
         for (i in 0 until 3)
             t.lessThan(Math.toDegrees(SO3.angleBetween(truth[i], pres.rotations[i])), 1e-6,
                 "a featureless frame falls back on its orientation prior")
+
+        // --- more cores must not change a single number ------------------------------
+        // The merge, the feature pass and the pairwise matching all run across
+        // cores now. Everything order-dependent - the pair list, the correspondence
+        // list, the RANSAC seed of each pair - is assembled by pair index rather
+        // than by completion order, and this is what holds that to account.
+        run {
+            val det = HdriPipeline.Options()
+            det.panoramaWidth = 512
+            det.featureWorkingWidth = 240
+            det.featherPx = 25.0
+            det.seed = 99
+            val restore = Parallel.threads
+            try {
+                Parallel.threads = 1
+                val single = HdriPipeline.process(inputs, det, null)
+                Parallel.threads = Math.max(2, Runtime.getRuntime().availableProcessors())
+                val many = HdriPipeline.process(inputs, det, null)
+
+                t.eq(single.pairs.size.toLong(), many.pairs.size.toLong(),
+                    "the same pairs are solved however many threads run")
+                var worstPose = 0.0
+                for (i in single.rotations.indices)
+                    worstPose = Math.max(worstPose, Math.toDegrees(
+                        SO3.angleBetween(single.rotations[i], many.rotations[i])))
+                t.near(0.0, worstPose, 0.0, "every recovered pose is bit-identical")
+                var worstGain = 0.0
+                for (i in single.gains.indices)
+                    worstGain = Math.max(worstGain, Math.abs(single.gains[i] - many.gains[i]))
+                t.near(0.0, worstGain, 0.0, "every photometric gain is bit-identical")
+                t.near(single.baRmsDeg, many.baRmsDeg, 0.0, "so is the bundle residual")
+                t.near(single.k1, many.k1, 0.0, "and the recovered distortion")
+
+                var differing = 0
+                for (i in single.panorama.data.indices)
+                    if (single.panorama.data[i] != many.panorama.data[i]) differing++
+                t.eq(0L, differing.toLong(),
+                    "and the panorama is identical to the last bit, not merely close")
+                t.note("threads 1 vs " + Parallel.threads + ": " + differing +
+                        " of " + single.panorama.data.size + " samples differ")
+            } finally {
+                Parallel.threads = restore
+            }
+        }
 
         // --- validation ------------------------------------------------------------------
         t.throwsException({ HdriPipeline.process(ArrayList(), opt, null) },

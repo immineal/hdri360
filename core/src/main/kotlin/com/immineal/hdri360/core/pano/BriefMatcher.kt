@@ -35,31 +35,29 @@ object BriefMatcher {
         val out = ArrayList<Match>()
         if (a.size() == 0 || b.size() == 0) return out
 
+        // One pass over the cross product, not two. The cross-check needs each b's
+        // nearest a, which the same distances already determine; computing them
+        // again doubled the cost of the single most expensive stage in the
+        // pipeline. Tie-breaking is unchanged: i still increases monotonically for
+        // any fixed j, and only a strictly smaller distance displaces the
+        // incumbent, so the first minimum still wins.
         val bestB = IntArray(a.size())
         val bestDist = IntArray(a.size())
         val secondDist = IntArray(a.size())
+        val crossCheck = cfg.crossCheck
+        val reverseBest = if (crossCheck) IntArray(b.size()) { -1 } else null
+        val reverseDist = if (crossCheck) IntArray(b.size()) { Int.MAX_VALUE } else null
+
         for (i in 0 until a.size()) {
             bestB[i] = -1
             bestDist[i] = Int.MAX_VALUE
             secondDist[i] = Int.MAX_VALUE
+            val da = a.descriptors[i]
             for (j in 0 until b.size()) {
-                val d = hamming(a.descriptors[i], b.descriptors[j])
+                val d = hamming(da, b.descriptors[j])
                 if (d < bestDist[i]) { secondDist[i] = bestDist[i]; bestDist[i] = d; bestB[i] = j }
                 else if (d < secondDist[i]) secondDist[i] = d
-            }
-        }
-
-        var reverseBest: IntArray? = null
-        if (cfg.crossCheck) {
-            reverseBest = IntArray(b.size())
-            for (j in 0 until b.size()) {
-                var best = Int.MAX_VALUE
-                var arg = -1
-                for (i in 0 until a.size()) {
-                    val d = hamming(a.descriptors[i], b.descriptors[j])
-                    if (d < best) { best = d; arg = i }
-                }
-                reverseBest[j] = arg
+                if (crossCheck && d < reverseDist!![j]) { reverseDist[j] = d; reverseBest!![j] = i }
             }
         }
 
