@@ -18,6 +18,9 @@ import com.immineal.hdri360.test.suites.BundleAdjustSuite
 import com.immineal.hdri360.test.suites.FeatureSuite
 import com.immineal.hdri360.test.suites.HorizonSuite
 import com.immineal.hdri360.test.suites.BlendSuite
+import com.immineal.hdri360.test.suites.WriterSuite
+import com.immineal.hdri360.test.suites.StreamingSuite
+import com.immineal.hdri360.test.suites.PipelineSuite
 import java.io.PrintWriter
 import java.io.StringWriter
 import java.util.Locale
@@ -53,11 +56,11 @@ object TestRunner {
         "HorizonSuite" to ::HorizonSuite,
         "BlendSuite" to ::BlendSuite,
         "PhotometricSuite" to ::PhotometricSuite,
-        "WriterSuite" to null,
-        "StreamingSuite" to null,
+        "WriterSuite" to ::WriterSuite,
+        "StreamingSuite" to ::StreamingSuite,
         "ToneMapSuite" to ::ToneMapSuite,
         "OrientationSuite" to ::OrientationSuite,
-        "PipelineSuite" to null,
+        "PipelineSuite" to ::PipelineSuite,
     )
 
     /** @return a human-readable report; throws AssertionError if anything failed. */
