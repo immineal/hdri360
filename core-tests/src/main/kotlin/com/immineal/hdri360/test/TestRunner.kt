@@ -14,6 +14,7 @@ import com.immineal.hdri360.test.suites.CapturePlanSuite
 import com.immineal.hdri360.test.suites.OrientationSuite
 import com.immineal.hdri360.test.suites.RotationSolveSuite
 import com.immineal.hdri360.test.suites.PhotometricSuite
+import com.immineal.hdri360.test.suites.PhotometrySuite
 import com.immineal.hdri360.test.suites.BundleAdjustSuite
 import com.immineal.hdri360.test.suites.DistortionSuite
 import com.immineal.hdri360.test.suites.FeatureSuite
@@ -49,6 +50,7 @@ object TestRunner {
         "MergeSuite" to ::MergeSuite,
         "ResponseCurveSuite" to ::ResponseCurveSuite,
         "VignetteSuite" to ::VignetteSuite,
+        "PhotometrySuite" to ::PhotometrySuite,
         "CapturePlanSuite" to ::CapturePlanSuite,
         "FeatureSuite" to ::FeatureSuite,
         "RotationSolveSuite" to ::RotationSolveSuite,

@@ -5,6 +5,7 @@ import com.immineal.hdri360.core.hdr.Exposure
 import com.immineal.hdri360.core.hdr.ToneMapper
 import com.immineal.hdri360.core.image.ImageF
 import com.immineal.hdri360.core.image.ImageOps
+import com.immineal.hdri360.core.hdr.RadianceScale
 import com.immineal.hdri360.core.io.ExrWriter
 import com.immineal.hdri360.core.io.Json
 import com.immineal.hdri360.core.io.RadianceHdrWriter
@@ -89,6 +90,12 @@ object RestitchTool {
         opt.seed = 7
         // Unset leaves the pipeline default; "0" and "1" force it either way.
         System.getenv("HDRI360_SOLVE_K1")?.let { opt.solveDistortion = it == "1" }
+        // Ordinary photographs have been through the phone's own pipeline: the
+        // camera chose the exposure and applied a tone curve, so the numbers that
+        // would go into the photometric arithmetic are not what they claim. The
+        // result is linear and self-consistent, and it is not in cd/m2.
+        opt.radianceScale = RadianceScale.relative(
+            "re-stitched from processed images: exposure and tone curve were the camera's")
 
         val last = longArrayOf(System.nanoTime())
         val progress = HdriPipeline.Progress { stage, fraction ->
@@ -113,6 +120,7 @@ object RestitchTool {
             if (opt.solveDistortion) " (solved)" else " (assumed)")
         System.out.printf(Locale.US, "coverage       : %.1f%% of the sphere%n",
             res.coveredFraction * 100)
+        println("radiance scale : " + res.radianceScale)
 
         println("\nper frame:")
         for (i in 0 until n) {
@@ -147,6 +155,9 @@ object RestitchTool {
             .put("pairs", res.pairs.size.toLong())
             .put("baResidualDeg", res.baRmsDeg).put("coveredFraction", res.coveredFraction)
             .put("panoramaWidth", res.panorama.width.toLong()).put("seconds", seconds)
+            .put("k1", res.k1)
+            .put("absoluteLuminance", res.radianceScale.absolute)
+            .put("radianceScaleBasis", res.radianceScale.basis)
         val poses = Json.Arr()
         for (i in 0 until n) {
             poses.add(Json.Obj().put("name", names[i])

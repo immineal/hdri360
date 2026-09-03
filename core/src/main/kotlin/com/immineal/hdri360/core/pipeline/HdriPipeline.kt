@@ -5,6 +5,7 @@ import com.immineal.hdri360.core.hdr.Exposure
 import com.immineal.hdri360.core.hdr.HdrMerger
 import com.immineal.hdri360.core.hdr.MergeConfig
 import com.immineal.hdri360.core.hdr.MergeResult
+import com.immineal.hdri360.core.hdr.RadianceScale
 import com.immineal.hdri360.core.image.ImageF
 import com.immineal.hdri360.core.image.ImageOps
 import com.immineal.hdri360.core.math.Mat3
@@ -95,6 +96,13 @@ object HdriPipeline {
          */
         @JvmField var solveDistortion = true
         @JvmField var merge = MergeConfig()
+        /**
+         * What the output radiance means. Supplied by the caller because only it
+         * knows whether the capture was a genuine measurement - the pipeline sees
+         * pixels and exposures, not which capability tier produced them.
+         */
+        @JvmField var radianceScale: RadianceScale =
+            RadianceScale.relative("no photometric calibration supplied")
         @JvmField var seed = 12345L
     }
 
@@ -121,7 +129,9 @@ object HdriPipeline {
         /** Confidence of the recovered horizon, or -1 if levelling was not attempted. */
         @JvmField val horizonConfidence: Double,
         /** Recovered shared radial distortion, 0 when it was not solved for. */
-        @JvmField val k1: Double
+        @JvmField val k1: Double,
+        /** What the panorama's numbers mean; see RadianceScale. */
+        @JvmField val radianceScale: RadianceScale
     )
 
     fun interface Progress {
@@ -273,7 +283,8 @@ object HdriPipeline {
         report(progress, "blending", 1.0)
 
         return Result(rendered.panorama, rendered.coverage, rotations, gains, placed,
-            pairs, frames, baRms, rendered.coveredFraction(), merges, horizonConfidence, k1)
+            pairs, frames, baRms, rendered.coveredFraction(), merges, horizonConfidence, k1,
+            opt.radianceScale)
     }
 
     /**
