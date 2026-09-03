@@ -6,6 +6,7 @@ import com.immineal.hdri360.test.suites.ImageSuite
 import com.immineal.hdri360.test.suites.MergeSuite
 import com.immineal.hdri360.test.suites.MeteringSuite
 import com.immineal.hdri360.test.suites.MathSuite
+import com.immineal.hdri360.test.suites.MaxFlowSuite
 import com.immineal.hdri360.test.suites.ToneMapSuite
 import com.immineal.hdri360.test.suites.VignetteSuite
 import com.immineal.hdri360.test.suites.ResponseCurveSuite
@@ -13,6 +14,7 @@ import com.immineal.hdri360.test.suites.EquirectSuite
 import com.immineal.hdri360.test.suites.CapturePlanSuite
 import com.immineal.hdri360.test.suites.OrientationSuite
 import com.immineal.hdri360.test.suites.RotationSolveSuite
+import com.immineal.hdri360.test.suites.SeamSuite
 import com.immineal.hdri360.test.suites.PhotometricSuite
 import com.immineal.hdri360.test.suites.PhotometrySuite
 import com.immineal.hdri360.test.suites.BundleAdjustSuite
@@ -56,6 +58,8 @@ object TestRunner {
         "RotationSolveSuite" to ::RotationSolveSuite,
         "BundleAdjustSuite" to ::BundleAdjustSuite,
         "DistortionSuite" to ::DistortionSuite,
+        "MaxFlowSuite" to ::MaxFlowSuite,
+        "SeamSuite" to ::SeamSuite,
         "EquirectSuite" to ::EquirectSuite,
         "HorizonSuite" to ::HorizonSuite,
         "BlendSuite" to ::BlendSuite,

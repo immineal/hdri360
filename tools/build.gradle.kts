@@ -12,3 +12,11 @@ tasks.register<JavaExec>("restitch") {
     maxHeapSize = "6g"
     args = (project.findProperty("restitchArgs") as String? ?: "").split(" ").filter { it.isNotEmpty() }
 }
+
+tasks.register<JavaExec>("seamBench") {
+    group = "verification"
+    mainClass.set("com.immineal.hdri360.tools.SeamBench")
+    classpath = sourceSets["main"].runtimeClasspath
+    maxHeapSize = "4g"
+    args = (project.findProperty("benchArgs") as String? ?: "").split(" ").filter { it.isNotEmpty() }
+}

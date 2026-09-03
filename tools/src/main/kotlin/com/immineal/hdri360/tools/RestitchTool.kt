@@ -90,6 +90,7 @@ object RestitchTool {
         opt.seed = 7
         // Unset leaves the pipeline default; "0" and "1" force it either way.
         System.getenv("HDRI360_SOLVE_K1")?.let { opt.solveDistortion = it == "1" }
+        System.getenv("HDRI360_SEAM")?.let { opt.seamWidth = it.toInt() }
         // Ordinary photographs have been through the phone's own pipeline: the
         // camera chose the exposure and applied a tone curve, so the numbers that
         // would go into the photometric arithmetic are not what they claim. The

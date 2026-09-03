@@ -95,6 +95,19 @@ object HdriPipeline {
          * correct answer for an input that has already been corrected.
          */
         @JvmField var solveDistortion = true
+        /**
+         * Width of the grid the compositing seam is solved on. See SeamFinder:
+         * this is what stops a moving subject or a parallax-shifted near object
+         * being averaged into a ghost.
+         *
+         * -1 sizes it from the output; 0 disables seams and blends by weight
+         * alone, which is what the pipeline did before and is worth keeping for
+         * comparison. Solving at a quarter of the output width is plenty: a seam
+         * is a boundary between regions, and the data does not determine its
+         * position to the pixel.
+         */
+        @JvmField var seamWidth = -1
+        @JvmField var seamFeather = 2.5
         @JvmField var merge = MergeConfig()
         /**
          * What the output radiance means. Supplied by the caller because only it
@@ -279,6 +292,9 @@ object HdriPipeline {
         rc.width = opt.panoramaWidth
         rc.featherPx = opt.featherPx
         rc.cosinePower = opt.cosinePower
+        rc.seamWidth = if (opt.seamWidth >= 0) opt.seamWidth
+                       else autoSeamWidth(opt.panoramaWidth)
+        rc.seamFeather = opt.seamFeather
         val rendered = PanoramaRenderer.render(renderable, rc)
         report(progress, "blending", 1.0)
 
@@ -417,6 +433,13 @@ object HdriPipeline {
         return (ImageOps.LUMA_R * img.sampleBilinear(u, v, 0) +
                 ImageOps.LUMA_G * img.sampleBilinear(u, v, 1) +
                 ImageOps.LUMA_B * img.sampleBilinear(u, v, 2)).toDouble()
+    }
+
+    /** A seam grid a quarter of the output, kept inside sensible bounds and even. */
+    @JvmStatic
+    fun autoSeamWidth(panoramaWidth: Int): Int {
+        val w = Math.max(128, Math.min(1024, panoramaWidth / 4))
+        return w - (w % 2)
     }
 
     private fun report(p: Progress?, stage: String, fraction: Double) {
