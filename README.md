@@ -11,16 +11,23 @@ Licensed under the GNU General Public License v3.0 — see `LICENSE`.
 
 ## Status
 
-This is a Kotlin rewrite of a verified Java implementation. The port is
-mechanical and held to exact behavioural parity: the full suite runs against
-both trees and the assertion counts and every measured diagnostic must match.
-
 | Part | State |
 |---|---|
-| `core/` radiance + stitching | port in progress |
-| `core-tests/` the suite | port in progress, green at every step |
-| `tools/` desktop re-stitch harness | not yet ported |
-| `app/` Android capture + UI | not yet written |
+| `core/` radiance + stitching | **Complete.** 56 files, 5,028 lines, zero dependencies |
+| `core-tests/` the suite | **Complete.** 21 suites, 510,893 assertions, all passing |
+| `tools/` desktop re-stitch harness | **Complete.** Stitches a folder of ordinary photographs |
+| `app/` Android capture + UI | Not yet written |
+
+This is a Kotlin rewrite of a verified Java implementation, held to exact
+behavioural parity rather than merely to passing tests. The Kotlin core
+reproduces the Java original's assertion count exactly, every measured
+diagnostic to every printed digit, and — on 30 real handheld photographs —
+**byte-identical output files**, with recovered pose matrices differing by 0.0.
+
+Three things are deliberately un-idiomatic because behaviour depends on them:
+`java.util.Random` rather than `kotlin.random.Random` (different algorithm, and
+`nextGaussian` consumes a variable number of draws); `Locale.US` pinned in every
+`toString`; and the test harness still catching `RuntimeException` only.
 
 ## Building
 
