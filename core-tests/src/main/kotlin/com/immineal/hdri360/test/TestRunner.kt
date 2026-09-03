@@ -9,6 +9,11 @@ import com.immineal.hdri360.test.suites.MathSuite
 import com.immineal.hdri360.test.suites.ToneMapSuite
 import com.immineal.hdri360.test.suites.VignetteSuite
 import com.immineal.hdri360.test.suites.ResponseCurveSuite
+import com.immineal.hdri360.test.suites.EquirectSuite
+import com.immineal.hdri360.test.suites.CapturePlanSuite
+import com.immineal.hdri360.test.suites.OrientationSuite
+import com.immineal.hdri360.test.suites.RotationSolveSuite
+import com.immineal.hdri360.test.suites.PhotometricSuite
 import java.io.PrintWriter
 import java.io.StringWriter
 import java.util.Locale
@@ -36,18 +41,18 @@ object TestRunner {
         "MergeSuite" to ::MergeSuite,
         "ResponseCurveSuite" to ::ResponseCurveSuite,
         "VignetteSuite" to ::VignetteSuite,
-        "CapturePlanSuite" to null,
+        "CapturePlanSuite" to ::CapturePlanSuite,
         "FeatureSuite" to null,
-        "RotationSolveSuite" to null,
+        "RotationSolveSuite" to ::RotationSolveSuite,
         "BundleAdjustSuite" to null,
-        "EquirectSuite" to null,
+        "EquirectSuite" to ::EquirectSuite,
         "HorizonSuite" to null,
         "BlendSuite" to null,
-        "PhotometricSuite" to null,
+        "PhotometricSuite" to ::PhotometricSuite,
         "WriterSuite" to null,
         "StreamingSuite" to null,
         "ToneMapSuite" to ::ToneMapSuite,
-        "OrientationSuite" to null,
+        "OrientationSuite" to ::OrientationSuite,
         "PipelineSuite" to null,
     )
 
