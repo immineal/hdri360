@@ -15,6 +15,7 @@ import com.immineal.hdri360.test.suites.OrientationSuite
 import com.immineal.hdri360.test.suites.RotationSolveSuite
 import com.immineal.hdri360.test.suites.PhotometricSuite
 import com.immineal.hdri360.test.suites.BundleAdjustSuite
+import com.immineal.hdri360.test.suites.DistortionSuite
 import com.immineal.hdri360.test.suites.FeatureSuite
 import com.immineal.hdri360.test.suites.HorizonSuite
 import com.immineal.hdri360.test.suites.BlendSuite
@@ -52,6 +53,7 @@ object TestRunner {
         "FeatureSuite" to ::FeatureSuite,
         "RotationSolveSuite" to ::RotationSolveSuite,
         "BundleAdjustSuite" to ::BundleAdjustSuite,
+        "DistortionSuite" to ::DistortionSuite,
         "EquirectSuite" to ::EquirectSuite,
         "HorizonSuite" to ::HorizonSuite,
         "BlendSuite" to ::BlendSuite,

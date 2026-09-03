@@ -87,6 +87,8 @@ object RestitchTool {
         opt.minPairInliers = 14
         opt.featherPx = Math.max(8.0, workingWidth * 0.06)
         opt.seed = 7
+        // Unset leaves the pipeline default; "0" and "1" force it either way.
+        System.getenv("HDRI360_SOLVE_K1")?.let { opt.solveDistortion = it == "1" }
 
         val last = longArrayOf(System.nanoTime())
         val progress = HdriPipeline.Progress { stage, fraction ->
@@ -107,6 +109,8 @@ object RestitchTool {
         println("placed frames  : $placed / $n")
         println("solved pairs   : " + res.pairs.size)
         System.out.printf(Locale.US, "BA residual    : %.4f deg%n", res.baRmsDeg)
+        System.out.printf(Locale.US, "lens k1        : %.5f%s%n", res.k1,
+            if (opt.solveDistortion) " (solved)" else " (assumed)")
         System.out.printf(Locale.US, "coverage       : %.1f%% of the sphere%n",
             res.coveredFraction * 100)
 

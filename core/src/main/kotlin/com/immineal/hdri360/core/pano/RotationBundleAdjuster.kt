@@ -1,5 +1,6 @@
 package com.immineal.hdri360.core.pano
 
+import com.immineal.hdri360.core.camera.Intrinsics
 import com.immineal.hdri360.core.math.Linalg
 import com.immineal.hdri360.core.math.Mat3
 import com.immineal.hdri360.core.math.SO3
@@ -22,13 +23,23 @@ import com.immineal.hdri360.core.math.Vec3
  */
 object RotationBundleAdjuster {
 
-    /** One point seen in two frames, as unit bearings in each frame's own camera coordinates. */
-    class Correspondence(
+    /**
+     * One point seen in two frames, as unit bearings in each frame's own camera
+     * coordinates.
+     *
+     * [pixelA] / [pixelB] are the observation the bearings were unprojected from.
+     * They are only needed when the solver is also estimating lens distortion:
+     * a bearing already has the distortion model baked into it, so k1 cannot be
+     * refined without going back to the pixels it came from.
+     */
+    class Correspondence @JvmOverloads constructor(
         @JvmField val frameA: Int,
         @JvmField val frameB: Int,
         bearingA: Vec3,
         bearingB: Vec3,
-        @JvmField val weight: Double
+        @JvmField val weight: Double,
+        @JvmField val pixelA: DoubleArray? = null,
+        @JvmField val pixelB: DoubleArray? = null
     ) {
         @JvmField val bearingA: Vec3 = bearingA.normalized()
         @JvmField val bearingB: Vec3 = bearingB.normalized()
@@ -42,16 +53,55 @@ object RotationBundleAdjuster {
         @JvmField var priorWeight = 0.0
         @JvmField var fixFirst = true
         @JvmField var convergenceRad = 1e-10
+
+        /**
+         * Estimate one radial distortion coefficient shared by every frame.
+         *
+         * Shared because it is one lens: solving a k1 per frame would let each
+         * absorb its own reprojection error and mean nothing. Requires
+         * [distortionIntrinsics] and correspondences carrying pixel coordinates.
+         */
+        @JvmField var solveDistortion = false
+        /** The camera each frame was unprojected with, needed to re-unproject as k1 moves. */
+        @JvmField var distortionIntrinsics: Array<Intrinsics>? = null
+        @JvmField var k1Initial = 0.0
+        /** Hard bound; phone lenses sit well inside this and a runaway k1 is always a fit artefact. */
+        @JvmField var k1Limit = 0.4
+        /**
+         * Huber threshold for a first pass when distortion is being solved.
+         *
+         * Starting from k1 = 0, an uncorrected lens produces angular residuals of
+         * several degrees - many times the nominal threshold - so the robust
+         * kernel would classify almost every correspondence as an outlier and
+         * remove the very gradient the distortion solve needs. One relaxed pass
+         * gets k1 into the right neighbourhood, then the nominal threshold does
+         * its real job of rejecting genuine mismatches.
+         */
+        @JvmField var distortionWarmupHuberDeg = 12.0
+        /**
+         * Smallest relative residual improvement that justifies keeping a recovered k1.
+         *
+         * A free parameter can always shave a little off the residual by fitting
+         * noise, and a spurious k1 costs real accuracy: on distortion-free data,
+         * accepting one unconditionally measurably worsened recovered pose. Real
+         * lens distortion improves the fit by orders of magnitude more than this,
+         * so the test separates the two cases cleanly rather than trading one
+         * failure mode for the other.
+         */
+        @JvmField var distortionMinGain = 0.01
     }
 
     class Result internal constructor(
         @JvmField val rotations: Array<Mat3>,
         @JvmField val costHistory: DoubleArray,
         @JvmField val iterations: Int,
-        @JvmField val rmsErrorRad: Double
+        @JvmField val rmsErrorRad: Double,
+        /** Recovered radial distortion, or the initial value when it was not solved for. */
+        @JvmField val k1: Double = 0.0
     )
 
     @JvmStatic
+    @JvmOverloads
     fun solve(initial: Array<Mat3>?, obs: List<Correspondence>?,
               priors: Array<Mat3>?, opt: Options): Result {
         if (initial == null || initial.isEmpty()) throw IllegalArgumentException("no frames")
@@ -60,16 +110,67 @@ object RotationBundleAdjuster {
         val hasPriors = priors != null && opt.priorWeight > 0
         val hasObs = obs != null && obs.isNotEmpty()
 
+        val baseIntrinsics = opt.distortionIntrinsics
+        val solveK1 = opt.solveDistortion && hasObs && baseIntrinsics != null
+        if (opt.solveDistortion && baseIntrinsics != null && baseIntrinsics.size != n)
+            throw IllegalArgumentException("distortion intrinsics count mismatch")
+        if (solveK1 && obs!!.none { it.pixelA != null && it.pixelB != null })
+            throw IllegalArgumentException(
+                "solveDistortion needs correspondences carrying pixel coordinates")
+
         var R = Array(n) { initial[it] }
-        if (!hasObs && !hasPriors) return Result(R, doubleArrayOf(0.0), 0, 0.0)
+        var k1 = if (solveK1) opt.k1Initial else 0.0
+        if (!hasObs && !hasPriors) return Result(R, doubleArrayOf(0.0), 0, 0.0, k1)
 
         val first = if (opt.fixFirst) 1 else 0
-        val dim = 3 * (n - first)
+        val poseDim = 3 * (n - first)
+        val dim = poseDim + (if (solveK1) 1 else 0)
         if (dim == 0)
-            return Result(R, doubleArrayOf(cost(R, obs, priors, opt, hasPriors)), 0, 0.0)
+            return Result(R, doubleArrayOf(cost(R, obs, priors, opt, hasPriors, k1,
+                baseIntrinsics, solveK1, opt.huberRad)), 0, 0.0, k1)
 
+        if (!solveK1)
+            return optimise(R, 0.0, obs, priors, opt, hasPriors, first, poseDim, poseDim,
+                false, baseIntrinsics, opt.huberRad)
+
+        // Both arms run the same graduated schedule - a relaxed kernel first, then
+        // the nominal one (see Options.distortionWarmupHuberDeg). Comparing a
+        // graduated fit against a single-pass one would not be a comparison of
+        // models at all: the schedule alone changes the residual by more than the
+        // acceptance threshold, and k1 would be credited for it.
+        val warmHuber = if (opt.distortionWarmupHuberDeg > 0)
+            Math.toRadians(opt.distortionWarmupHuberDeg) else opt.huberRad
+
+        val refWarm = optimise(R, 0.0, obs, priors, opt, hasPriors, first, poseDim, poseDim,
+            false, baseIntrinsics, warmHuber)
+        val reference = optimise(refWarm.rotations, 0.0, obs, priors, opt, hasPriors,
+            first, poseDim, poseDim, false, baseIntrinsics, opt.huberRad)
+
+        val warm = optimise(R, k1, obs, priors, opt, hasPriors, first, poseDim, dim,
+            true, baseIntrinsics, warmHuber)
+        val fitted = optimise(warm.rotations, warm.k1, obs, priors, opt, hasPriors,
+            first, poseDim, dim, true, baseIntrinsics, opt.huberRad)
+        val withK1 = Result(fitted.rotations, fitted.costHistory, fitted.iterations,
+            rms(fitted.rotations, obs, camerasFor(fitted.k1, baseIntrinsics, true)), fitted.k1)
+
+        // Keep the coefficient only if it earned its place against an otherwise
+        // identically-fitted model.
+        val improved = reference.rmsErrorRad - withK1.rmsErrorRad
+        if (improved > reference.rmsErrorRad * opt.distortionMinGain) return withK1
+        return reference
+    }
+
+    private fun optimise(initialR: Array<Mat3>, initialK1: Double,
+                         obs: List<Correspondence>?, priors: Array<Mat3>?, opt: Options,
+                         hasPriors: Boolean, first: Int, poseDim: Int, dim: Int,
+                         solveK1: Boolean, baseIntrinsics: Array<Intrinsics>?,
+                         huberRad: Double): Result {
+        val hasObs = obs != null && obs.isNotEmpty()
+        val n = initialR.size
+        var R = initialR
+        var k1 = initialK1
         var lambda = 1e-6
-        var current = cost(R, obs, priors, opt, hasPriors)
+        var current = cost(R, obs, priors, opt, hasPriors, k1, baseIntrinsics, solveK1, huberRad)
         val history = DoubleArray(opt.maxIterations + 1)
         history[0] = current
         var accepted = 0
@@ -77,23 +178,50 @@ object RotationBundleAdjuster {
         for (iter in 0 until opt.maxIterations) {
             val h = Array(dim) { DoubleArray(dim) }
             val g = DoubleArray(dim)
+            val cam = camerasFor(k1, baseIntrinsics, solveK1)
 
             if (hasObs) {
+                // Differencing step for the distortion Jacobian. k1 enters the
+                // residual through a Newton-inverted radial polynomial, so a
+                // central difference is both simpler and better conditioned than
+                // propagating an analytic derivative through that inverse.
+                val hk = 1e-6
+                val camPlus = if (solveK1) camerasFor(k1 + hk, baseIntrinsics, true) else null
+                val camMinus = if (solveK1) camerasFor(k1 - hk, baseIntrinsics, true) else null
+
                 for (c in obs!!) {
-                    val u = R[c.frameA].mul(c.bearingA)
-                    val v = R[c.frameB].mul(c.bearingB)
+                    val ba = bearingA(c, cam)
+                    val bb = bearingB(c, cam)
+                    val u = R[c.frameA].mul(ba)
+                    val v = R[c.frameB].mul(bb)
                     val t1 = u.anyPerpendicular()
                     val t2 = u.cross(t1)
                     val r1 = t1.dot(v)
                     val r2 = t2.dot(v)
                     val norm = Math.hypot(r1, r2)
-                    val w = c.weight * huber(norm, opt.huberRad)
+                    val w = c.weight * huber(norm, huberRad)
                     if (w <= 0) continue
                     // d r_k / d w_j =  v x t_k ; d r_k / d w_i = -(v x t_k)
                     val j1 = v.cross(t1)
                     val j2 = v.cross(t2)
                     addResidual(h, g, first, c.frameA, c.frameB, j1, r1, w)
                     addResidual(h, g, first, c.frameA, c.frameB, j2, r2, w)
+
+                    if (solveK1) {
+                        // The tangent basis is held at the linearisation point, exactly
+                        // as it is for the rotation blocks above.
+                        val up = R[c.frameA].mul(bearingA(c, camPlus!!))
+                        val vp = R[c.frameB].mul(bearingB(c, camPlus))
+                        val um = R[c.frameA].mul(bearingA(c, camMinus!!))
+                        val vm = R[c.frameB].mul(bearingB(c, camMinus))
+                        // r_k = t_k . v, and t_k . u == 0 by construction, so the
+                        // residual is really t_k . (v - u): both endpoints move with
+                        // k1 and a change that moves them together must not register.
+                        val e1 = ((t1.dot(vp) - t1.dot(up)) - (t1.dot(vm) - t1.dot(um))) / (2 * hk)
+                        val e2 = ((t2.dot(vp) - t2.dot(up)) - (t2.dot(vm) - t2.dot(um))) / (2 * hk)
+                        addDistortionResidual(h, g, first, poseDim, c.frameA, c.frameB, j1, e1, r1, w)
+                        addDistortionResidual(h, g, first, poseDim, c.frameA, c.frameB, j2, e2, r2, w)
+                    }
                 }
             }
             if (hasPriors) {
@@ -113,19 +241,24 @@ object RotationBundleAdjuster {
             var step: DoubleArray? = null
             var bestCost = current
             var bestR: Array<Mat3>? = null
+            var bestK1 = k1
             for (attempt in 0 until 12) {
                 step = Linalg.solveSpdDamped(h, negate(g), lambda)
                 if (step == null) { lambda *= 10; continue }
                 val candidate = apply(R, step, first)
-                val c2 = cost(candidate, obs, priors, opt, hasPriors)
-                if (c2 <= current) { bestCost = c2; bestR = candidate; break }
+                val candidateK1 = if (solveK1)
+                    clamp(k1 + step[poseDim], -opt.k1Limit, opt.k1Limit) else k1
+                val c2 = cost(candidate, obs, priors, opt, hasPriors, candidateK1,
+                    baseIntrinsics, solveK1, huberRad)
+                if (c2 <= current) { bestCost = c2; bestR = candidate; bestK1 = candidateK1; break }
                 lambda *= 10
             }
             if (bestR == null) break                       // no downhill step exists
 
             var magnitude = 0.0
-            for (s in step!!) magnitude = Math.max(magnitude, Math.abs(s))
+            for (s2 in step!!) magnitude = Math.max(magnitude, Math.abs(s2))
             R = bestR
+            k1 = bestK1
             val improvement = current - bestCost
             current = bestCost
             history[++accepted] = current
@@ -135,7 +268,58 @@ object RotationBundleAdjuster {
 
         val trimmed = DoubleArray(accepted + 1)
         System.arraycopy(history, 0, trimmed, 0, accepted + 1)
-        return Result(R, trimmed, accepted, rms(R, obs))
+        return Result(R, trimmed, accepted,
+            rms(R, obs, camerasFor(k1, baseIntrinsics, solveK1)), k1)
+    }
+
+    /** The camera model implied by the current k1, or null when distortion is fixed. */
+    private fun camerasFor(k1: Double, base: Array<Intrinsics>?, solve: Boolean): Array<Intrinsics>? {
+        if (!solve || base == null) return null
+        return Array(base.size) { base[it].withDistortion(k1, 0.0, 0.0) }
+    }
+
+    private fun bearingA(c: Correspondence, cam: Array<Intrinsics>?): Vec3 {
+        val p = c.pixelA
+        if (cam == null || p == null) return c.bearingA
+        return cam[c.frameA].unproject(p[0], p[1])
+    }
+
+    private fun bearingB(c: Correspondence, cam: Array<Intrinsics>?): Vec3 {
+        val p = c.pixelB
+        if (cam == null || p == null) return c.bearingB
+        return cam[c.frameB].unproject(p[0], p[1])
+    }
+
+    private fun clamp(v: Double, lo: Double, hi: Double): Double =
+        if (v < lo) lo else (if (v > hi) hi else v)
+
+    /**
+     * Adds the shared-distortion column of one residual row.
+     *
+     * k1 couples to every pose, so its cross terms against both frames' rotation
+     * blocks have to go in as well or the normal matrix is inconsistent and the
+     * step is not the one that minimises the linearised cost.
+     */
+    private fun addDistortionResidual(h: Array<DoubleArray>, g: DoubleArray, first: Int,
+                                      poseDim: Int, frameA: Int, frameB: Int,
+                                      jac: Vec3, dk: Double, residual: Double, w: Double) {
+        val k = poseDim
+        g[k] += w * dk * residual
+        h[k][k] += w * dk * dk
+        val ia = 3 * (frameA - first)
+        val ib = 3 * (frameB - first)
+        val rowA = doubleArrayOf(-jac.x, -jac.y, -jac.z)
+        val rowB = doubleArrayOf(jac.x, jac.y, jac.z)
+        for (a in 0 until 3) {
+            if (frameA >= first) {
+                h[ia + a][k] += w * rowA[a] * dk
+                h[k][ia + a] += w * rowA[a] * dk
+            }
+            if (frameB >= first) {
+                h[ib + a][k] += w * rowB[a] * dk
+                h[k][ib + a] += w * rowB[a] * dk
+            }
+        }
     }
 
     private fun addResidual(h: Array<DoubleArray>, g: DoubleArray, first: Int,
@@ -172,12 +356,16 @@ object RotationBundleAdjuster {
     }
 
     private fun cost(R: Array<Mat3>, obs: List<Correspondence>?, priors: Array<Mat3>?,
-                     opt: Options, hasPriors: Boolean): Double {
+                     opt: Options, hasPriors: Boolean, k1: Double,
+                     baseIntrinsics: Array<Intrinsics>?, solveK1: Boolean,
+                     huberRad: Double): Double {
         var c = 0.0
+        val cam = camerasFor(k1, baseIntrinsics, solveK1)
         if (obs != null) {
             for (o in obs) {
-                val a = R[o.frameA].mul(o.bearingA).angleTo(R[o.frameB].mul(o.bearingB))
-                c += o.weight * huberCost(a, opt.huberRad)
+                val a = R[o.frameA].mul(bearingA(o, cam))
+                    .angleTo(R[o.frameB].mul(bearingB(o, cam)))
+                c += o.weight * huberCost(a, huberRad)
             }
         }
         if (hasPriors) {
@@ -189,11 +377,13 @@ object RotationBundleAdjuster {
         return c
     }
 
-    private fun rms(R: Array<Mat3>, obs: List<Correspondence>?): Double {
+    private fun rms(R: Array<Mat3>, obs: List<Correspondence>?,
+                    cam: Array<Intrinsics>?): Double {
         if (obs == null || obs.isEmpty()) return 0.0
         var s = 0.0
         for (o in obs) {
-            val a = R[o.frameA].mul(o.bearingA).angleTo(R[o.frameB].mul(o.bearingB))
+            val a = R[o.frameA].mul(bearingA(o, cam))
+                .angleTo(R[o.frameB].mul(bearingB(o, cam)))
             s += a * a
         }
         return Math.sqrt(s / obs.size)

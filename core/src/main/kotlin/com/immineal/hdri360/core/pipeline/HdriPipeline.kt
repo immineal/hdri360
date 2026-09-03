@@ -79,6 +79,21 @@ object HdriPipeline {
          * wrong direction, so this is on by default.
          */
         @JvmField var levelHorizon = true
+        /**
+         * Recover one radial distortion coefficient shared by every frame.
+         *
+         * Nothing else in the pipeline estimates lens geometry, so without this
+         * the bundle adjustment has to express real barrel distortion as pose
+         * error - which it does, biasing every pose and smearing the seams it is
+         * supposed to be tightening.
+         *
+         * On by default because the app's own capture path is RAW, which is not
+         * distortion-corrected by anything. Note that processed JPEGs usually are
+         * already rectified by the phone's imaging pipeline - re-stitching Pixel
+         * HDR+ output recovers k1 of about 0.002, i.e. nothing, which is the
+         * correct answer for an input that has already been corrected.
+         */
+        @JvmField var solveDistortion = true
         @JvmField var merge = MergeConfig()
         @JvmField var seed = 12345L
     }
@@ -104,7 +119,9 @@ object HdriPipeline {
         @JvmField val coveredFraction: Double,
         @JvmField val merges: List<MergeResult>,
         /** Confidence of the recovered horizon, or -1 if levelling was not attempted. */
-        @JvmField val horizonConfidence: Double
+        @JvmField val horizonConfidence: Double,
+        /** Recovered shared radial distortion, 0 when it was not solved for. */
+        @JvmField val k1: Double
     )
 
     fun interface Progress {
@@ -155,11 +172,15 @@ object HdriPipeline {
 
                 val from = ArrayList<Vec3>(matches.size)
                 val to = ArrayList<Vec3>(matches.size)
+                val pixelsFrom = ArrayList<DoubleArray>(matches.size)
+                val pixelsTo = ArrayList<DoubleArray>(matches.size)
                 for (m in matches) {
                     val pa = features[i]!!.keypoints[m.a]
                     val pb = features[j]!!.keypoints[m.b]
                     from.add(workingIntrinsics[i]!!.unproject(pa.x.toDouble(), pa.y.toDouble()))
                     to.add(workingIntrinsics[j]!!.unproject(pb.x.toDouble(), pb.y.toDouble()))
+                    pixelsFrom.add(doubleArrayOf(pa.x.toDouble(), pa.y.toDouble()))
+                    pixelsTo.add(doubleArrayOf(pb.x.toDouble(), pb.y.toDouble()))
                 }
                 val ransac = RotationSolver.ransac(from, to,
                     Math.toRadians(opt.ransacThresholdDeg), opt.ransacIterations,
@@ -169,8 +190,10 @@ object HdriPipeline {
                 pairs.add(PairResult(i, j, matches.size, ransac.inlierCount, ransac.rotation))
                 for (m in from.indices)
                     if (ransac.inliers[m])
-                        correspondences.add(
-                            RotationBundleAdjuster.Correspondence(i, j, from[m], to[m], 1.0))
+                        correspondences.add(RotationBundleAdjuster.Correspondence(
+                            i, j, from[m], to[m], 1.0,
+                            if (opt.solveDistortion) pixelsFrom[m] else null,
+                            if (opt.solveDistortion) pixelsTo[m] else null))
             }
         }
 
@@ -186,12 +209,19 @@ object HdriPipeline {
         bo.huberRad = Math.toRadians(opt.baHuberDeg)
         bo.priorWeight = opt.priorWeight
         bo.fixFirst = true
+        // Distortion is estimated at the working resolution the features were
+        // detected at, but radial coefficients live in normalised image
+        // coordinates, so the value carries straight over to full resolution.
+        bo.solveDistortion = opt.solveDistortion && correspondences.isNotEmpty()
+        if (bo.solveDistortion) bo.distortionIntrinsics = Array(n) { workingIntrinsics[it]!! }
         val priors = collectPriors(inputs)
         var baRms = 0.0
+        var k1 = 0.0
         if (correspondences.isNotEmpty() || (priors != null && opt.priorWeight > 0)) {
             val ba = RotationBundleAdjuster.solve(rotations, correspondences, priors, bo)
             rotations = ba.rotations
             baRms = Math.toDegrees(ba.rmsErrorRad)
+            k1 = ba.k1
         }
         // Without a prior the gauge is whatever frame came first; recover gravity
         // from the frames' own horizontal axes and level the panorama on it.
@@ -214,7 +244,9 @@ object HdriPipeline {
         report(progress, "blending", 0.0)
         val frames = ArrayList<FrameSource>(n)
         for (i in 0 until n) {
-            frames.add(FrameSource(merges[i].radiance, inputs[i].intrinsics,
+            val optics = if (k1 != 0.0) inputs[i].intrinsics.withDistortion(k1, 0.0, 0.0)
+                         else inputs[i].intrinsics
+            frames.add(FrameSource(merges[i].radiance, optics,
                 rotations[i], confidenceOf(merges[i], opt.confidenceSnrReference), 1.0))
         }
         var gains = DoubleArray(n)
@@ -241,7 +273,7 @@ object HdriPipeline {
         report(progress, "blending", 1.0)
 
         return Result(rendered.panorama, rendered.coverage, rotations, gains, placed,
-            pairs, frames, baRms, rendered.coveredFraction(), merges, horizonConfidence)
+            pairs, frames, baRms, rendered.coveredFraction(), merges, horizonConfidence, k1)
     }
 
     /**

@@ -51,7 +51,15 @@ class Intrinsics(
         if (!(dirCam.z > 1e-12)) return null
         val x = dirCam.x / dirCam.z
         val y = dirCam.y / dirCam.z
-        val f = radialFactor(x * x + y * y)
+        val r2 = x * x + y * y
+        // Past the radius where the radial polynomial stops increasing, the model
+        // folds over: with a negative k1 a bearing far outside the real field of
+        // view maps back *inside* the frame, and every consumer here - the
+        // renderer, the visibility test, the matcher - would take it for a genuine
+        // observation. It is also exactly where unproject's Newton iteration stops
+        // having a unique root, so refusing is the only consistent answer.
+        if (hasDistortion() && radialDerivative(r2) <= 0) return null
+        val f = radialFactor(r2)
         return doubleArrayOf(fx * x * f + cx, fy * y * f + cy)
     }
 
@@ -67,6 +75,10 @@ class Intrinsics(
     }
 
     private fun radialFactor(r2: Double): Double = 1.0 + r2 * (k1 + r2 * (k2 + r2 * k3))
+
+    /** d(distorted radius)/d(true radius); positive exactly where the model is invertible. */
+    private fun radialDerivative(r2: Double): Double =
+        1.0 + r2 * (3 * k1 + r2 * (5 * k2 + 7 * k3 * r2))
 
     /**
      * Invert rd = ru * (1 + k1 ru^2 + k2 ru^4 + k3 ru^6) by Newton iteration.
