@@ -3,8 +3,12 @@ package com.immineal.hdri360.test
 import com.immineal.hdri360.test.suites.BracketPlannerSuite
 import com.immineal.hdri360.test.suites.CameraModelSuite
 import com.immineal.hdri360.test.suites.ImageSuite
+import com.immineal.hdri360.test.suites.MergeSuite
 import com.immineal.hdri360.test.suites.MeteringSuite
 import com.immineal.hdri360.test.suites.MathSuite
+import com.immineal.hdri360.test.suites.ToneMapSuite
+import com.immineal.hdri360.test.suites.VignetteSuite
+import com.immineal.hdri360.test.suites.ResponseCurveSuite
 import java.io.PrintWriter
 import java.io.StringWriter
 import java.util.Locale
@@ -29,9 +33,9 @@ object TestRunner {
         "CameraModelSuite" to ::CameraModelSuite,
         "MeteringSuite" to ::MeteringSuite,
         "BracketPlannerSuite" to ::BracketPlannerSuite,
-        "MergeSuite" to null,
-        "ResponseCurveSuite" to null,
-        "VignetteSuite" to null,
+        "MergeSuite" to ::MergeSuite,
+        "ResponseCurveSuite" to ::ResponseCurveSuite,
+        "VignetteSuite" to ::VignetteSuite,
         "CapturePlanSuite" to null,
         "FeatureSuite" to null,
         "RotationSolveSuite" to null,
@@ -42,7 +46,7 @@ object TestRunner {
         "PhotometricSuite" to null,
         "WriterSuite" to null,
         "StreamingSuite" to null,
-        "ToneMapSuite" to null,
+        "ToneMapSuite" to ::ToneMapSuite,
         "OrientationSuite" to null,
         "PipelineSuite" to null,
     )
