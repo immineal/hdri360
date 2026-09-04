@@ -134,6 +134,18 @@ class CaptureController(
          * This is that measurement, divided out.
          */
         @JvmField var previewMedianTarget = 0.035
+        /**
+         * Longest shutter the viewfinder may use.
+         *
+         * Exposure is bought with time first because at base ISO that is the
+         * cleanest signal - right for the frames that become the panorama, wrong
+         * for the picture somebody is aiming by. A dim room put the preview on
+         * the same 1/15 s the captures use, which is fifteen frames a second,
+         * each smeared by any movement, while the person is being asked to swing
+         * the phone around a room. Noise in a viewfinder costs nothing. Lag and
+         * blur cost the aim.
+         */
+        @JvmField var previewMaxTimeSec = 1.0 / 60.0
     }
 
     enum class State { IDLE, SCANNING, CAPTURING, FINISHED, FAILED }
@@ -229,7 +241,18 @@ class CaptureController(
     private var burstStartedNs = 0L
     private var lastBracketNs = Long.MIN_VALUE
 
-    private var previewExposure = source.profile.exposureLimits.realize(config.initialScanExposure)
+    /**
+     * The device's limits with the viewfinder's shorter shutter cap, so gain is
+     * spent where the capture path would have spent time.
+     */
+    private val previewLimits: com.immineal.hdri360.core.hdr.DeviceExposureLimits = run {
+        val l = source.profile.exposureLimits
+        com.immineal.hdri360.core.hdr.DeviceExposureLimits(
+            l.minExposureTimeSec, l.maxExposureTimeSec, l.minIso, l.maxIso, l.baseIso,
+            l.apertureN, Math.min(config.previewMaxTimeSec, l.maxHandheldTimeSec))
+    }
+
+    private var previewExposure = previewLimits.realize(config.initialScanExposure)
     /**
      * What metering frames are taken at, which is not what the viewfinder is
      * shown at. See CameraSource.setMeteringExposure.
@@ -374,7 +397,7 @@ class CaptureController(
                 // Never slower than a hand can hold. A preview that updates once
                 // every sixteen seconds is not a preview, and that is exactly where
                 // an unbounded request lands when the scene's dark end is at zero.
-                val lim = source.profile.exposureLimits
+                val lim = previewLimits
                 val ceiling = lim.maxHandheldTimeSec * lim.maxIso / lim.baseIso.toDouble()
                 previewExposure = lim.realize(Math.min(want, ceiling))
             }
@@ -438,7 +461,7 @@ class CaptureController(
             val whole = if (all.isEmpty()) stats else SceneStats.union(all)
             val view = SceneMeter.viewingRelativeExposure(whole, config.previewMedianTarget)
             if (view.isFinite() && view > 0) {
-                val lim = source.profile.exposureLimits
+                val lim = previewLimits
                 val ceiling = lim.maxHandheldTimeSec * lim.maxIso / lim.baseIso.toDouble()
                 val realised = lim.realize(Math.min(view, ceiling))
                 if (realised.iso != previewExposure.iso ||

@@ -605,6 +605,7 @@ class CaptureSuite : TestCase {
         t.check(!CaptureTier.LOCKED_AUTO.drivesExposure, "locked auto does not")
         theSweepWaitsForTheBrightEnd(t)
         theViewfinderIsNotTheLightMeter(t)
+        theViewfinderStaysQuick(t)
         stoppingEarlyIsNotFinishing(t)
     }
 
@@ -812,5 +813,48 @@ class CaptureSuite : TestCase {
         t.check(!said.contains("all"), "and it does not report a whole sphere: " + said)
         t.check(said.contains(snap.directionsShot.toString()),
             "it says how many were actually taken: " + said)
+    }
+
+    /**
+     * A viewfinder may be noisy. It may not be slow.
+     *
+     * Exposure is bought with shutter time first, because at base ISO that is the
+     * cleanest signal - which is right for the frames that become the panorama and
+     * wrong for the picture someone is aiming by. A dim room put the preview on
+     * the same 1/15 s the captures use: fifteen frames a second, each one smeared
+     * by any movement, while the person is being asked to swing the phone around a
+     * room. Noise in a viewfinder costs nothing; lag and blur cost the aim.
+     */
+    private fun theViewfinderStaysQuick(t: TestKit) {
+        val cam = FakeCamera(profile())
+        val c = CaptureController(cam, CountingSink())
+        cam.setListener(c)
+        c.beginScan()
+
+        val dim = ImageF(16, 16, 1)
+        java.util.Arrays.fill(dim.data, 0.002f)      // a room at dusk
+        var now = 1_000_000_000L
+        for (i in c.plan.targets.indices) {
+            c.onOrientation(c.plan.targets[i].rotation, false, now)
+            cam.bound?.onPreviewFrame(dim, 1.0 / 60)
+            now += 50_000_000L
+        }
+
+        val cfg = CaptureController.Config()
+        val shown = cam.lastPreview
+        t.check(shown != null, "the viewfinder was given an exposure")
+        t.lessThan(shown!!.exposureTimeSec, cfg.previewMaxTimeSec * 1.001,
+            "and it is short enough to follow a moving phone")
+        t.greaterThan(shown.iso.toDouble(), profile().exposureLimits.baseIso.toDouble(),
+            "the brightness it needed was bought with gain instead")
+
+        // The frames that matter are unaffected: they are still allowed the long
+        // handheld exposures, because there the noise is what costs.
+        t.check(c.finishScanAndPlan(), "the ladder is planned")
+        val ladder = c.bracketPlan()!!.ladder
+        var longest = 0.0
+        for (i in 0 until ladder.size()) longest = Math.max(longest, ladder.steps[i].exposureTimeSec)
+        t.greaterThan(longest, cfg.previewMaxTimeSec,
+            "the capture ladder still reaches past the viewfinder's limit")
     }
 }
