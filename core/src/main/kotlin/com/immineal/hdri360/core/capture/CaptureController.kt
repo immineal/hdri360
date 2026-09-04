@@ -122,7 +122,18 @@ class CaptureController(
          * ladder is fixed the preview is re-exposed for the eye, while the
          * brackets go on being shot at the ladder's own exposures.
          */
-        @JvmField var previewMedianTarget = 0.18
+        /**
+         * Where the preview puts the scene's median, in the sensor's own linear
+         * scale.
+         *
+         * Not 0.18. The number the eye wants at the middle is 0.18 of a
+         * *display*, and the preview stream is rendered by the camera's own tone
+         * curve on its way to the screen - which lifts the middle a long way.
+         * Measured on the phone, aiming the linear median at 0.18 put the
+         * displayed median at 211 of 255 and a fifth of the screen at full white.
+         * This is that measurement, divided out.
+         */
+        @JvmField var previewMedianTarget = 0.035
     }
 
     enum class State { IDLE, SCANNING, CAPTURING, FINISHED, FAILED }
