@@ -117,7 +117,9 @@ class CaptureActivity : ComponentActivity() {
                             ProcessingService.start(this@CaptureActivity, ready, width)
                         }
                         state.phase == CaptureUiState.Phase.IDLE && wanted == null ->
-                            StartScreen(state) { lens, resume -> wanted = Pair(lens, resume) }
+                            StartScreen(state, ::openReview) { lens, resume ->
+                                wanted = Pair(lens, resume)
+                            }
                         else -> CaptureScreen(state, sensorRotation(state),
                             onSurface = { st -> onPreviewSurface(st) },
                             onFinish = { session.finish() },
@@ -189,7 +191,11 @@ private fun PermissionScreen(onAsk: () -> Unit) {
 }
 
 @Composable
-private fun StartScreen(state: CaptureUiState, onStart: (String, File?) -> Unit) {
+private fun StartScreen(
+    state: CaptureUiState,
+    onOpen: (File) -> Unit,
+    onStart: (String, File?) -> Unit
+) {
     var lens by remember { mutableStateOf(state.chosenLens) }
     Column(Modifier.fillMaxSize().safeDrawingPadding().padding(24.dp)
         .verticalScroll(rememberScrollState())) {
@@ -231,6 +237,22 @@ private fun StartScreen(state: CaptureUiState, onStart: (String, File?) -> Unit)
                         style = MaterialTheme.typography.bodySmall)
                     Spacer(Modifier.height(10.dp))
                     Button({ lens?.let { onStart(it, dir) } }) { Text("Resume it") }
+                }
+            }
+        }
+
+        state.finished?.let { dir ->
+            Spacer(Modifier.height(20.dp))
+            Card(Modifier.fillMaxWidth()) {
+                Column(Modifier.padding(14.dp)) {
+                    Text("The last sphere is ready",
+                        style = MaterialTheme.typography.titleSmall)
+                    Spacer(Modifier.height(4.dp))
+                    Text("Look around it, move the exposure through the whole range, " +
+                        "and export the EXR from there.",
+                        style = MaterialTheme.typography.bodySmall)
+                    Spacer(Modifier.height(10.dp))
+                    Button({ onOpen(dir) }) { Text("Open it") }
                 }
             }
         }

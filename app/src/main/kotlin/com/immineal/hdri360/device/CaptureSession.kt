@@ -42,7 +42,9 @@ class CaptureUiState(
     @JvmField val warning: String? = null,
     @JvmField val resumable: File? = null,
     /** Clockwise degrees between the sensor's frame and the phone's natural one. */
-    @JvmField val sensorOrientationDeg: Int = 90
+    @JvmField val sensorOrientationDeg: Int = 90,
+    /** The most recent sphere that has been built, if there is one to look at. */
+    @JvmField val finished: File? = null
 ) {
     enum class Phase { IDLE, OPENING, SCANNING, CAPTURING, FINISHED, FAILED }
 }
@@ -85,7 +87,8 @@ class CaptureSession(
         flow.value = CaptureUiState(
             lenses = lenses,
             chosenLens = CameraProbe.defaultLens(lenses)?.cameraId,
-            resumable = unfinishedCapture())
+            resumable = unfinishedCapture(),
+            finished = finishedCapture())
     }
 
     /** A capture that was interrupted and still has frames worth keeping. */
@@ -93,6 +96,20 @@ class CaptureSession(
         val dirs = root.listFiles() ?: return null
         return dirs.filter { it.isDirectory && File(it, FrameStore.SESSION).isFile &&
                              !File(it, DONE).isFile }
+            .maxByOrNull { it.lastModified() }
+    }
+
+    /**
+     * The most recent capture that has a sphere to show.
+     *
+     * Without this the only route to a finished panorama is the notification,
+     * which clears itself - so a sphere shot and processed away from a computer
+     * became a sphere nobody could look at.
+     */
+    fun finishedCapture(): File? {
+        val dirs = root.listFiles() ?: return null
+        return dirs.filter { it.isDirectory && File(it, DONE).isFile &&
+                             File(it, "panorama.exr").isFile }
             .maxByOrNull { it.lastModified() }
     }
 

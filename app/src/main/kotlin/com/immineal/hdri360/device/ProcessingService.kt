@@ -169,13 +169,13 @@ class ProcessingService : Service() {
 
             publish(State(false, "Done in ${Math.round(elapsed)} s", 1.0, "", true, dir))
             notifyDone(String.format(Locale.US, "%d x %d, %.1f stops, %.0f s",
-                width, width / 2, stats.dynamicRangeStops, elapsed), false)
+                width, width / 2, stats.dynamicRangeStops, elapsed), false, dir)
         } catch (e: Throwable) {
             Log.e(TAG, "processing failed", e)
             CaptureLog.error("processing failed", e)
             publish(State(false, "Processing stopped", 0.0, "", true, dir,
                 e.message ?: e.javaClass.simpleName))
-            notifyDone(e.message ?: e.javaClass.simpleName, true)
+            notifyDone(e.message ?: e.javaClass.simpleName, true, dir)
         } finally {
             // Scratch, whatever happened. Leaving it behind fills the phone, and
             // the frames it was built from are still on disk to try again from.
@@ -272,9 +272,16 @@ class ProcessingService : Service() {
     }
 
     /** The one line worth leaving behind, which clears itself if nobody looks. */
-    private fun notifyDone(text: String, failed: Boolean) {
-        val open = Intent(this, com.immineal.hdri360.ui.CaptureActivity::class.java)
-            .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TOP)
+    private fun notifyDone(text: String, failed: Boolean, dir: File) {
+        // Straight to the sphere when there is one. Landing on the start screen
+        // instead makes the reader hunt for what they were just told was ready.
+        val open = if (failed)
+            Intent(this, com.immineal.hdri360.ui.CaptureActivity::class.java)
+                .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TOP)
+        else
+            Intent(this, com.immineal.hdri360.ui.ReviewActivity::class.java)
+                .putExtra(com.immineal.hdri360.ui.ReviewActivity.EXTRA_DIR, dir.absolutePath)
+                .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TOP)
         val pending = android.app.PendingIntent.getActivity(this, 0, open,
             android.app.PendingIntent.FLAG_IMMUTABLE or
             android.app.PendingIntent.FLAG_UPDATE_CURRENT)
