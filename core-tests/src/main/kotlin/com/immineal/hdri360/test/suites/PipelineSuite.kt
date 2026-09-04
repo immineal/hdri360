@@ -47,6 +47,7 @@ class PipelineSuite : TestCase {
         }
 
         val inputs = ArrayList<HdriPipeline.FrameInput>()
+        val brackets = ArrayList<List<Exposure>>()
         for (R in truth) {
             val radiance = renderView(env, ew, eh, k, R)
             val bracket = ArrayList<Exposure>()
@@ -60,6 +61,7 @@ class PipelineSuite : TestCase {
                 }
                 bracket.add(Exposure(frame, e, 1.0))
             }
+            brackets.add(bracket)
             inputs.add(HdriPipeline.FrameInput(bracket, k, null, "f" + inputs.size))
         }
 
@@ -236,6 +238,68 @@ class PipelineSuite : TestCase {
             } finally {
                 Parallel.threads = restore
             }
+        }
+
+        // --- reading brackets on demand must change nothing ---------------------------
+        // A full sphere is far more exposures than fit in a phone's heap at once,
+        // so the merge has to be able to pull each bracket as it reaches it. The
+        // only acceptable difference from holding them all is peak memory.
+        run {
+            val opened = java.util.concurrent.atomic.AtomicInteger()
+            val deferred = ArrayList<HdriPipeline.FrameInput>()
+            for (i in inputs.indices) {
+                val src = brackets[i]
+                deferred.add(HdriPipeline.FrameInput.deferred(k, null, "d$i") {
+                    opened.incrementAndGet()
+                    // Standing in for a read from storage; the pipeline must not
+                    // assume the frames were there all along.
+                    ArrayList(src)
+                })
+            }
+            t.check(!deferred[0].resident, "a deferred input reports itself not resident")
+            t.check(inputs[0].resident, "a resident one reports that it is")
+
+            val det = HdriPipeline.Options()
+            det.panoramaWidth = 512
+            det.featureWorkingWidth = 240
+            det.featherPx = 25.0
+            det.seed = 99
+            val residentResult = HdriPipeline.process(inputs, det, null)
+            val deferredResult = HdriPipeline.process(deferred, det, null)
+
+            t.eq(inputs.size.toLong(), opened.get().toLong(),
+                "each bracket is opened exactly once, not re-read per stage")
+            var differing = 0
+            for (i in residentResult.panorama.data.indices)
+                if (residentResult.panorama.data[i] != deferredResult.panorama.data[i]) differing++
+            t.eq(0L, differing.toLong(),
+                "a deferred capture produces a bit-identical panorama")
+            t.near(residentResult.baRmsDeg, deferredResult.baRmsDeg, 0.0,
+                "and the same bundle residual")
+
+            // The one thing it must limit: how many are open at once.
+            val bounded = HdriPipeline.Options()
+            bounded.panoramaWidth = 256
+            bounded.featureWorkingWidth = 240
+            bounded.mergeConcurrency = 1
+            val opened2 = java.util.concurrent.atomic.AtomicInteger()
+            val live = java.util.concurrent.atomic.AtomicInteger()
+            var worstLive = 0
+            val serial = ArrayList<HdriPipeline.FrameInput>()
+            for (i in inputs.indices) {
+                val src = brackets[i]
+                serial.add(HdriPipeline.FrameInput.deferred(k, null, "s$i") {
+                    opened2.incrementAndGet()
+                    synchronized(live) { worstLive = Math.max(worstLive, live.incrementAndGet()) }
+                    val b = ArrayList(src)
+                    live.decrementAndGet()
+                    b
+                })
+            }
+            HdriPipeline.process(serial, bounded, null)
+            t.eq(inputs.size.toLong(), opened2.get().toLong(), "every direction is still merged")
+            t.check(worstLive <= 1, "mergeConcurrency of 1 opens one bracket at a time")
+            t.note("deferred brackets: " + opened.get() + " opened once each, panorama identical")
         }
 
         // --- validation ------------------------------------------------------------------

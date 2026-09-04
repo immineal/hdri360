@@ -64,6 +64,49 @@ class StreamingSuite : TestCase {
                 t.near(whole.coverage[i].toDouble(), coverage[i].toDouble(), 0.0, "coverage matches too")
         }
 
+        // --- and must still do so once seams decide who owns what -----------------
+        // The full-resolution output is written strip by strip, long after the
+        // seam was solved. Every strip has to make the same decision, which is why
+        // the seam map is solved once and handed in rather than recomputed: a seam
+        // solved per strip would disagree with itself at every join.
+        run {
+            val seamCfg = PanoramaRenderer.Config()
+            seamCfg.width = 256
+            seamCfg.featherPx = 10.0
+            seamCfg.seamWidth = 64
+            val map = PanoramaRenderer.buildSeamMap(frames, seamCfg)
+            t.check(map != null, "a seam map is produced for a multi-frame capture")
+
+            val oneShot = PanoramaRenderer.renderRows(frames, seamCfg, 0,
+                seamCfg.width / 2, map)
+            val assembled = ImageF(seamCfg.width, seamCfg.width / 2, 3)
+            var y0 = 0
+            while (y0 < seamCfg.width / 2) {
+                val y1 = Math.min(seamCfg.width / 2, y0 + 11)
+                val part = PanoramaRenderer.renderRows(frames, seamCfg, y0, y1, map)
+                System.arraycopy(part.panorama.data, 0, assembled.data,
+                    y0 * seamCfg.width * 3, (y1 - y0) * seamCfg.width * 3)
+                y0 += 11
+            }
+            var worstSeamed = 0.0
+            for (i in oneShot.panorama.data.indices)
+                worstSeamed = Math.max(worstSeamed,
+                    Math.abs(assembled.data[i] - oneShot.panorama.data[i]).toDouble())
+            t.near(0.0, worstSeamed, 0.0,
+                "seam-aware strips reproduce the whole render bit for bit")
+
+            // One solve has to serve any output size, since the preview and the
+            // full-resolution file are rendered at different widths from it.
+            val bigger = PanoramaRenderer.Config()
+            bigger.width = 512
+            bigger.featherPx = 10.0
+            bigger.seamWidth = 64
+            val atBigger = PanoramaRenderer.renderRows(frames, bigger, 0, 256, map)
+            t.eq(512L, atBigger.panorama.width.toLong(),
+                "the same seam map renders at a different output size")
+            t.greaterThan(atBigger.coveredFraction(), 0.1, "and still covers the sphere")
+        }
+
         t.throwsException({ PanoramaRenderer.renderRows(frames, cfg, 10, 5) },
             "an inverted row range is an error")
         t.throwsException({ PanoramaRenderer.renderRows(frames, cfg, 0, 10000) },

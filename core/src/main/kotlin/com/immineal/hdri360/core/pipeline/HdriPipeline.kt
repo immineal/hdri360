@@ -45,15 +45,54 @@ import java.util.Random
  */
 object HdriPipeline {
 
-    /** One capture direction: its bracket, its optics, and optionally what the gyro said. */
-    class FrameInput(
-        @JvmField val bracket: List<Exposure>,
+    /**
+     * One capture direction: its bracket, its optics, and optionally what the gyro said.
+     *
+     * The bracket can be held in memory or read on demand. On a phone the second
+     * is the only workable choice: a full sphere is dozens of directions of
+     * several exposures each, and holding them all at once runs out of heap long
+     * before the capture is finished. [deferred] lets the merge read each bracket
+     * as it reaches it and release the frames immediately afterwards, so what has
+     * to fit is one bracket per worker rather than the whole capture.
+     */
+    class FrameInput private constructor(
         @JvmField val intrinsics: Intrinsics,
         @JvmField val priorRotation: Mat3?,
-        @JvmField val label: String
+        @JvmField val label: String,
+        private val held: List<Exposure>?,
+        private val open: (() -> List<Exposure>)?
     ) {
-        init {
+        /** A bracket already in memory. */
+        constructor(bracket: List<Exposure>, intrinsics: Intrinsics,
+                    priorRotation: Mat3?, label: String)
+                : this(intrinsics, priorRotation, label, bracket, null) {
             if (bracket.isEmpty()) throw IllegalArgumentException("empty bracket")
+        }
+
+        /** True when the frames are resident rather than read on demand. */
+        val resident: Boolean get() = held != null
+
+        /**
+         * Yields the frames. For a deferred input this is where the read happens,
+         * and the caller is expected to drop the result as soon as it has merged.
+         */
+        internal fun openBracket(): List<Exposure> {
+            val b = held ?: open!!.invoke()
+            if (b.isEmpty()) throw IllegalArgumentException("empty bracket: " + label)
+            return b
+        }
+
+        companion object {
+            /**
+             * A bracket read only when the merge reaches it.
+             *
+             * [open] is called once, from a worker thread, and must be safe to call
+             * concurrently with the same function for other directions.
+             */
+            @JvmStatic
+            fun deferred(intrinsics: Intrinsics, priorRotation: Mat3?, label: String,
+                         open: () -> List<Exposure>): FrameInput =
+                FrameInput(intrinsics, priorRotation, label, null, open)
         }
     }
 
@@ -109,6 +148,14 @@ object HdriPipeline {
          */
         @JvmField var seamWidth = -1
         @JvmField var seamFeather = 2.5
+        /**
+         * How many brackets may be open at once. 0 uses every worker thread.
+         *
+         * Only matters for deferred inputs, where it is the difference between
+         * peak memory being one bracket and being one per core. On a device that
+         * is the knob worth having.
+         */
+        @JvmField var mergeConcurrency = 0
         @JvmField var merge = MergeConfig()
         /**
          * What the output radiance means. Supplied by the caller because only it
@@ -145,7 +192,22 @@ object HdriPipeline {
         /** Recovered shared radial distortion, 0 when it was not solved for. */
         @JvmField val k1: Double,
         /** What the panorama's numbers mean; see RadianceScale. */
-        @JvmField val radianceScale: RadianceScale
+        @JvmField val radianceScale: RadianceScale,
+        /**
+         * The frames actually composited, gains applied - the unplaced ones dropped.
+         */
+        @JvmField val renderable: List<FrameSource>,
+        /**
+         * Which frame owns which part of the sphere, or null when seams are off.
+         *
+         * Carried out of the pipeline because the full-resolution output is written
+         * in strips by a separate pass, and every strip has to make the same
+         * decision. Solving it again per strip would disagree at the joins; solving
+         * it again at full resolution would cost far more and decide nothing extra.
+         * It is sampled in normalised coordinates, so one solve serves any output
+         * size.
+         */
+        @JvmField val seamMap: PanoramaRenderer.SeamMap?
     )
 
     fun interface Progress {
@@ -162,9 +224,18 @@ object HdriPipeline {
         // 1. Merge brackets.
         val mergedArr = arrayOfNulls<MergeResult>(n)
         val mergeDone = java.util.concurrent.atomic.AtomicInteger()
-        Parallel.forEach(n) { i ->
-            mergedArr[i] = HdrMerger.merge(inputs[i].bracket, opt.merge)
-            report(progress, "merging", mergeDone.incrementAndGet() / n.toDouble())
+        val mergeThreads = if (opt.mergeConcurrency > 0) opt.mergeConcurrency else Parallel.threads
+        val restoreThreads = Parallel.threads
+        try {
+            Parallel.threads = mergeThreads
+            Parallel.forEach(n) { i ->
+                // Scoped so a deferred bracket becomes collectable the moment it has
+                // been merged, rather than at the end of the stage.
+                mergedArr[i] = HdrMerger.merge(inputs[i].openBracket(), opt.merge)
+                report(progress, "merging", mergeDone.incrementAndGet() / n.toDouble())
+            }
+        } finally {
+            Parallel.threads = restoreThreads
         }
         val merges = ArrayList<MergeResult>(n)
         for (i in 0 until n) merges.add(mergedArr[i]!!)
@@ -325,12 +396,14 @@ object HdriPipeline {
         rc.seamWidth = if (opt.seamWidth >= 0) opt.seamWidth
                        else autoSeamWidth(opt.panoramaWidth)
         rc.seamFeather = opt.seamFeather
-        val rendered = PanoramaRenderer.render(renderable, rc)
+        val seamMap = PanoramaRenderer.buildSeamMap(renderable, rc)
+        val rendered = PanoramaRenderer.renderRows(renderable, rc, 0,
+            com.immineal.hdri360.core.pano.Equirect.heightFor(rc.width), seamMap)
         report(progress, "blending", 1.0)
 
         return Result(rendered.panorama, rendered.coverage, rotations, gains, placed,
             pairs, frames, baRms, rendered.coveredFraction(), merges, horizonConfidence, k1,
-            opt.radianceScale)
+            opt.radianceScale, renderable, seamMap)
     }
 
     /**
