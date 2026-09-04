@@ -25,10 +25,18 @@ from 1/1110 s ISO 29 to 1/15 s ISO 906, **0.110° bundle residual**, **13.5 stop
 peak **12,752 cd/m²** on an absolute scale.
 
 This is a Kotlin rewrite of a verified Java implementation, held to exact
-behavioural parity rather than merely to passing tests. The Kotlin core
-reproduces the Java original's assertion count exactly, every measured
-diagnostic to every printed digit, and — on 30 real handheld photographs —
-**byte-identical output files**, with recovered pose matrices differing by 0.0.
+behavioural parity rather than merely to passing tests. At the end of the port
+the Kotlin core reproduced the Java original's assertion count exactly, every
+measured diagnostic to every printed digit, and — on 30 real handheld
+photographs — **byte-identical output files**, with recovered pose matrices
+differing by 0.0.
+
+The accuracy work that followed (radial distortion in the bundle adjustment,
+seam-aware compositing, absolute radiance) deliberately changed what the
+pipeline produces, so today's binary no longer reproduces the Java output and
+should not. What is still held byte-identical is *change to change*: the same 30
+photographs are re-stitched before and after any refactor, and a difference of
+one bit is a defect until explained.
 
 Three things are deliberately un-idiomatic because behaviour depends on them:
 `java.util.Random` rather than `kotlin.random.Random` (different algorithm, and
