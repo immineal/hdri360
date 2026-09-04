@@ -101,7 +101,6 @@ object RotationBundleAdjuster {
     )
 
     @JvmStatic
-    @JvmOverloads
     fun solve(initial: Array<Mat3>?, obs: List<Correspondence>?,
               priors: Array<Mat3>?, opt: Options): Result {
         if (initial == null || initial.isEmpty()) throw IllegalArgumentException("no frames")
@@ -114,7 +113,7 @@ object RotationBundleAdjuster {
         val solveK1 = opt.solveDistortion && hasObs && baseIntrinsics != null
         if (opt.solveDistortion && baseIntrinsics != null && baseIntrinsics.size != n)
             throw IllegalArgumentException("distortion intrinsics count mismatch")
-        if (solveK1 && obs!!.none { it.pixelA != null && it.pixelB != null })
+        if (solveK1 && obs.none { it.pixelA != null && it.pixelB != null })
             throw IllegalArgumentException(
                 "solveDistortion needs correspondences carrying pixel coordinates")
 
@@ -189,7 +188,7 @@ object RotationBundleAdjuster {
                 val camPlus = if (solveK1) camerasFor(k1 + hk, baseIntrinsics, true) else null
                 val camMinus = if (solveK1) camerasFor(k1 - hk, baseIntrinsics, true) else null
 
-                for (c in obs!!) {
+                for (c in obs) {
                     val ba = bearingA(c, cam)
                     val bb = bearingB(c, cam)
                     val u = R[c.frameA].mul(ba)

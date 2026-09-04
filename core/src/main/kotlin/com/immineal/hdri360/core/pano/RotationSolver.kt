@@ -90,12 +90,12 @@ object RotationSolver {
         val errs = ArrayList<Double>()
         var count = 0
         for (k in 0 until n) {
-            val e = best!!.mul(from[k]).angleTo(to[k])
+            val e = best.mul(from[k]).angleTo(to[k])
             inliers[k] = e < thresholdRad
             if (inliers[k]) { count++; errs.add(e) }
         }
         Collections.sort(errs)
         val median = if (errs.isEmpty()) Double.NaN else errs[errs.size / 2]
-        return Ransac(best!!, inliers, count, median)
+        return Ransac(best, inliers, count, median)
     }
 }
