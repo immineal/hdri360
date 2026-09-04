@@ -64,6 +64,50 @@ class MeteringSuite : TestCase {
         t.check(dark.shadowsCrushed, "crushed shadows are detected")
         t.check(!dark.highlightsClipped, "a dark frame does not report clipping")
 
+        // Measured on a Pixel 9a: every RAW frame reported max exactly 1.0 however
+        // short the exposure, because a real sensor always has some pixels stuck at
+        // full scale. Counting them made the controller believe the scene was blown
+        // and chase the shutter down through its whole range, oscillating between
+        // 1/3700 and 1/7800 of a second on a scene that was not clipping at all.
+        val speckled = ImageF(250, 186, 1)
+        java.util.Arrays.fill(speckled.data, 0.2f)
+        for (i in 0 until 20) speckled.data[(i * 1973) % speckled.data.size] = 1.0f
+        val spotty = SceneMeter.measure(speckled, 1.0, cfg)
+        t.greaterThan(spotty.clippedFraction, cfg.clipTolerance,
+            "the hot pixels are more numerous than the bare count tolerance allows")
+        t.check(!spotty.highlightsClipped,
+            "but a handful of stuck pixels is not a blown highlight")
+        t.near(0.2, spotty.highRadiance, 1e-6,
+            "so the scene's high end is read from the scene rather than from the rail")
+        t.check(SceneMeter.isWellExposed(spotty, cfg) ||
+            SceneMeter.suggestRelativeExposure(spotty, 1.0, cfg) > 1.0,
+            "and the controller opens up rather than stopping down")
+
+        // A genuinely blown frame still has to be caught: there the bright pixels
+        // are not a speckle, they are the top of the distribution.
+        val blown = ImageF(64, 48, 1)
+        for (i in blown.data.indices) blown.data[i] = if (i % 4 == 0) 0.3f else 1.0f
+        t.check(SceneMeter.measure(blown, 1.0, cfg).highlightsClipped,
+            "a frame that really is on the rail is still reported as clipped")
+
+        // Exposing to view is a different question from exposing to measure.
+        val ordinary = SceneStats(0.05, 5.0, 0.5, 0.0, 0.0, false, false)
+        t.nearRel(0.18 / 0.5, SceneMeter.viewingRelativeExposure(ordinary), 1e-12,
+            "an ordinary scene is exposed to put its median at mid grey")
+
+        // Measured on a Pixel 9a in a room with a bright window: at the metering
+        // exposure more than half the frame quantises to zero, so the median is
+        // zero and target/median is infinite. That asked for a sixteen second
+        // preview at maximum ISO, which updates once every sixteen seconds.
+        val roomWithAWindow = SceneStats(0.024, 1192.0, 0.0, 0.02, 0.6, true, true)
+        val viewing = SceneMeter.viewingRelativeExposure(roomWithAWindow)
+        t.check(viewing.isFinite() && viewing > 0,
+            "a scene whose median has fallen to zero still gets a usable exposure")
+        t.check(viewing < 0.18 / Math.sqrt(0.024 * 1192.0) * 1.0001 &&
+                viewing > 0.18 / Math.sqrt(0.024 * 1192.0) * 0.9999,
+            "taken from the middle of the range instead, in the space the range lives in")
+        t.lessThan(viewing, 1.0, "which is a fraction of a second, not sixteen of them")
+
         // --- the auto-exposure controller ----------------------------------
         // Start 6 EV too bright and require convergence to an unclipped frame.
         for (startEv in doubleArrayOf(-6.0, -3.0, 0.0, 3.0, 6.0, 10.0)) {

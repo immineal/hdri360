@@ -28,8 +28,9 @@ object FrameConverters {
      * phase is not a Bayer image any more, it is four interleaved wrong ones.
      */
     @JvmStatic
+    @JvmOverloads
     fun rawPlane(image: Image, c: CameraCharacteristics, result: TotalCaptureResult,
-                 subsample: Int): ImageF {
+                 subsample: Int, applyShading: Boolean = true): ImageF {
         if (subsample < 1 || (subsample and (subsample - 1)) != 0)
             throw IllegalArgumentException("subsample must be a power of two")
         val plane = image.planes[0]
@@ -43,7 +44,7 @@ object FrameConverters {
 
         val black = blackLevelOf(c, result)
         val white = (c.get(CameraCharacteristics.SENSOR_INFO_WHITE_LEVEL) ?: 1023).toDouble()
-        val shading = shadingOf(c, result, image.width, image.height)
+        val shading = if (applyShading) shadingOf(c, result, image.width, image.height) else null
         val pattern = CameraProbe.cfaOf(c)
 
         for (y in 0 until outH) {

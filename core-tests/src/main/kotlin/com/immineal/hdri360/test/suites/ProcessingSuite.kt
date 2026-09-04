@@ -42,6 +42,36 @@ class ProcessingSuite : TestCase {
         theEstimateScalesWithTheWork(t)
         theEstimateIsCalibratedByRunningTheWork(t)
         theWrittenSphereMatchesTheRenderedOne(t)
+        theJobIsSizedToFitTheMemoryItHas(t)
+    }
+
+    /**
+     * Measured on a Pixel 9a: sixteen directions of three megapixel frames is
+     * 576 MB of merged float against a 512 MB heap, and processing died with an
+     * OutOfMemoryError partway through the merge. Every merged direction has to
+     * be resident at once, because the renderer walks all of them for each output
+     * row, so the size of the job is set by the sphere rather than by one frame.
+     */
+    private fun theJobIsSizedToFitTheMemoryItHas(t: TestKit) {
+        val heap = 512L * 1024 * 1024
+        val budget = (heap * 0.35).toLong()
+
+        val f = StoredCapture.workingSubsampleFor(32, 3_000_000, budget)
+        t.greaterThan(f.toDouble(), 1.0, "a full sphere at three megapixels has to come down")
+        t.check(f and (f - 1) == 0, "and it comes down by a power of two, so a mosaic stays on phase")
+        t.check(32L * (3_000_000L / (f.toLong() * f)) * StoredCapture.BYTES_PER_MERGED_PIXEL
+                <= budget, "far enough down that the merged sphere fits the budget")
+        val oneLess = f / 2
+        t.check(oneLess < 1 || 32L * (3_000_000L / (oneLess.toLong() * oneLess)) *
+                StoredCapture.BYTES_PER_MERGED_PIXEL > budget,
+            "and no further than it has to: one step less would not have fitted")
+
+        t.eq(1L, StoredCapture.workingSubsampleFor(4, 500_000, budget).toLong(),
+            "a small capture is left alone")
+        t.eq(1L, StoredCapture.workingSubsampleFor(0, 3_000_000, budget).toLong(),
+            "and a degenerate one does not divide by zero")
+        t.check(StoredCapture.workingSubsampleFor(4096, 12_000_000, budget) <= 8,
+            "even an impossible job stops reducing rather than shrinking to nothing")
     }
 
     /**

@@ -1,53 +1,367 @@
 package com.immineal.hdri360.ui
 
+import android.Manifest
+import android.content.Intent
+import android.content.pm.PackageManager
+import android.graphics.SurfaceTexture
+import android.os.Build
 import android.os.Bundle
+import android.view.TextureView
+import android.view.WindowManager
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
+import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.foundation.background
+import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.Row
+import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
+import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.safeDrawingPadding
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.verticalScroll
+import androidx.compose.material3.Button
+import androidx.compose.material3.ButtonDefaults
+import androidx.compose.material3.Card
+import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.material3.darkColorScheme
+import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
-import androidx.compose.runtime.produceState
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
+import androidx.compose.runtime.setValue
+import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.text.font.FontFamily
+import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
-import com.immineal.hdri360.core.Parallel
-import com.immineal.hdri360.core.camera.Intrinsics
-import com.immineal.hdri360.core.hdr.BracketConfig
-import com.immineal.hdri360.core.hdr.BracketPlanner
-import com.immineal.hdri360.core.hdr.DeviceExposureLimits
-import com.immineal.hdri360.core.hdr.Photometry
-import com.immineal.hdri360.core.hdr.SceneStats
-import com.immineal.hdri360.core.pano.CapturePlan
-import com.immineal.hdri360.core.pano.CapturePlanConfig
+import androidx.compose.ui.viewinterop.AndroidView
+import androidx.lifecycle.compose.collectAsStateWithLifecycle
+import com.immineal.hdri360.device.CaptureSession
+import com.immineal.hdri360.device.CaptureUiState
+import com.immineal.hdri360.device.ProcessingService
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
-import java.util.Locale
+import java.io.File
 
 /**
- * For now this only proves the wiring: that the radiance core runs unchanged on
- * the device, inside an app, and that its answers there are the ones it gives
- * everywhere else. The capture UI replaces it.
+ * The capture screen.
+ *
+ * One job: point the phone where the sphere still has a hole, and say plainly
+ * what this device is actually able to record. The tier line is not decoration -
+ * a capture that could not be driven manually is not a radiance measurement, and
+ * the user finds that out here rather than from a file that looks the same
+ * either way.
  */
 class CaptureActivity : ComponentActivity() {
+
+    private lateinit var session: CaptureSession
+    private var previewTexture: SurfaceTexture? = null
+    private var pending by mutableStateOf<File?>(null)
+    /**
+     * What the user asked for, held until there is a surface to preview into.
+     *
+     * The camera cannot be opened before the TextureView exists: without a real
+     * preview target the session configures against a detached one and the user
+     * aims a sphere at a black screen.
+     */
+    private var wanted by mutableStateOf<Pair<String, File?>?>(null)
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        // A sphere takes minutes of aiming; the screen going out mid-capture would
+        // stop the sensors and lose the pose.
+        window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+        session = CaptureSession(this) { dir -> pending = dir }
+
         setContent {
             MaterialTheme(colorScheme = darkColorScheme()) {
-                Surface(modifier = Modifier.fillMaxSize()) {
-                    val report by produceState("running the core...") {
-                        value = withContext(Dispatchers.Default) { selfCheck() }
+                // contentColorFor(Black) is unspecified, so without this every piece
+                // of text that does not set its own colour comes out black on black.
+                Surface(Modifier.fillMaxSize(), color = Color.Black,
+                        contentColor = Color(0xFFECECEC)) {
+                    var granted by remember {
+                        mutableStateOf(checkSelfPermission(Manifest.permission.CAMERA)
+                            == PackageManager.PERMISSION_GRANTED)
                     }
-                    Column(Modifier.padding(16.dp).verticalScroll(rememberScrollState())) {
-                        Text("360 HDRI Camera", style = MaterialTheme.typography.titleLarge)
-                        Text(report, fontFamily = FontFamily.Monospace, fontSize = 12.sp)
+                    val ask = rememberLauncherForPermission { granted = it }
+                    val state by session.state.collectAsStateWithLifecycle()
+                    val processing by ProcessingService.state.collectAsStateWithLifecycle()
+
+                    val ready = pending
+                    when {
+                        !granted -> PermissionScreen { ask() }
+                        processing.active || processing.finished ->
+                            ProcessingScreen(processing, { dir -> openReview(dir) }) {
+                                ProcessingService.acknowledge(); pending = null
+                            }
+                        ready != null -> ReadyScreen(ready) { width ->
+                            pending = null
+                            ProcessingService.start(this@CaptureActivity, ready, width)
+                        }
+                        state.phase == CaptureUiState.Phase.IDLE && wanted == null ->
+                            StartScreen(state) { lens, resume -> wanted = Pair(lens, resume) }
+                        else -> CaptureScreen(state, sensorRotation(state),
+                            onSurface = { st -> onPreviewSurface(st) },
+                            onFinish = { session.finish() },
+                            onSkipScan = { session.finishScan() })
+                    }
+                }
+            }
+        }
+    }
+
+    override fun onStop() {
+        super.onStop()
+        // The camera belongs to whatever is in front of the user. Holding it in the
+        // background is how an app becomes the reason another one cannot open it.
+        if (isFinishing) session.stop()
+    }
+
+    override fun onDestroy() {
+        super.onDestroy()
+        session.stop()
+    }
+
+    private fun onPreviewSurface(st: SurfaceTexture?) {
+        previewTexture = st
+        val start = wanted ?: return
+        if (st == null) return
+        wanted = null
+        session.start(start.first, st, start.second)
+    }
+
+    private fun openReview(dir: File) {
+        startActivity(Intent(this, ReviewActivity::class.java)
+            .putExtra(ReviewActivity.EXTRA_DIR, dir.absolutePath))
+    }
+
+    /** How far the sensor's frame is turned from the way the phone is being held. */
+    private fun sensorRotation(state: CaptureUiState): Int {
+        val sensor = state.sensorOrientationDeg
+        val display = when (if (Build.VERSION.SDK_INT >= 30) display?.rotation ?: 0
+                            else @Suppress("DEPRECATION") windowManager.defaultDisplay.rotation) {
+            1 -> 90
+            2 -> 180
+            3 -> 270
+            else -> 0
+        }
+        return ((sensor - display) % 360 + 360) % 360
+    }
+
+    @Composable
+    private fun rememberLauncherForPermission(onResult: (Boolean) -> Unit): () -> Unit {
+        val launcher = androidx.activity.compose.rememberLauncherForActivityResult(
+            ActivityResultContracts.RequestPermission(), onResult)
+        return { launcher.launch(Manifest.permission.CAMERA) }
+    }
+}
+
+@Composable
+private fun PermissionScreen(onAsk: () -> Unit) {
+    Column(Modifier.fillMaxSize().safeDrawingPadding().padding(28.dp),
+        verticalArrangement = Arrangement.Center) {
+        Text("360 HDRI Camera", style = MaterialTheme.typography.headlineSmall)
+        Spacer(Modifier.height(12.dp))
+        Text("This app needs the camera to photograph the sphere. Nothing leaves the " +
+            "phone: there is no network permission in the manifest at all.",
+            style = MaterialTheme.typography.bodyMedium)
+        Spacer(Modifier.height(24.dp))
+        Button(onAsk) { Text("Allow the camera") }
+    }
+}
+
+@Composable
+private fun StartScreen(state: CaptureUiState, onStart: (String, File?) -> Unit) {
+    var lens by remember { mutableStateOf(state.chosenLens) }
+    Column(Modifier.fillMaxSize().safeDrawingPadding().padding(24.dp)
+        .verticalScroll(rememberScrollState())) {
+        Text("360 HDRI Camera", style = MaterialTheme.typography.headlineSmall)
+        Spacer(Modifier.height(6.dp))
+        Text("A full sphere in linear radiance, bracketed automatically.",
+            style = MaterialTheme.typography.bodyMedium, color = Color(0xFFB0B0B0))
+        Spacer(Modifier.height(20.dp))
+
+        if (state.lenses.isEmpty()) {
+            Text("No usable camera was found on this device.", color = Color(0xFFFF8A80))
+            return@Column
+        }
+
+        Text("Lens", style = MaterialTheme.typography.labelLarge)
+        Spacer(Modifier.height(8.dp))
+        for (option in state.lenses.filter { !it.frontFacing }) {
+            val selected = option.cameraId == lens
+            OutlinedButton(
+                onClick = { lens = option.cameraId },
+                modifier = Modifier.fillMaxWidth().padding(vertical = 3.dp),
+                colors = if (selected)
+                    ButtonDefaults.outlinedButtonColors(containerColor = Color(0x2239C36B))
+                else ButtonDefaults.outlinedButtonColors()
+            ) {
+                Text(option.toString(), modifier = Modifier.fillMaxWidth())
+            }
+        }
+
+        state.resumable?.let { dir ->
+            Spacer(Modifier.height(20.dp))
+            Card(Modifier.fillMaxWidth()) {
+                Column(Modifier.padding(14.dp)) {
+                    Text("An unfinished capture is waiting",
+                        style = MaterialTheme.typography.titleSmall)
+                    Spacer(Modifier.height(4.dp))
+                    Text("It will carry on from where it stopped, on the same exposure " +
+                        "ladder, so both halves land on one radiance scale.",
+                        style = MaterialTheme.typography.bodySmall)
+                    Spacer(Modifier.height(10.dp))
+                    Button({ lens?.let { onStart(it, dir) } }) { Text("Resume it") }
+                }
+            }
+        }
+
+        Spacer(Modifier.height(24.dp))
+        Button({ lens?.let { onStart(it, null) } }, Modifier.fillMaxWidth()) {
+            Text("Start a new sphere")
+        }
+        if (state.phase == CaptureUiState.Phase.FAILED) {
+            Spacer(Modifier.height(16.dp))
+            Text(state.message, color = Color(0xFFFF8A80),
+                style = MaterialTheme.typography.bodySmall)
+        }
+    }
+}
+
+@Composable
+private fun CaptureScreen(state: CaptureUiState, rotationDeg: Int,
+                          onSurface: (SurfaceTexture?) -> Unit,
+                          onFinish: () -> Unit, onSkipScan: () -> Unit) {
+    val snap = state.snapshot
+    Box(Modifier.fillMaxSize()) {
+        AndroidView(factory = { ctx ->
+            TextureView(ctx).apply {
+                surfaceTextureListener = object : TextureView.SurfaceTextureListener {
+                    override fun onSurfaceTextureAvailable(st: SurfaceTexture, w: Int, h: Int) =
+                        onSurface(st)
+                    override fun onSurfaceTextureSizeChanged(st: SurfaceTexture, w: Int, h: Int) { }
+                    override fun onSurfaceTextureDestroyed(st: SurfaceTexture): Boolean {
+                        onSurface(null); return true
+                    }
+                    override fun onSurfaceTextureUpdated(st: SurfaceTexture) { }
+                }
+            }
+        }, modifier = Modifier.fillMaxSize())
+
+        SphereOverlay(
+            targets = state.targets,
+            shot = snap?.shot,
+            abandoned = snap?.abandoned,
+            current = snap?.currentTarget ?: -1,
+            pose = state.pose,
+            intrinsics = state.intrinsics,
+            aligned = snap?.aligned ?: false,
+            steady = snap?.steady ?: false,
+            modifier = Modifier.fillMaxSize(),
+            rotationDeg = rotationDeg)
+
+        Column(Modifier.align(Alignment.TopCenter).fillMaxWidth()
+            .background(Color(0xAA000000)).safeDrawingPadding().padding(12.dp)) {
+            Text(state.message, style = MaterialTheme.typography.titleSmall)
+            if (state.tierNote.isNotEmpty()) {
+                Spacer(Modifier.height(2.dp))
+                Text(state.tierNote, style = MaterialTheme.typography.bodySmall,
+                    color = Color(0xFFB0B0B0))
+            }
+            state.warning?.let {
+                Spacer(Modifier.height(4.dp))
+                Text(it, style = MaterialTheme.typography.bodySmall, color = Color(0xFFFFC400))
+            }
+        }
+
+        val target = snap?.currentTarget?.takeIf { it >= 0 && it < state.targets.size }
+            ?.let { state.targets[it] }
+        Text(aimText(state.pose, target, rotationDeg),
+            modifier = Modifier.align(Alignment.Center).padding(top = 96.dp),
+            style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.Medium)
+
+        Column(Modifier.align(Alignment.BottomCenter).fillMaxWidth()
+            .background(Color(0xAA000000)).safeDrawingPadding().padding(14.dp)) {
+            if (snap != null) {
+                val progress = if (state.phase == CaptureUiState.Phase.SCANNING)
+                    snap.scanCoverage.toFloat() else snap.progress.toFloat()
+                LinearProgressIndicator({ progress.coerceIn(0f, 1f) },
+                    Modifier.fillMaxWidth().height(4.dp))
+                Spacer(Modifier.height(8.dp))
+                Text(
+                    if (state.phase == CaptureUiState.Phase.SCANNING)
+                        "metered ${Math.round(snap.scanCoverage * 100)}% of the sphere"
+                    else {
+                        val lost = snap.abandoned.count { it }
+                        "${snap.directionsShot} of ${snap.shot.size} directions, " +
+                        "${snap.framesTaken} frames" +
+                        if (lost > 0) ", $lost could not be shot" else ""
+                    },
+                    style = MaterialTheme.typography.bodyMedium, fontFamily = FontFamily.Monospace,
+                    fontSize = 13.sp)
+            }
+            Spacer(Modifier.height(10.dp))
+            Row(horizontalArrangement = Arrangement.spacedBy(10.dp)) {
+                if (state.phase == CaptureUiState.Phase.SCANNING)
+                    OutlinedButton(onSkipScan) { Text("Done sweeping") }
+                if (state.phase == CaptureUiState.Phase.CAPTURING)
+                    OutlinedButton(onFinish) { Text("Finish here") }
+            }
+        }
+    }
+}
+
+/**
+ * The estimate, before the user commits to it.
+ *
+ * Measured on this phone rather than assumed: the same sphere is a couple of
+ * minutes on one device and the better part of an hour on another, so the only
+ * useful number is one this machine produced.
+ */
+@Composable
+private fun ReadyScreen(dir: File, onChoose: (Int) -> Unit) {
+    var options by remember {
+        mutableStateOf<List<com.immineal.hdri360.core.pipeline.ResolutionOption>?>(null)
+    }
+    LaunchedEffect(dir) {
+        options = withContext(Dispatchers.Default) { ProcessingService.optionsFor(dir) }
+    }
+    Column(Modifier.fillMaxSize().safeDrawingPadding().padding(24.dp),
+        verticalArrangement = Arrangement.Center) {
+        Text("The sphere is captured", style = MaterialTheme.typography.headlineSmall)
+        Spacer(Modifier.height(8.dp))
+        Text("Every frame is already on the phone. Pick an output size; the times " +
+            "below were measured on this device just now.",
+            style = MaterialTheme.typography.bodyMedium, color = Color(0xFFB0B0B0))
+        Spacer(Modifier.height(20.dp))
+        val list = options
+        if (list == null) {
+            Text("Timing this phone...", style = MaterialTheme.typography.bodyMedium)
+        } else if (list.isEmpty()) {
+            Text("No direction was completely shot, so there is nothing to stitch.",
+                color = Color(0xFFFF8A80))
+        } else {
+            for (o in list) {
+                OutlinedButton({ onChoose(o.width) },
+                    Modifier.fillMaxWidth().padding(vertical = 4.dp)) {
+                    Column(Modifier.fillMaxWidth()) {
+                        Text("${o.label}  ${o.width} x ${o.height}",
+                            style = MaterialTheme.typography.titleSmall)
+                        Text(o.estimate.humanText(), style = MaterialTheme.typography.bodySmall,
+                            color = Color(0xFFB0B0B0))
                     }
                 }
             }
@@ -55,40 +369,34 @@ class CaptureActivity : ComponentActivity() {
     }
 }
 
-/**
- * Exercises the parts of the core the app will lean on, and prints numbers that
- * can be checked against the desktop rather than merely "it did not crash".
- */
-private fun selfCheck(): String {
-    val sb = StringBuilder()
-    fun line(s: String) = sb.append(s).append('\n')
-
-    line("cores: ${Runtime.getRuntime().availableProcessors()}, " +
-         "worker threads: ${Parallel.threads}")
-    line("")
-
-    // The capture plan the guidance overlay will draw.
-    val k = Intrinsics.fromHorizontalFov(3000, 4000, 58.7)
-    val plan = CapturePlan.forCamera(k, CapturePlanConfig())
-    line(String.format(Locale.US, "capture plan  %.1f x %.1f deg -> %d directions",
-        k.horizontalFovDeg(), k.verticalFovDeg(), plan.targets.size))
-
-    // The exposure ladder, from the Pixel 9a's own reported limits.
-    val limits = DeviceExposureLimits(1.0 / 17554, 16.0, 29, 7276, 29, 1.7, 1.0 / 15.0)
-    val scene = listOf(
-        SceneStats(1e2, 2e5, 4500.0, 0.0, 0.0, false, false),
-        SceneStats(1e-1, 2e1, 1.4, 0.0, 0.0, false, false))
-    val bracket = BracketPlanner.plan(scene, limits, BracketConfig())
-    line(String.format(Locale.US, "bracket plan  %d rungs, %d shots, %.1f EV span",
-        bracket.ladder.size(), bracket.totalShots(), bracket.ladder.evSpan()))
-
-    // The photometric scale, which is only meaningful on the RAW+manual tier.
-    line(String.format(Locale.US, "photometry    %.4g cd/m2 per unit at f/1.7, base ISO 29",
-        Photometry.luminanceScale(1.7, 29)))
-    line(String.format(Locale.US, "              headroom %.4f stops above middle grey",
-        Photometry.headroomStops()))
-    line("")
-    line("These must match the desktop exactly; if they do,")
-    line("the core is behaving identically on this device.")
-    return sb.toString()
+@Composable
+private fun ProcessingScreen(p: ProcessingService.State, onReview: (File) -> Unit,
+                             onDismiss: () -> Unit) {
+    Column(Modifier.fillMaxSize().safeDrawingPadding().padding(24.dp),
+        verticalArrangement = Arrangement.Center) {
+        Text(if (p.finished) "Finished" else "Building the sphere",
+            style = MaterialTheme.typography.headlineSmall)
+        Spacer(Modifier.height(14.dp))
+        Text(p.stage, style = MaterialTheme.typography.bodyMedium)
+        Spacer(Modifier.height(10.dp))
+        LinearProgressIndicator({ p.fraction.toFloat().coerceIn(0f, 1f) },
+            Modifier.fillMaxWidth().height(5.dp))
+        Spacer(Modifier.height(10.dp))
+        if (!p.finished && p.remainingText.isNotEmpty())
+            Text(p.remainingText, style = MaterialTheme.typography.bodySmall,
+                color = Color(0xFFB0B0B0))
+        if (p.error != null) {
+            Spacer(Modifier.height(12.dp))
+            Text(p.error, color = Color(0xFFFF8A80), style = MaterialTheme.typography.bodySmall)
+        }
+        if (p.finished) {
+            Spacer(Modifier.height(22.dp))
+            p.directory?.let { d ->
+                if (p.error == null)
+                    Button({ onReview(d) }, Modifier.fillMaxWidth()) { Text("Look at it") }
+            }
+            Spacer(Modifier.height(8.dp))
+            OutlinedButton(onDismiss, Modifier.fillMaxWidth()) { Text("Back to capture") }
+        }
+    }
 }

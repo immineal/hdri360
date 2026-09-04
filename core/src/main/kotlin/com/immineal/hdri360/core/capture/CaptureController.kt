@@ -70,6 +70,17 @@ class CaptureController(
         @JvmField var maxBurstAttempts = 3
         /** Exposure the scan starts at, before metering has anything to say. */
         @JvmField var initialScanExposure = 1.0 / 120.0
+        /**
+         * Where the preview puts the scene's median once the scan is over.
+         *
+         * The metering exposure is not a viewing exposure. Metering wants the
+         * brightest tenth of a percent just under saturation so the top of the
+         * range can be measured, which in an ordinary room leaves everything else
+         * black - and a user cannot aim a sphere at a black screen. So once the
+         * ladder is fixed the preview is re-exposed for the eye, while the
+         * brackets go on being shot at the ladder's own exposures.
+         */
+        @JvmField var previewMedianTarget = 0.18
     }
 
     enum class State { IDLE, SCANNING, CAPTURING, FINISHED, FAILED }
@@ -80,7 +91,17 @@ class CaptureController(
      */
     class Snapshot(
         @JvmField val state: State,
+        /** Directions that were actually captured. */
         @JvmField val shot: BooleanArray,
+        /**
+         * Directions given up on after repeated failures.
+         *
+         * Kept apart from [shot] because they are not the same thing and one flag
+         * cannot mean both: conflating them makes the app report a full sphere it
+         * does not have, and makes a resumed capture skip the one direction with
+         * no frames in it.
+         */
+        @JvmField val abandoned: BooleanArray,
         @JvmField val currentTarget: Int,
         @JvmField val yawOffsetDeg: Double,
         @JvmField val pitchOffsetDeg: Double,
@@ -106,6 +127,9 @@ class CaptureController(
     private val lock = Any()
     private var state = State.IDLE
     private val shot = BooleanArray(targetCount)
+    private val abandoned = BooleanArray(targetCount)
+    /** Directions the guide should stop offering: captured, or given up on. */
+    private val settled = BooleanArray(targetCount)
     private val perTarget = arrayOfNulls<SceneStats>(targetCount)
     private val attempts = IntArray(targetCount)
     private var bracketPlan: BracketPlan? = null
@@ -151,12 +175,14 @@ class CaptureController(
             if (alreadyShot.size != targetCount)
                 throw IllegalArgumentException("resuming a capture of a different shape")
             System.arraycopy(alreadyShot, 0, shot, 0, targetCount)
+            System.arraycopy(alreadyShot, 0, settled, 0, targetCount)
+            java.util.Arrays.fill(abandoned, false)
             bracketPlan = plannedBrackets
             framesPlanned = plannedBrackets.totalShots()
             framesTaken = 0
             for (i in 0 until targetCount)
                 if (shot[i]) framesTaken += plannedBrackets.indicesPerTarget[i].size
-            state = if (shot.all { it }) State.FINISHED else State.CAPTURING
+            state = if (settled.all { it }) State.FINISHED else State.CAPTURING
             message = "resumed with ${shot.count { it }} of $targetCount directions already shot"
         }
         source.setPreviewMeteringEnabled(false)
@@ -178,6 +204,18 @@ class CaptureController(
 
     /** Fraction of directions that have been metered at least once. */
     fun scanCoverage(): Double = synchronized(lock) { meteredFraction() }
+
+    /**
+     * The ladder this capture committed to, once the scan has closed.
+     *
+     * Needed by whoever writes the frames down: a capture that is interrupted has
+     * to come back on the same ladder, so the ladder has to be stored with it.
+     */
+    fun bracketPlan(): BracketPlan? = synchronized(lock) { bracketPlan }
+
+    /** What the preview is currently being shown at, which is not what is being shot. */
+    fun previewExposure(): com.immineal.hdri360.core.hdr.ExposureSettings =
+        synchronized(lock) { previewExposure }
 
     private fun meteredFraction(): Double {
         var n = 0
@@ -213,8 +251,18 @@ class CaptureController(
             message = String.format(java.util.Locale.US,
                 "%.0f EV of scene: %d frames over %d directions",
                 union.dynamicRangeEv(), ladder.totalShots(), targetCount)
+            val want = SceneMeter.viewingRelativeExposure(union, config.previewMedianTarget)
+            if (want.isFinite() && want > 0) {
+                // Never slower than a hand can hold. A preview that updates once
+                // every sixteen seconds is not a preview, and that is exactly where
+                // an unbounded request lands when the scene's dark end is at zero.
+                val lim = source.profile.exposureLimits
+                val ceiling = lim.maxHandheldTimeSec * lim.maxIso / lim.baseIso.toDouble()
+                previewExposure = lim.realize(Math.min(want, ceiling))
+            }
         }
         source.setPreviewMeteringEnabled(false)
+        source.startPreview(synchronized(lock) { previewExposure })
         publish()
         return true
     }
@@ -224,7 +272,7 @@ class CaptureController(
         synchronized(lock) {
             if (state == State.FINISHED) return
             state = State.FINISHED
-            message = "captured ${shot.count { it }} of $targetCount directions"
+            message = finishedMessageLocked()
         }
         publish()
     }
@@ -283,11 +331,11 @@ class CaptureController(
             if (state != State.CAPTURING) return@synchronized
             val ladder = bracketPlan ?: return@synchronized
 
-            val target = CaptureGuide.nearestPendingTarget(plan.targets, shot, cameraToWorld)
+            val target = CaptureGuide.nearestPendingTarget(plan.targets, settled, cameraToWorld)
             currentTarget = target
             if (target < 0) {
                 state = State.FINISHED
-                message = "captured $targetCount of $targetCount directions"
+                message = finishedMessageLocked()
                 return@synchronized
             }
             val t = plan.targets[target]
@@ -356,21 +404,26 @@ class CaptureController(
             // left a hole that nothing later would fill.
             if (pendingReceived >= requested && requested > 0) {
                 shot[targetIndex] = true
+                settled[targetIndex] = true
+                abandoned[targetIndex] = false
                 attempts[targetIndex] = 0
             } else {
                 attempts[targetIndex]++
                 message = if (attempts[targetIndex] >= config.maxBurstAttempts)
                     "direction ${targetIndex + 1} kept failing; moving on"
                 else "direction ${targetIndex + 1} came back short; retrying"
-                if (attempts[targetIndex] >= config.maxBurstAttempts) shot[targetIndex] = true
+                if (attempts[targetIndex] >= config.maxBurstAttempts) {
+                    abandoned[targetIndex] = true
+                    settled[targetIndex] = true
+                }
             }
             pendingTarget = -1
             pendingBurst = 0L
             pendingRungs = 0
             pendingReceived = 0
-            if (shot.all { it }) {
+            if (settled.all { it }) {
                 state = State.FINISHED
-                message = "captured ${shot.count { it }} of $targetCount directions"
+                message = finishedMessageLocked()
             }
         }
         publish()
@@ -438,9 +491,17 @@ class CaptureController(
         return best
     }
 
+    /** Says what was actually captured, and admits to anything that was not. */
+    private fun finishedMessageLocked(): String {
+        val got = shot.count { it }
+        val lost = abandoned.count { it }
+        return if (lost == 0) "captured all $targetCount directions"
+        else "captured $got of $targetCount directions; $lost could not be shot"
+    }
+
     private fun buildSnapshot(): Snapshot {
         val measured = perTarget.filterNotNull()
-        return Snapshot(state, shot.copyOf(), currentTarget, yawOffset, pitchOffset,
+        return Snapshot(state, shot.copyOf(), abandoned.copyOf(), currentTarget, yawOffset, pitchOffset,
             aligned, steady, framesTaken, framesPlanned, meteredFraction(),
             if (measured.isEmpty()) null else SceneStats.union(measured), message)
     }

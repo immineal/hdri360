@@ -32,7 +32,13 @@ object SceneMeter {
         val lowValue = ImageOps.percentile(lum, 0, cfg.lowPercentile).toDouble()
         val medValue = ImageOps.percentile(lum, 0, 0.5).toDouble()
 
-        val highlightsClipped = clipFrac > cfg.clipTolerance
+        // Both have to agree. The bare count catches a frame that is genuinely on
+        // the rail, but on its own it also catches the handful of stuck pixels
+        // every real sensor has - which no shutter speed removes, so the
+        // controller stops down through its whole range chasing them. The high
+        // quantile cannot be moved by a speckle, so requiring it to agree is what
+        // separates a blown highlight from a hot pixel.
+        val highlightsClipped = clipFrac > cfg.clipTolerance && highValue >= cfg.saturationThreshold
         val shadowsCrushed = blackFrac > cfg.blackTolerance
 
         // A clipped frame can only bound the true radiance from below.
@@ -51,6 +57,29 @@ object SceneMeter {
         if (s.highlightsClipped) return false
         if (s.highValue.isNaN()) return true
         return s.highValue >= cfg.aeTargetLow && s.highValue <= cfg.aeTargetHigh
+    }
+
+    /**
+     * A relative exposure for looking at the scene rather than measuring it.
+     *
+     * Metering puts the brightest tenth of a percent just under saturation so the
+     * top of the range can be read; that is the correct exposure for a
+     * measurement and a useless one for a viewfinder, since in an ordinary room
+     * it leaves everything else black.
+     *
+     * The median is the right anchor when there is one. In a room with a window
+     * most of the frame can quantise to zero at the metering exposure, and then
+     * the median says nothing at all - so the fallback is the geometric mean of
+     * the two ends, which is the middle of the scene in the space the scene
+     * actually lives in.
+     */
+    @JvmStatic
+    @JvmOverloads
+    fun viewingRelativeExposure(s: SceneStats, target: Double = 0.18): Double {
+        val anchor = if (s.medianRadiance > 1e-9) s.medianRadiance
+                     else Math.sqrt(s.lowRadiance * s.highRadiance)
+        if (!(anchor > 0) || !anchor.isFinite()) return Double.NaN
+        return target / anchor
     }
 
     /** Next relative exposure to probe with. */

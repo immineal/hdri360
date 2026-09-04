@@ -3,6 +3,7 @@ package com.immineal.hdri360.core.pipeline
 import com.immineal.hdri360.core.capture.CaptureTier
 import com.immineal.hdri360.core.capture.FrameRecord
 import com.immineal.hdri360.core.capture.FrameStore
+import com.immineal.hdri360.core.capture.SensorGeometry
 import com.immineal.hdri360.core.capture.StoredSession
 import com.immineal.hdri360.core.hdr.Exposure
 import com.immineal.hdri360.core.hdr.Photometry
@@ -11,6 +12,7 @@ import com.immineal.hdri360.core.image.BayerImage
 import com.immineal.hdri360.core.image.CfaPattern
 import com.immineal.hdri360.core.image.Demosaic
 import com.immineal.hdri360.core.image.ImageF
+import com.immineal.hdri360.core.image.ImageOps
 import java.util.Locale
 
 /**
@@ -41,27 +43,55 @@ object StoredCapture {
      */
     @JvmStatic
     @JvmOverloads
-    fun inputs(store: FrameStore, reader: Reader = StoreReader(store)): List<HdriPipeline.FrameInput> {
+    fun inputs(store: FrameStore, reader: Reader = StoreReader(store),
+               subsample: Int = 1): List<HdriPipeline.FrameInput> {
         val session = store.session
+        val k = SensorGeometry.subsampled(session.intrinsics, subsample)
         val out = ArrayList<HdriPipeline.FrameInput>()
         for (target in session.plan.indicesPerTarget.indices) {
             val bracket = recordsFor(store, target) ?: continue
             val label = String.format(Locale.US, "t%03d", target)
-            out.add(HdriPipeline.FrameInput.deferred(session.intrinsics, bracket[0].pose, label) {
-                exposuresOf(bracket, session, reader)
+            out.add(HdriPipeline.FrameInput.deferred(k, bracket[0].pose, label) {
+                exposuresOf(bracket, session, reader, subsample)
             })
         }
         return out
     }
 
+    /**
+     * How much to shrink each frame so the whole job fits in [budgetBytes].
+     *
+     * The merged radiance for every direction has to be resident at once - the
+     * renderer walks all of them for each output row - so the memory the job
+     * needs is set by the sphere, not by one frame. On a phone with a 512 MB heap
+     * a thirty-two direction sphere at three megapixels a frame is over a
+     * gigabyte of merged float, and no amount of care during merging changes
+     * that.
+     *
+     * Reducing here rather than failing is the honest trade: the alternative is a
+     * capture the user cannot process at all. What is chosen gets said out loud.
+     */
+    @JvmStatic
+    fun workingSubsampleFor(directions: Int, framePixels: Long, budgetBytes: Long): Int {
+        if (directions <= 0 || framePixels <= 0 || budgetBytes <= 0) return 1
+        var f = 1
+        // Three channels of float per merged pixel, plus the confidence map.
+        while (f < 8 && directions * (framePixels / (f.toLong() * f)) * BYTES_PER_MERGED_PIXEL
+               > budgetBytes) f *= 2
+        return f
+    }
+
+    /** Three float channels of radiance plus one of confidence. */
+    const val BYTES_PER_MERGED_PIXEL = 16L
+
     /** The bracket for one direction, read now. */
     @JvmStatic
     @JvmOverloads
     fun openBracketFor(store: FrameStore, target: Int,
-                       reader: Reader = StoreReader(store)): List<Exposure> {
+                       reader: Reader = StoreReader(store), subsample: Int = 1): List<Exposure> {
         val bracket = recordsFor(store, target)
             ?: throw IllegalArgumentException("direction $target was not completely shot")
-        return exposuresOf(bracket, store.session, reader)
+        return exposuresOf(bracket, store.session, reader, subsample)
     }
 
     /** Forces a deferred input, for callers that want the frames rather than the pipeline. */
@@ -110,8 +140,31 @@ object StoredCapture {
         return out
     }
 
+    /**
+     * Applies the capture's one white balance, normalised so green is unchanged.
+     *
+     * Scaling all three channels would move the absolute radiance scale, which
+     * the photometry is anchored to; scaling relative to green corrects the
+     * colour without touching the luminance the calibration describes.
+     */
+    private fun whiteBalance(image: ImageF, gains: DoubleArray?) {
+        if (gains == null || gains.size < 3 || image.channels < 3) return
+        val g = if (gains[1] > 1e-9) gains[1] else 1.0
+        val r = (gains[0] / g).toFloat()
+        val b = (gains[2] / g).toFloat()
+        if (Math.abs(r - 1f) < 1e-6f && Math.abs(b - 1f) < 1e-6f) return
+        val d = image.data
+        val step = image.channels
+        var i = 0
+        while (i < d.size) {
+            d[i] *= r
+            d[i + 2] *= b
+            i += step
+        }
+    }
+
     private fun exposuresOf(bracket: List<FrameRecord>, session: StoredSession,
-                            reader: Reader): List<Exposure> {
+                            reader: Reader, subsample: Int): List<Exposure> {
         val out = ArrayList<Exposure>(bracket.size)
         for (r in bracket) {
             var image = reader.read(r)
@@ -122,6 +175,11 @@ object StoredCapture {
                 image = Demosaic.malvarHeCutler(
                     BayerImage(image.width, image.height, pattern, image.data))
             }
+            whiteBalance(image, session.neutralGains)
+            // Reduced here, one rung at a time, so the full size copy is collectable
+            // before the next rung is read rather than after the whole bracket is.
+            var f = subsample
+            while (f > 1) { image = ImageOps.downsample2x(image); f /= 2 }
             out.add(Exposure.of(image, r.settings, session.baseIso))
         }
         return out

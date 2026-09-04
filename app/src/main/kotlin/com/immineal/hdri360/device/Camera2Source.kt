@@ -161,7 +161,7 @@ class Camera2Source private constructor(
             s.captureBurst(requests, burstCallback, handler)
             true
         } catch (e: Exception) {
-            Log.w(TAG, "the bracket could not be submitted", e)
+            CaptureLog.warn("the bracket could not be submitted", e)
             synchronized(lock) { this.burstId = 0L; burstTarget = -1; burstExpected = 0 }
             applyPreview()
             report("This bracket could not be started: ${e.message}", false)
@@ -191,15 +191,54 @@ class Camera2Source private constructor(
     private fun applyPreview() {
         val s = session ?: return
         val settings = synchronized(lock) { previewSettings }
+        // White balance has to come from somewhere, and with AWB switched off the
+        // camera will not compute one. So the very first preview runs under the
+        // camera's own algorithms purely to read the gains it picks, and
+        // everything after that is manual with those gains frozen in. One scale
+        // for the whole sphere is the point: a per-frame white balance puts every
+        // direction on a different colour scale and no blending hides it.
+        val probing = profile.tier.drivesExposure && lockedWhiteBalance == null
         try {
             val b = device.createCaptureRequest(CameraDevice.TEMPLATE_PREVIEW)
             b.addTarget(previewSurface)
             meteringReader?.let { if (synchronized(lock) { meteringEnabled }) b.addTarget(it.surface) }
-            applyManualSettings(b, settings)
-            s.setRepeatingRequest(b.build(), null, handler)
+            if (probing) applyAutoSettings(b) else applyManualSettings(b, settings)
+            s.setRepeatingRequest(b.build(), if (probing) whiteBalanceProbe else null, handler)
         } catch (e: Exception) {
             report("The preview stopped: ${e.message}", false)
         }
+    }
+
+    private val whiteBalanceProbe = object : CameraCaptureSession.CaptureCallback() {
+        override fun onCaptureCompleted(s: CameraCaptureSession, request: CaptureRequest,
+                                        result: TotalCaptureResult) {
+            if (lockedWhiteBalance != null) return
+            val awb = result.get(CaptureResult.CONTROL_AWB_STATE)
+            // Wait for it to settle; the first frames report gains it is still moving.
+            if (awb != null && awb != CameraMetadata.CONTROL_AWB_STATE_CONVERGED &&
+                awb != CameraMetadata.CONTROL_AWB_STATE_LOCKED) return
+            val gains = result.get(CaptureResult.COLOR_CORRECTION_GAINS) ?: return
+            lockedWhiteBalance = gains
+            handler.post { applyPreview() }
+        }
+    }
+
+    /** The per-channel gains this capture is fixed to, greens averaged. */
+    fun neutralGains(): DoubleArray? {
+        val g = lockedWhiteBalance ?: return null
+        return doubleArrayOf(g.red.toDouble(),
+            0.5 * (g.greenEven.toDouble() + g.greenOdd.toDouble()), g.blue.toDouble())
+    }
+
+    /** Everything automatic, briefly, so there is something to freeze. */
+    private fun applyAutoSettings(b: CaptureRequest.Builder) {
+        b.set(CaptureRequest.CONTROL_AF_MODE, CameraMetadata.CONTROL_AF_MODE_OFF)
+        b.set(CaptureRequest.LENS_FOCUS_DISTANCE, 0.0f)
+        b.set(CaptureRequest.NOISE_REDUCTION_MODE, CameraMetadata.NOISE_REDUCTION_MODE_OFF)
+        b.set(CaptureRequest.EDGE_MODE, CameraMetadata.EDGE_MODE_OFF)
+        b.set(CaptureRequest.CONTROL_MODE, CameraMetadata.CONTROL_MODE_AUTO)
+        b.set(CaptureRequest.CONTROL_AE_MODE, CameraMetadata.CONTROL_AE_MODE_ON)
+        b.set(CaptureRequest.CONTROL_AWB_MODE, CameraMetadata.CONTROL_AWB_MODE_AUTO)
     }
 
     /**
@@ -213,7 +252,8 @@ class Camera2Source private constructor(
         override fun run() {
             val s = session
             val reader = captureReader
-            val active = synchronized(lock) { meteringEnabled && burstId == 0L && !closed }
+            val settled = !profile.tier.drivesExposure || lockedWhiteBalance != null
+            val active = settled && synchronized(lock) { meteringEnabled && burstId == 0L && !closed }
             if (s == null || reader == null || meteringReader != null || !active) {
                 if (synchronized(lock) { meteringEnabled && !closed } && meteringReader == null)
                     handler.postDelayed(this, METERING_PERIOD_MS)
@@ -320,10 +360,11 @@ class Camera2Source private constructor(
         val settings = actualSettings(result)
         try {
             if (metering) {
-                val luma = try { FrameConverters.luma(image, meteringSubsample()) } catch (e: Exception) { null }
+                val luma = try { meteringPlane(image, result) } catch (e: Exception) { null }
                 image.close()
                 if (luma != null) {
                     val rel = settings.relativeExposure(profile.exposureLimits.baseIso)
+                    logMetering(luma, settings)
                     work.execute { synchronized(lock) { listener }?.onPreviewFrame(luma, rel) }
                 }
                 return
@@ -350,6 +391,40 @@ class Camera2Source private constructor(
             Log.w(TAG, "a captured frame could not be converted", e)
             settle(false)
         }
+    }
+
+    /**
+     * A metering frame, in whatever space this tier actually measures in.
+     *
+     * On the RAW tier that has to be RAW: metering a YUV preview would be
+     * metering the camera's tone curve, and every number the bracket planner
+     * derives from it - the scene's dynamic range, where the highlights sit -
+     * assumes linear sensor units.
+     *
+     * Uncorrected, too: whether the sensor is clipping is a question about the
+     * sensor, and shading correction multiplies the corners by three or four
+     * before the clamp.
+     */
+    private fun meteringPlane(image: Image, result: TotalCaptureResult): ImageF =
+        if (image.format == ImageFormat.RAW_SENSOR)
+            FrameConverters.rawPlane(image, characteristics, result, meteringSubsample(),
+                applyShading = false)
+        else
+            FrameConverters.luma(image, meteringSubsample())
+
+    private var meteringLogged = 0L
+
+    /** Occasional, because a line per preview frame would drown everything else. */
+    private fun logMetering(plane: ImageF, settings: ExposureSettings) {
+        val now = System.currentTimeMillis()
+        if (now - meteringLogged < 1500) return
+        meteringLogged = now
+        var max = 0f
+        var sum = 0.0
+        for (v in plane.data) { if (v > max) max = v; sum += v.toDouble() }
+        CaptureLog.log(String.format(java.util.Locale.US,
+            "meter %dx%d mean %.4f max %.4f at %s",
+            plane.width, plane.height, sum / plane.data.size, max, settings))
     }
 
     private fun convert(image: Image, result: TotalCaptureResult): ImageF =
@@ -463,6 +538,7 @@ class Camera2Source private constructor(
 
     private fun meteringSubsample(): Int {
         val w = (meteringReader ?: captureReader)?.width ?: return 1
+        // Powers of two, because a RAW plane has to stay on its CFA phase.
         var f = 1
         while (w / f > 320 && f < 16) f *= 2
         return f
@@ -633,10 +709,12 @@ class Camera2Source private constructor(
                             }
                         }, handler)
                         source.applyPreview()
+                        CaptureLog.log("configured: $plan, working at 1/$subsample")
                         onReady(source)
                     }
 
                     override fun onConfigureFailed(s: CameraCaptureSession) {
+                        CaptureLog.log("refused: $plan")
                         refused.add("  $plan")
                         try { s.close() } catch (e: Exception) { }
                         readerForClose.close()

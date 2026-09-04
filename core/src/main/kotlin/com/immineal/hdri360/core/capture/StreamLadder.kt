@@ -93,13 +93,14 @@ object StreamLadder {
         // RAW is only worth planning where it would be both linear and driveable:
         // RAW frames at an exposure the camera picked are not a measurement.
         if (r.hasRaw && manual && r.rawSizes.isNotEmpty()) {
-            for (s in r.rawSizes.sortedByDescending { it.pixels() }.take(2)) {
-                if (threeStreams)
-                    out.add(StreamPlan(CaptureTier.LINEAR_RAW, PixelFormat.RAW_SENSOR, s, preview,
-                        true, "RAW at $s with live metering"))
+            // No metering stream. Metering a YUV preview would be metering the
+            // camera's tone curve, and the whole point of this tier is that the
+            // numbers are linear - so the scan meters from RAW stills through the
+            // capture stream instead, which costs a frame a second and one stream
+            // fewer.
+            for (s in r.rawSizes.sortedByDescending { it.pixels() }.take(2))
                 out.add(StreamPlan(CaptureTier.LINEAR_RAW, PixelFormat.RAW_SENSOR, s, preview,
-                    false, "RAW at $s, metering from the preview"))
-            }
+                    false, "RAW at $s, metered from RAW"))
         }
 
         // Three YUV-shaped streams at once is only guaranteed from FULL upward.
@@ -116,10 +117,13 @@ object StreamLadder {
         val unique = ArrayList<StreamPlan>()
         for (p in out) if (seen.add("${p.format}|${p.capture}|${p.preview}|${p.metering}")) unique.add(p)
 
-        // Descend: never more streams than the step that failed, never a better
-        // tier at the same stream count, and otherwise fewer pixels each time.
-        unique.sortWith(compareByDescending<StreamPlan> { it.streamCount() }
-            .thenBy { it.tier.ordinal }
+        // The ladder descends in capability, not in stream count. A configuration
+        // that failed did not fail because two streams was too many, so dropping to
+        // a worse tier and then asking for a third stream is a legitimate next
+        // thing to try; going back up a tier never is. Within a tier the cost
+        // descends: streams first, then pixels.
+        unique.sortWith(compareBy<StreamPlan> { it.tier.ordinal }
+            .thenByDescending { it.streamCount() }
             .thenByDescending { it.capture.pixels() })
         return unique
     }

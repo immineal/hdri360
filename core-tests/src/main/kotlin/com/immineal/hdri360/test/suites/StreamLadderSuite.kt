@@ -87,7 +87,10 @@ class StreamLadderSuite : TestCase {
         t.eq(CaptureTier.LINEAR_RAW, first.tier, "and its first choice is a radiance measurement")
         t.eq(PixelFormat.RAW_SENSOR, first.format, "shot as RAW")
         t.eq(4080L, first.capture.width.toLong(), "at the sensor's full width")
-        t.check(first.metering, "with a metering stream, which it has the streams to afford")
+        t.check(!first.metering,
+            "and asks for no YUV metering stream: metering a tone curve would defeat the tier, " +
+            "so the scan meters from RAW through the capture stream")
+        t.check(first.streamCount() <= 2, "which also leaves it inside two streams")
         t.check(first.preview.width <= 1920,
             "and a preview no larger than a screen, so it costs nothing to run")
 
@@ -118,6 +121,8 @@ class StreamLadderSuite : TestCase {
         val last = namesOf(pixelLike()).last()
         t.eq(false, last.metering, "the final fallback asks for the fewest streams")
         t.eq(PixelFormat.YUV_420_888, last.format, "and the most widely supported format")
+        t.check(namesOf(pixelLike()).none { it.format == PixelFormat.RAW_SENSOR && it.metering },
+            "no RAW plan ever asks for a metering stream")
     }
 
     /** A fallback that asks for more than the thing that just failed is not a fallback. */
@@ -127,12 +132,13 @@ class StreamLadderSuite : TestCase {
             for (i in 1 until plans.size) {
                 val a = plans[i - 1]
                 val b = plans[i]
-                t.check(b.streamCount() <= a.streamCount(),
-                    "step $i of the ${r.hardwareLevel} ladder does not ask for more streams")
-                if (b.streamCount() == a.streamCount()) {
-                    t.check(b.tier.ordinal >= a.tier.ordinal,
-                        "at the same stream count, step $i does not claim a better tier")
-                    if (b.tier == a.tier && b.format == a.format)
+                t.check(b.tier.ordinal >= a.tier.ordinal,
+                    "step $i of the ${r.hardwareLevel} ladder never claims a better tier " +
+                    "than one that has already failed")
+                if (b.tier == a.tier) {
+                    t.check(b.streamCount() <= a.streamCount(),
+                        "and within a tier, step $i does not ask for more streams")
+                    if (b.streamCount() == a.streamCount() && b.format == a.format)
                         t.check(b.capture.pixels() < a.capture.pixels(),
                             "an otherwise identical step at least asks for fewer pixels")
                 }

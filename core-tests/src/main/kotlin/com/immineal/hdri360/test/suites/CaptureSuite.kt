@@ -46,7 +46,8 @@ class CaptureSuite : TestCase {
         private var inFlight = false
 
         override fun setListener(listener: CameraSource.Listener?) { bound = listener }
-        override fun startPreview(settings: ExposureSettings) { previewStarts++ }
+        var lastPreview: ExposureSettings? = null
+        override fun startPreview(settings: ExposureSettings) { lastPreview = settings; previewStarts++ }
         override fun setPreviewMeteringEnabled(enabled: Boolean) { meteringEnabled = enabled }
         override fun close() { closed = true }
 
@@ -156,8 +157,30 @@ class CaptureSuite : TestCase {
             var now = scanEverything(c, cam, 1_000_000_000L)
             t.greaterThan(c.scanCoverage(), 0.9, "sweeping every direction meters the sphere")
 
+            val meteringExposure = cam.lastPreview
             t.check(c.finishScanAndPlan(), "planning succeeds once the scene is metered")
             t.check(!cam.meteringEnabled, "and metering is turned back off")
+
+            // The metering exposure puts the brightest tenth of a percent just under
+            // saturation, which in a real room leaves the preview black - and nobody
+            // can aim a sphere at a black screen. Once the ladder is fixed the
+            // preview is re-exposed for the eye.
+            val viewing = cam.lastPreview
+            t.check(viewing !== meteringExposure,
+                "the preview is re-exposed once the scan is over")
+            val scene = c.snapshot().scene
+            t.check(scene != null, "and the scene it was metered from is known")
+            if (scene != null && viewing != null) {
+                val median = scene.medianRadiance *
+                    viewing.relativeExposure(cam.profile.exposureLimits.baseIso)
+                t.greaterThan(median, 0.02,
+                    "which puts the scene's median somewhere a person can see")
+                t.lessThan(median, 0.9, "without putting it on the rail either")
+            }
+            if (viewing != null)
+                t.check(viewing.exposureTimeSec <= cam.profile.exposureLimits.maxHandheldTimeSec,
+                    "and never asks for a shutter slower than a hand can hold, whatever " +
+                    "the scene's dark end does")
             val planned = c.snapshot().framesPlanned
             t.greaterThan(planned.toDouble(), c.plan.targets.size.toDouble(),
                 "the plan shoots more frames than directions, because it brackets")
@@ -257,14 +280,41 @@ class CaptureSuite : TestCase {
             t.greaterThan(stuck.toDouble(), -1.0, "a direction is chosen")
             if (cam.lastTarget == stuck) cam.deliver(0)
             var tries = 1
-            while (!c.snapshot().shot[stuck] && tries++ < 10) {
+            while (!c.snapshot().abandoned[stuck] && tries++ < 10) {
                 now = settleOn(c, stuck, now + 300_000_000L)
                 if (cam.lastTarget == stuck) cam.deliver(0)      // never delivers anything
             }
-            t.check(c.snapshot().shot[stuck],
+            val after = c.snapshot()
+            t.check(after.abandoned[stuck],
                 "a direction that keeps failing is eventually given up on")
             t.lessThan(tries.toDouble(), 6.0, "and it gives up promptly, not after ten attempts")
+
+            // Giving up is not the same as capturing, and one flag cannot mean both.
+            // Counting an abandoned direction as shot makes the app report a full
+            // sphere it does not have, and makes a resumed capture skip the very
+            // direction that has no frames in it.
+            t.check(!after.shot[stuck], "but it is not reported as captured")
+            t.eq(0L, after.directionsShot.toLong(), "so nothing counts as shot yet")
+            t.check(!after.message.isNullOrEmpty(), "and the user is told what happened")
+            now = settleOn(c, stuck, now + 300_000_000L)
+            t.check(c.snapshot().currentTarget != stuck,
+                "the next direction offered is a different one")
             t.note("a hopeless direction was abandoned after " + tries + " attempts")
+
+            // Shooting the rest still finishes the capture, with an honest count.
+            var guard = 0
+            while (c.snapshot().state == CaptureController.State.CAPTURING && guard++ < 300) {
+                val (target, then) = aimAtNext(c, now + 300_000_000L)
+                now = then
+                if (target < 0) break
+                if (cam.lastTarget == target) cam.deliver(cam.lastRungs.size)
+            }
+            val end = c.snapshot()
+            t.eq(CaptureController.State.FINISHED.toString(), end.state.toString(),
+                "one hopeless direction does not trap the capture")
+            t.eq((c.plan.targets.size - 1).toLong(), end.directionsShot.toLong(),
+                "and the count reports every direction that was actually captured")
+            t.eq(1L, end.abandoned.count { it }.toLong(), "with the one that was not still marked")
         }
 
         // --- storage refusing a write -----------------------------------------------

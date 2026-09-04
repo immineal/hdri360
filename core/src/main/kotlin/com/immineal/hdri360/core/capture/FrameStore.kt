@@ -42,7 +42,16 @@ class StoredSession(
     @JvmField val blackLevel: DoubleArray,
     @JvmField val baseIso: Int,
     @JvmField val plan: BracketPlan,
-    @JvmField val note: String = ""
+    @JvmField val note: String = "",
+    /**
+     * Per-channel white balance the camera measured before the capture locked to
+     * manual, or null if none was available.
+     *
+     * A gain is linear, so applying it leaves radiance as radiance - but it has
+     * to be one gain for the whole sphere, measured once, or every direction
+     * lands on a different colour scale.
+     */
+    @JvmField val neutralGains: DoubleArray? = null
 ) {
 
     fun toJson(): Json.Obj {
@@ -81,6 +90,7 @@ class StoredSession(
             .put("ladderClampedLow", plan.ladder.clampedLow)
             .put("ladderClampedHigh", plan.ladder.clampedHigh)
             .put("indicesPerTarget", perTarget)
+            .also { o -> neutralGains?.let { o.put("neutralGains", it) } }
     }
 
     companion object {
@@ -122,7 +132,11 @@ class StoredSession(
                 blackLevel = black,
                 baseIso = o["baseIso"].asDouble().toInt(),
                 plan = BracketPlan(ladder, runs),
-                note = if (o.has("note")) o["note"].asString() else "")
+                note = if (o.has("note")) o["note"].asString() else "",
+                neutralGains = if (o.has("neutralGains")) {
+                    val g = o["neutralGains"]
+                    DoubleArray(g.size()) { g.at(it).asDouble() }
+                } else null)
         }
     }
 }

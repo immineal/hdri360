@@ -10,7 +10,12 @@ class MeterConfig {
     @JvmField var lowPercentile = 0.01
     /** Quantile used for "the bright end of the scene". */
     @JvmField var highPercentile = 0.999
-    /** Clipped fraction above which highlights count as blown. */
+    /**
+     * Clipped fraction above which highlights count as blown, provided the high
+     * quantile agrees. Both conditions are needed: a real sensor has stuck pixels
+     * that no exposure removes, and counting those alone sends the exposure
+     * controller down through its whole range on a scene that is not clipping.
+     */
     @JvmField var clipTolerance = 1e-4
     /** Fraction below the noise floor above which shadows count as crushed. */
     @JvmField var blackTolerance = 0.02
