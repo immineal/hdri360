@@ -120,7 +120,15 @@ class Camera2Source private constructor(
     }
 
     override fun startPreview(settings: ExposureSettings) {
-        synchronized(lock) { previewSettings = settings }
+        val changed = synchronized(lock) {
+            val was = previewSettings
+            previewSettings = settings
+            was.iso != settings.iso || was.exposureTimeSec != settings.exposureTimeSec
+        }
+        // What the viewfinder is being shown at, whenever it moves. Without this
+        // there is no way to tell a preview that is dark because the room is dark
+        // from one that is dark because it is being exposed for a light meter.
+        if (changed) CaptureLog.log("preview at $settings")
         applyPreview()
     }
 
@@ -223,9 +231,36 @@ class Camera2Source private constructor(
             b.addTarget(previewSurface)
             meteringReader?.let { if (synchronized(lock) { meteringEnabled }) b.addTarget(it.surface) }
             if (probing) applyAutoSettings(b) else applyManualSettings(b, settings)
-            s.setRepeatingRequest(b.build(), if (probing) whiteBalanceProbe else null, handler)
+            previewReported = false
+            s.setRepeatingRequest(b.build(),
+                if (probing) whiteBalanceProbe else previewReport, handler)
         } catch (e: Exception) {
             report("The preview stopped: ${e.message}", false)
+        }
+    }
+
+    @Volatile private var previewReported = false
+    /** The colour matrix the camera chose, frozen alongside the white balance. */
+    @Volatile private var lockedColorTransform: android.hardware.camera2.params.ColorSpaceTransform? = null
+
+    /**
+     * What the viewfinder actually got, once per change.
+     *
+     * Requesting an exposure and receiving it are different things - a device can
+     * clamp the frame duration, ignore a sensitivity, or run the request through
+     * a pipeline that darkens it - and without reading the result back there is
+     * no way to tell a preview that is dark because the room is dark from one
+     * that is dark because the request did not take.
+     */
+    private val previewReport = object : CameraCaptureSession.CaptureCallback() {
+        override fun onCaptureCompleted(s: CameraCaptureSession, request: CaptureRequest,
+                                        result: TotalCaptureResult) {
+            if (previewReported) return
+            previewReported = true
+            val got = actualSettings(result)
+            val tone = result.get(CaptureResult.TONEMAP_MODE)
+            val xf = result.get(CaptureResult.COLOR_CORRECTION_TRANSFORM)
+            CaptureLog.log("preview got $got, tonemap $tone, colour $xf")
         }
     }
 
@@ -238,6 +273,7 @@ class Camera2Source private constructor(
             if (awb != null && awb != CameraMetadata.CONTROL_AWB_STATE_CONVERGED &&
                 awb != CameraMetadata.CONTROL_AWB_STATE_LOCKED) return
             val gains = result.get(CaptureResult.COLOR_CORRECTION_GAINS) ?: return
+            lockedColorTransform = result.get(CaptureResult.COLOR_CORRECTION_TRANSFORM)
             lockedWhiteBalance = gains
             handler.post { applyPreview() }
         }
@@ -295,8 +331,10 @@ class Camera2Source private constructor(
     private val meteringCallback = object : CameraCaptureSession.CaptureCallback() {
         override fun onCaptureCompleted(s: CameraCaptureSession, request: CaptureRequest,
                                         result: TotalCaptureResult) {
-            if (lockedWhiteBalance == null)
+            if (lockedWhiteBalance == null) {
+                lockedColorTransform = result.get(CaptureResult.COLOR_CORRECTION_TRANSFORM)
                 lockedWhiteBalance = result.get(CaptureResult.COLOR_CORRECTION_GAINS)
+            }
             val ts = result.get(CaptureResult.SENSOR_TIMESTAMP) ?: return
             synchronized(lock) { pendingResults[ts] = result }
             pairAny()
@@ -308,8 +346,10 @@ class Camera2Source private constructor(
     private val burstCallback = object : CameraCaptureSession.CaptureCallback() {
         override fun onCaptureCompleted(s: CameraCaptureSession, request: CaptureRequest,
                                         result: TotalCaptureResult) {
-            if (lockedWhiteBalance == null)
+            if (lockedWhiteBalance == null) {
+                lockedColorTransform = result.get(CaptureResult.COLOR_CORRECTION_TRANSFORM)
                 lockedWhiteBalance = result.get(CaptureResult.COLOR_CORRECTION_GAINS)
+            }
             val ts = result.get(CaptureResult.SENSOR_TIMESTAMP)
             if (ts == null) {
                 // Without a timestamp there is no way to say which pixels this
@@ -535,6 +575,14 @@ class Camera2Source private constructor(
                 b.set(CaptureRequest.COLOR_CORRECTION_MODE,
                     CameraMetadata.COLOR_CORRECTION_MODE_TRANSFORM_MATRIX)
                 b.set(CaptureRequest.COLOR_CORRECTION_GAINS, it)
+                // The mode says "use the transform in this request", so a request
+                // without one hands the pipeline whatever its unset default is -
+                // and on this device that is a matrix which multiplies the frame
+                // to nothing. RAW never passes through colour correction, so the
+                // measurement and the stored frames were untouched and only the
+                // viewfinder went black.
+                b.set(CaptureRequest.COLOR_CORRECTION_TRANSFORM,
+                    lockedColorTransform ?: IDENTITY_TRANSFORM)
             }
         } else {
             // The camera chooses. Locking what it chose at least gives every frame
@@ -570,6 +618,12 @@ class Camera2Source private constructor(
         private const val TAG = "Hdri360.Camera"
         private const val METERING_TAG = -1
         private const val METERING_PERIOD_MS = 700L
+
+        /** Nine rationals, row major: the matrix that changes nothing. */
+        private val IDENTITY_TRANSFORM = android.hardware.camera2.params.ColorSpaceTransform(
+            intArrayOf(1, 1, 0, 1, 0, 1,
+                       0, 1, 1, 1, 0, 1,
+                       0, 1, 0, 1, 1, 1))
         private const val MAX_PENDING = 16
 
         /**
