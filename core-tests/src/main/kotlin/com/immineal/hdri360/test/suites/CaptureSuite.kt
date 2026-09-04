@@ -635,13 +635,19 @@ class CaptureSuite : TestCase {
             val c = CaptureController(cam, CountingSink())
             cam.setListener(c)
             c.beginScan()
+            // Past "enough to describe the room" but short of the coverage at
+            // which the sweep gives up and takes what it has.
             var now = 1_000_000_000L
-            for (i in c.plan.targets.indices) {
+            val half = c.plan.targets.size / 2
+            for (i in 0 until half) {
                 c.onOrientation(c.plan.targets[i].rotation, false, now)
                 cam.bound?.onPreviewFrame(bright, 1.0 / 500)
                 now += 50_000_000L
             }
-            t.greaterThan(c.scanCoverage(), 0.9, "the sweep covered the sphere")
+            t.greaterThan(c.scanCoverage(), CaptureController.Config().scanCoverageEnough,
+                "the sweep covered enough of the sphere to describe it")
+            t.lessThan(c.scanCoverage(), CaptureController.Config().scanCoverageComplete,
+                "and not so much that it would stop regardless")
             t.check(!c.scanReady(),
                 "but it does not close while the brightest thing it has seen is off the scale")
             t.check(c.scanWaitingForHighlights(),
@@ -665,6 +671,28 @@ class CaptureSuite : TestCase {
                 "a room that saturates the camera at its fastest is as measured as it can be")
             t.check(!c.scanWaitingForHighlights(), "so nothing is being waited for")
             t.check(c.finishScanAndPlan(), "and the ladder is planned rather than refused")
+        }
+
+        // --- swept nearly all of it, and still on the rail -------------------------
+        // Holding out for an unclipped look is right up to a point. Past that
+        // point the person is hunting the last few directions of a sphere with
+        // nothing telling them which way is left, for a ladder that is set from
+        // the whole scene anyway.
+        run {
+            val cam = FakeCamera(profile())
+            val c = CaptureController(cam, CountingSink())
+            cam.setListener(c)
+            c.beginScan()
+            var now = 1_000_000_000L
+            for (i in c.plan.targets.indices) {
+                c.onOrientation(c.plan.targets[i].rotation, false, now)
+                cam.bound?.onPreviewFrame(bright, 1.0 / 500)
+                now += 50_000_000L
+            }
+            t.greaterThan(c.scanCoverage(), CaptureController.Config().scanCoverageComplete,
+                "the sweep reached nearly all of the sphere")
+            t.check(c.scanReady(), "and ends, rather than hunting the last few directions")
+            t.check(!c.scanWaitingForHighlights(), "with nothing left to wait for")
         }
 
         // --- an ordinary room ----------------------------------------------------

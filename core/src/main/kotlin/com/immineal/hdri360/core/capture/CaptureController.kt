@@ -58,6 +58,14 @@ class CaptureController(
          * being planned from a corner of it.
          */
         @JvmField var scanCoverageEnough = 0.35
+        /**
+         * Coverage at which the sweep ends whatever else it has or has not
+         * learned. Hunting the last few percent of a sphere with no idea which
+         * way is left is a poor use of somebody's time, and the directions still
+         * missing at this point are worth little: the ladder is set from the
+         * whole scene, not from any one direction.
+         */
+        @JvmField var scanCoverageComplete = 0.85
         @JvmField var alignmentToleranceDeg = 7.0
         /**
          * How far the phone may be rolled about that axis and still fire.
@@ -144,6 +152,14 @@ class CaptureController(
         @JvmField val framesTaken: Int,
         @JvmField val framesPlanned: Int,
         @JvmField val scanCoverage: Double,
+        /**
+         * Directions the sweep has actually metered.
+         *
+         * Shown, because a coverage percentage tells someone how far they have
+         * got and nothing at all about which way to turn next - so the last part
+         * of every sweep was spent guessing.
+         */
+        @JvmField val metered: BooleanArray,
         @JvmField val scene: SceneStats?,
         @JvmField val message: String?
     ) {
@@ -274,7 +290,9 @@ class CaptureController(
      * response is to plan what can be planned and say the top is clipped.
      */
     fun scanReady(): Boolean = synchronized(lock) {
-        if (meteredFraction() < config.scanCoverageEnough) return false
+        val covered = meteredFraction()
+        if (covered >= config.scanCoverageComplete) return true
+        if (covered < config.scanCoverageEnough) return false
         val measured = perTarget.filterNotNull()
         if (measured.isEmpty()) return false
         if (!SceneStats.union(measured).highlightsClipped) return true
@@ -284,7 +302,9 @@ class CaptureController(
 
     /** True while the sweep is holding on for an unclipped look at the bright end. */
     fun scanWaitingForHighlights(): Boolean = synchronized(lock) {
-        if (meteredFraction() < config.scanCoverageEnough) return false
+        val covered = meteredFraction()
+        if (covered < config.scanCoverageEnough || covered >= config.scanCoverageComplete)
+            return false
         val measured = perTarget.filterNotNull()
         if (measured.isEmpty()) return false
         val floor = source.profile.exposureLimits.minRelativeExposure()
@@ -397,7 +417,15 @@ class CaptureController(
             // And separately, something to look at. The sweep is when a person
             // most needs to see where they are pointing, and the exposure that
             // reads the top of the range is not one they can see anything in.
-            val view = SceneMeter.viewingRelativeExposure(stats, config.previewMedianTarget)
+            //
+            // Keyed to everything measured so far rather than to the frame in
+            // hand. A single frame is whatever the phone happens to be pointing
+            // at - a window, then a wall, then the floor - so keying to it made
+            // the picture swing between blown and black on every metering tick,
+            // which is worse to sweep by than a preview that is merely wrong.
+            val all = perTarget.filterNotNull()
+            val whole = if (all.isEmpty()) stats else SceneStats.union(all)
+            val view = SceneMeter.viewingRelativeExposure(whole, config.previewMedianTarget)
             if (view.isFinite() && view > 0) {
                 val lim = source.profile.exposureLimits
                 val ceiling = lim.maxHandheldTimeSec * lim.maxIso / lim.baseIso.toDouble()
@@ -636,6 +664,7 @@ class CaptureController(
         val measured = perTarget.filterNotNull()
         return Snapshot(state, shot.copyOf(), abandoned.copyOf(), currentTarget, yawOffset, pitchOffset,
             aligned, steady, framesTaken, framesPlanned, meteredFraction(),
+            BooleanArray(targetCount) { perTarget[it] != null },
             if (measured.isEmpty()) null else SceneStats.union(measured), message)
     }
 

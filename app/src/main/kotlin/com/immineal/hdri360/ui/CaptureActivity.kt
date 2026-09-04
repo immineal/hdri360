@@ -209,9 +209,20 @@ private fun StartScreen(
             return@Column
         }
 
+        val choices = state.lenses.filter { !it.frontFacing }
         Text("Lens", style = MaterialTheme.typography.labelLarge)
         Spacer(Modifier.height(8.dp))
-        for (option in state.lenses.filter { !it.frontFacing }) {
+        if (choices.size <= 1) {
+            // One camera is not a choice. A button that looks pressable and does
+            // nothing when pressed is worse than a line of text, because it makes
+            // the person wonder what they did wrong.
+            Text(choices.firstOrNull()?.toString() ?: "no back camera",
+                style = MaterialTheme.typography.bodyMedium)
+            Spacer(Modifier.height(4.dp))
+            Text("This phone reports one back camera to apps. Its other lenses sit " +
+                 "behind it and are not offered yet.",
+                style = MaterialTheme.typography.bodySmall, color = Color(0xFF9A9A9A))
+        } else for (option in choices) {
             val selected = option.cameraId == lens
             OutlinedButton(
                 onClick = { lens = option.cameraId },
@@ -353,10 +364,15 @@ private fun CaptureScreen(state: CaptureUiState, rotationDeg: Int,
         val k = state.intrinsics
         val aspect = if (k != null && k.height > 0) k.width.toFloat() / k.height else 4f / 3f
         val quarterTurned = (((rotationDeg % 360) + 360) % 360) / 90 % 2 == 1
-        // Cover the screen without distorting: pick the short side from whichever
-        // way round the frame ends up, then let the long side follow the aspect.
-        val shortPx = if (quarterTurned) Math.max(viewW, viewH / aspect)
-                      else Math.max(viewH, viewW / aspect)
+        // The whole frame, not as much of it as fills the screen.
+        //
+        // Covering the screen crops a 4:3 frame held upright to about a third of
+        // its width, so the preview shows a far narrower view than the camera is
+        // actually recording - which reads as being zoomed in, and hides the
+        // edges of the very frame the person is being asked to aim. Fitting shows
+        // what will be captured, with bars where there is nothing to show.
+        val shortPx = if (quarterTurned) Math.min(viewW, viewH / aspect)
+                      else Math.min(viewH, viewW / aspect)
         val longPx = shortPx * aspect
         // The same frame as it ends up on the screen, after the quarter turn the
         // sensor's mounting implies. This is what the overlay draws onto and what
@@ -412,6 +428,8 @@ private fun CaptureScreen(state: CaptureUiState, rotationDeg: Int,
         SphereOverlay(
             targets = state.targets,
             shot = snap?.shot,
+            metered = snap?.metered,
+            scanning = state.phase == CaptureUiState.Phase.SCANNING,
             abandoned = snap?.abandoned,
             current = snap?.currentTarget ?: -1,
             pose = state.pose,

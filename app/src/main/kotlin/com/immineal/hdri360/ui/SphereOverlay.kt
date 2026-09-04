@@ -26,6 +26,10 @@ import com.immineal.hdri360.core.pano.CaptureTarget
 fun SphereOverlay(
     targets: List<CaptureTarget>,
     shot: BooleanArray?,
+    /** Directions the metering sweep has reached, for the sweep's own display. */
+    metered: BooleanArray? = null,
+    /** True during the sweep, when what matters is where you have not looked. */
+    scanning: Boolean = false,
     abandoned: BooleanArray?,
     current: Int,
     pose: Mat3?,
@@ -51,9 +55,13 @@ fun SphereOverlay(
         val map = ViewMap(intrinsics, size, rotationDeg, frameWidthPx, frameHeightPx)
 
         for (i in targets.indices) {
-            val done = shot != null && i < shot.size && shot[i]
-            val gaveUp = abandoned != null && i < abandoned.size && abandoned[i]
-            val isCurrent = i == current
+            // During the sweep the dots are a map of where the meter has been, so
+            // finishing it is a matter of filling in the empty ones rather than
+            // of guessing which way to turn.
+            val done = if (scanning) metered != null && i < metered.size && metered[i]
+                       else shot != null && i < shot.size && shot[i]
+            val gaveUp = !scanning && abandoned != null && i < abandoned.size && abandoned[i]
+            val isCurrent = !scanning && i == current
             // Into the camera's own frame: the pose is camera-to-world.
             val dirCam = pose.mulTranspose(targets[i].direction)
             val p = if (dirCam.z > 1e-6) intrinsics.project(dirCam) else null

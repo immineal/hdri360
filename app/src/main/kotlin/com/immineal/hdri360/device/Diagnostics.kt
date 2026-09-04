@@ -141,6 +141,17 @@ object Diagnostics {
                 val c = manager.getCameraCharacteristics(lens.cameraId)
                 val report = CameraProbe.reportFor(c)
                 b.append("  ").append(report).append('\n')
+                // What sits behind a logical camera. The other lenses on a modern
+                // phone are here rather than in the top level id list.
+                if (Build.VERSION.SDK_INT >= 28) try {
+                    for (pid in c.physicalCameraIds) {
+                        val pc = manager.getCameraCharacteristics(pid)
+                        b.append("    physical ").append(pid).append(": ")
+                            .append(CameraProbe.reportFor(pc)).append('\n')
+                    }
+                } catch (e: Exception) {
+                    b.append("    physical cameras unreadable: ").append(e).append('\n')
+                }
                 for (plan in com.immineal.hdri360.core.capture.StreamLadder.plansFor(report))
                     b.append("    ").append(plan).append('\n')
             }

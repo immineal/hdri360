@@ -239,6 +239,14 @@ class Camera2Source private constructor(
         }
     }
 
+    /** Whether the lens can be told to hold still, from the device's own list. */
+    private val opticalStabilisationOff: Boolean = try {
+        characteristics.get(CameraCharacteristics.LENS_INFO_AVAILABLE_OPTICAL_STABILIZATION)
+            ?.any { it == CameraMetadata.LENS_OPTICAL_STABILIZATION_MODE_OFF } ?: false
+    } catch (e: Exception) {
+        false
+    }
+
     @Volatile private var previewReported = false
     @Volatile private var previewLastReport: String? = null
     /** The colour matrix the camera chose, frozen alongside the white balance. */
@@ -295,6 +303,7 @@ class Camera2Source private constructor(
 
     /** Everything automatic, briefly, so there is something to freeze. */
     private fun applyAutoSettings(b: CaptureRequest.Builder) {
+        applyStillOptics(b)
         b.set(CaptureRequest.CONTROL_AF_MODE, CameraMetadata.CONTROL_AF_MODE_OFF)
         b.set(CaptureRequest.LENS_FOCUS_DISTANCE, 0.0f)
         b.set(CaptureRequest.NOISE_REDUCTION_MODE, CameraMetadata.NOISE_REDUCTION_MODE_OFF)
@@ -562,7 +571,27 @@ class Camera2Source private constructor(
             if (aperture != null && aperture > 0) aperture.toDouble() else profile.apertureN)
     }
 
+    /**
+     * Both kinds of stabilisation, off.
+     *
+     * Optical stabilisation moves the lens to cancel hand shake, which is the
+     * right thing for a photograph and the wrong thing for a panorama: it shifts
+     * the optical centre between frames, so the frames are no longer views from
+     * one point through one lens. The stitcher solves rotations about a fixed
+     * centre with a fixed camera model, and a lens that quietly moves puts that
+     * error into the seams where it cannot be told from parallax. Digital
+     * stabilisation is worse still - it crops and warps.
+     */
+    private fun applyStillOptics(b: CaptureRequest.Builder) {
+        if (opticalStabilisationOff)
+            b.set(CaptureRequest.LENS_OPTICAL_STABILIZATION_MODE,
+                CameraMetadata.LENS_OPTICAL_STABILIZATION_MODE_OFF)
+        b.set(CaptureRequest.CONTROL_VIDEO_STABILIZATION_MODE,
+            CameraMetadata.CONTROL_VIDEO_STABILIZATION_MODE_OFF)
+    }
+
     private fun applyManualSettings(b: CaptureRequest.Builder, settings: ExposureSettings) {
+        applyStillOptics(b)
         b.set(CaptureRequest.CONTROL_AF_MODE, CameraMetadata.CONTROL_AF_MODE_OFF)
         b.set(CaptureRequest.LENS_FOCUS_DISTANCE, 0.0f)                  // infinity
         b.set(CaptureRequest.NOISE_REDUCTION_MODE, CameraMetadata.NOISE_REDUCTION_MODE_OFF)

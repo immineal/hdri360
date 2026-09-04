@@ -389,9 +389,16 @@ class EndToEndSuite : TestCase {
         override fun setPreviewMeteringEnabled(enabled: Boolean) { }
         override fun close() { }
 
-        /** One metering frame at whatever the preview is currently set to. */
+        /**
+         * One metering frame, at the exposure metering was asked for.
+         *
+         * Not at the preview's: the two are separate on a real device precisely
+         * because the viewfinder wants a room and the meter wants the top of the
+         * range, and a simulator that conflates them measures a scene nobody
+         * would measure.
+         */
         fun emitPreview() {
-            val rel = preview.relativeExposure(profile.exposureLimits.baseIso)
+            val rel = (metering ?: preview).relativeExposure(profile.exposureLimits.baseIso)
             val luma = ImageF(32, 24, 1)
             val k = profile.intrinsics.scaled(32.0 / profile.intrinsics.width)
             for (y in 0 until 24) for (x in 0 until 32) {
