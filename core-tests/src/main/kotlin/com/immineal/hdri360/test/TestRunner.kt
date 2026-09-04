@@ -2,6 +2,7 @@ package com.immineal.hdri360.test
 
 import com.immineal.hdri360.test.suites.BracketPlannerSuite
 import com.immineal.hdri360.test.suites.CameraModelSuite
+import com.immineal.hdri360.test.suites.CaptureSuite
 import com.immineal.hdri360.test.suites.ImageSuite
 import com.immineal.hdri360.test.suites.MergeSuite
 import com.immineal.hdri360.test.suites.MeteringSuite
@@ -60,6 +61,7 @@ object TestRunner {
         "DistortionSuite" to ::DistortionSuite,
         "MaxFlowSuite" to ::MaxFlowSuite,
         "SeamSuite" to ::SeamSuite,
+        "CaptureSuite" to ::CaptureSuite,
         "EquirectSuite" to ::EquirectSuite,
         "HorizonSuite" to ::HorizonSuite,
         "BlendSuite" to ::BlendSuite,
