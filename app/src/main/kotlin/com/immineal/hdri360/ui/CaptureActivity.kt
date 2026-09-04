@@ -358,6 +358,11 @@ private fun CaptureScreen(state: CaptureUiState, rotationDeg: Int,
         val shortPx = if (quarterTurned) Math.max(viewW, viewH / aspect)
                       else Math.max(viewH, viewW / aspect)
         val longPx = shortPx * aspect
+        // The same frame as it ends up on the screen, after the quarter turn the
+        // sensor's mounting implies. This is what the overlay draws onto and what
+        // the preview is scaled to, so they are the same picture by construction.
+        val shownW = if (quarterTurned) shortPx else longPx
+        val shownH = if (quarterTurned) longPx else shortPx
 
         // The view fills the screen and the frame is placed inside it by the
         // TextureView's own transform, rather than by laying the view out large
@@ -386,12 +391,20 @@ private fun CaptureScreen(state: CaptureUiState, rotationDeg: Int,
             }
         }, modifier = Modifier.fillMaxSize(), update = { view ->
             if (viewW > 0 && viewH > 0) {
-                // The buffer arrives stretched to the view; scale it back to the
-                // frame's own shape, then turn it. The overlay is given exactly
-                // these numbers, so the two cannot disagree.
+                // Only the shape, never the turn.
+                //
+                // The camera hands a SurfaceTexture its buffers already turned
+                // upright for the device's natural orientation, and this screen is
+                // locked to portrait - so there is no turn left to make. Making it
+                // anyway put the picture through the quarter turn twice: ninety
+                // degrees round from the room, and stretched by 1.78 because the
+                // frame's long axis was then being scaled to the short side.
+                //
+                // What is left is the shape. The buffer arrives stretched to fill
+                // the view, and the overlay places its markers on a picture
+                // shownW by shownH, so the picture is scaled to exactly that.
                 val m = android.graphics.Matrix()
-                m.postScale(longPx / viewW, shortPx / viewH, viewW / 2, viewH / 2)
-                m.postRotate(rotationDeg.toFloat(), viewW / 2, viewH / 2)
+                m.postScale(shownW / viewW, shownH / viewH, viewW / 2, viewH / 2)
                 view.setTransform(m)
             }
         })
