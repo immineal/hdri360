@@ -74,8 +74,16 @@ class CaptureController(
          * smeared one.
          */
         @JvmField var stabilityDwellNs = 150_000_000L
-        /** A burst that has not delivered its frames by now is presumed lost. */
-        @JvmField var burstTimeoutNs = 4_000_000_000L
+        /**
+         * A burst that has not delivered its frames by now is presumed lost.
+         *
+         * Generous on purpose. A five rung burst of twelve megapixel RAW is a
+         * hundred and twenty megabytes through one thread, and the DNG the user
+         * asked to keep is written from the same image before it is released.
+         * A burst that is merely slow must not be thrown away and shot again,
+         * because shooting it again costs more than waiting for it.
+         */
+        @JvmField var burstTimeoutNs = 12_000_000_000L
         /** Give up on a direction after this many failed bursts and move on. */
         @JvmField var maxBurstAttempts = 3
         /** Exposure the scan starts at, before metering has anything to say. */

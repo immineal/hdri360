@@ -392,6 +392,24 @@ class ProcessingSuite : TestCase {
                 "and each one is quicker than the one above it")
         }
         t.eq(8192L, options[0].width.toLong(), "the best option is the full 8K output")
+
+        // Reading and demosaicing are charged against the sensor, not the reduced
+        // frame. Leaving them out is what made the estimate say a minute for a job
+        // that took three: they are most of the work, and they do not shrink when
+        // the frames do.
+        val decoding = Calibration(12.0, 40.0, 1.5, "fixed, for the test", 8.0)
+        val reduced = WorkEstimator.estimate(32, 5, 750_000, 4096, decoding, 12_000_000)
+        val asIfSmall = WorkEstimator.estimate(32, 5, 750_000, 4096, decoding, 750_000)
+        t.greaterThan(reduced.mergeSeconds, asIfSmall.mergeSeconds * 4,
+            "a twelve megapixel sensor reduced to 750k still costs twelve megapixels to read")
+        t.greaterThan(reduced.seconds, asIfSmall.seconds, "so the whole job takes longer")
+        t.note("32 x 5 frames of 12 MP, worked at 750k: " + reduced.humanText() +
+                " against " + asIfSmall.humanText() + " if the read were free")
+
+        // And the sensor size cannot make the job cheaper than the work it implies.
+        val plain = WorkEstimator.estimate(32, 5, 750_000, 4096, decoding)
+        t.check(plain.seconds <= reduced.seconds + 1e-9,
+            "omitting the sensor size never overstates the work")
     }
 
     /**

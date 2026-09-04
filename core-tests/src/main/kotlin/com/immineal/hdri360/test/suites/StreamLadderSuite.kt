@@ -32,6 +32,43 @@ class StreamLadderSuite : TestCase {
         legacyStaysWithinItsLimits(t)
         aspectCropDoesNotWidenTheLens(t)
         subsamplingKeepsTheFieldOfView(t)
+        thePreviewIsTheFrameBeingCaptured(t)
+    }
+
+    /**
+     * The preview has to be the captured frame scaled down, not a crop of it.
+     *
+     * A 16:9 preview of a 4:3 capture shows a different field of view from the
+     * one being recorded, so every target drawn on it is in the wrong place and
+     * the edges of what is actually being captured are off screen entirely. The
+     * device offers both shapes and nothing but this makes it pick the right one.
+     */
+    private fun thePreviewIsTheFrameBeingCaptured(t: TestKit) {
+        for (report in all()) {
+            for (plan in StreamLadder.plansFor(report)) {
+                val capture = plan.capture.width.toDouble() / plan.capture.height
+                val preview = plan.preview.width.toDouble() / plan.preview.height
+                val offered = report.yuvSizes.any { it.height > 0 &&
+                    Math.abs(it.width.toDouble() / it.height - capture) < 0.02 &&
+                    it.width <= 1920 }
+                if (!offered) continue
+                t.near(capture, preview, 0.02,
+                    "the preview is the shape of what is being captured ($plan)")
+            }
+        }
+        // The device that offers the wrong shape first: 16:9 sits closest to the
+        // preview's target width, and would win on width alone.
+        val tempting = DeviceReport(
+            hardwareLevel = HardwareLevel.LEVEL_3,
+            hasRaw = true, hasManualSensor = true,
+            rawSizes = listOf(SensorSize(4000, 3000)),
+            yuvSizes = listOf(SensorSize(4000, 3000), SensorSize(1280, 720),
+                SensorSize(1024, 768), SensorSize(640, 360)),
+            activeArray = SensorSize(4000, 3000))
+        val best = StreamLadder.plansFor(tempting).first()
+        t.eq(1024L, best.preview.width.toLong(),
+            "a 4:3 preview is chosen over a wider one that is closer to the target width")
+        t.note("preview for a 4:3 sensor offering 1280x720: " + best.preview)
     }
 
     private val pixelYuv = listOf(

@@ -81,12 +81,12 @@ object StreamLadder {
 
     @JvmStatic
     fun plansFor(r: DeviceReport): List<StreamPlan> {
-        // Matched to the sensor's own shape, so the preview is the capture frame
-        // scaled down rather than a crop of it. A 16:9 preview of a 4:3 capture
-        // shows a different field of view from the one being recorded, and every
-        // marker drawn on it is then in the wrong place.
-        val native = (r.rawSizes + r.yuvSizes).maxByOrNull { it.pixels() }
-        val preview = pickPreview(r.yuvSizes, native) ?: return emptyList()
+        // Each plan gets the preview that matches the frame *it* captures, so the
+        // preview is the capture scaled down rather than a crop of it. A 16:9
+        // preview of a 4:3 capture shows a different field of view from the one
+        // being recorded: every marker drawn on it is in the wrong place, and the
+        // edges of what is actually being captured are off the screen entirely.
+        if (pickPreview(r.yuvSizes, null) == null) return emptyList()
         val threeStreams = r.hardwareLevel.allowsThreeStreams()
         // A manual sensor is what makes the bracket ours rather than the camera's.
         // LEGACY never has one, whatever it reports.
@@ -104,13 +104,14 @@ object StreamLadder {
             // capture stream instead, which costs a frame a second and one stream
             // fewer.
             for (s in r.rawSizes.sortedByDescending { it.pixels() }.take(2))
-                out.add(StreamPlan(CaptureTier.LINEAR_RAW, PixelFormat.RAW_SENSOR, s, preview,
-                    false, "RAW at $s, metered from RAW"))
+                out.add(StreamPlan(CaptureTier.LINEAR_RAW, PixelFormat.RAW_SENSOR, s,
+                    pickPreview(r.yuvSizes, s)!!, false, "RAW at $s, metered from RAW"))
         }
 
         // Three YUV-shaped streams at once is only guaranteed from FULL upward.
         val yuvMetering = threeStreams && r.hardwareLevel.rank >= HardwareLevel.FULL.rank
-        for (s in yuvCandidates(r.yuvSizes, preview)) {
+        for (s in yuvCandidates(r.yuvSizes, pickPreview(r.yuvSizes, null)!!)) {
+            val preview = pickPreview(r.yuvSizes, s)!!
             if (yuvMetering)
                 out.add(StreamPlan(yuvTier, PixelFormat.YUV_420_888, s, preview, true,
                     "YUV at $s with live metering"))

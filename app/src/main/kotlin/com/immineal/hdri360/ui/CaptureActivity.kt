@@ -433,8 +433,10 @@ private fun ReadyScreen(dir: File, onChoose: (Int) -> Unit) {
     var options by remember {
         mutableStateOf<List<com.immineal.hdri360.core.pipeline.ResolutionOption>?>(null)
     }
+    var recommended by remember { mutableStateOf(0) }
     LaunchedEffect(dir) {
         options = withContext(Dispatchers.Default) { ProcessingService.optionsFor(dir) }
+        recommended = withContext(Dispatchers.Default) { ProcessingService.recommendedWidth(dir) }
     }
     Column(Modifier.fillMaxSize().safeDrawingPadding().padding(24.dp),
         verticalArrangement = Arrangement.Center) {
@@ -452,16 +454,25 @@ private fun ReadyScreen(dir: File, onChoose: (Int) -> Unit) {
                 color = Color(0xFFFF8A80))
         } else {
             for (o in list) {
+                val best = o.width == recommended
                 OutlinedButton({ onChoose(o.width) },
-                    Modifier.fillMaxWidth().padding(vertical = 4.dp)) {
+                    Modifier.fillMaxWidth().padding(vertical = 4.dp),
+                    colors = if (best)
+                        ButtonDefaults.outlinedButtonColors(containerColor = Color(0x2239C36B))
+                    else ButtonDefaults.outlinedButtonColors()) {
                     Column(Modifier.fillMaxWidth()) {
-                        Text("${o.label}  ${o.width} x ${o.height}",
+                        Text("${o.label}  ${o.width} x ${o.height}" +
+                            if (best) "   matches the capture" else "",
                             style = MaterialTheme.typography.titleSmall)
                         Text(o.estimate.humanText(), style = MaterialTheme.typography.bodySmall,
                             color = Color(0xFFB0B0B0))
                     }
                 }
             }
+            Spacer(Modifier.height(10.dp))
+            Text("Above the matched size the render resamples detail that was never " +
+                "captured; below it, detail that was gets thrown away.",
+                style = MaterialTheme.typography.bodySmall, color = Color(0xFF9A9A9A))
         }
     }
 }

@@ -374,6 +374,35 @@ class ProcessingService : Service() {
          * sphere is minutes on one device and an hour on another, and an estimate
          * borrowed from a different phone is worse than none.
          */
+        /**
+         * The output size at which one panorama pixel is one captured pixel.
+         *
+         * Above it the render resamples data that is not there; below it, data
+         * that is gets thrown away. The user still chooses, but they should be
+         * told which one the capture actually supports.
+         */
+        @JvmStatic
+        fun recommendedWidth(dir: File): Int {
+            val store = FrameStore.open(dir) ?: return 4096
+            try {
+                val records = store.records()
+                val directions = store.shotMask().count { it }
+                val rungs = Math.max(1, records.size / Math.max(1, directions))
+                val framePixels = records.firstOrNull()
+                    ?.let { it.width.toLong() * it.height } ?: return 4096
+                val f = StoredCapture.mergingSubsampleFor(framePixels, rungs, mergeBudget())
+                val working = com.immineal.hdri360.core.capture.SensorGeometry
+                    .subsampled(store.session.intrinsics, f)
+                val matched = WorkEstimator.matchedWidth(working)
+                // Snap to the sizes actually offered, never below the nearest.
+                return intArrayOf(2048, 4096, 8192).firstOrNull { it >= matched * 0.75 } ?: 8192
+            } catch (e: Exception) {
+                return 4096
+            } finally {
+                store.close()
+            }
+        }
+
         @JvmStatic
         fun optionsFor(dir: File): List<ResolutionOption> {
             val store = FrameStore.open(dir) ?: return emptyList()
@@ -388,7 +417,8 @@ class ProcessingService : Service() {
                 // reduced size the memory allows, not the size on disk.
                 val f = StoredCapture.mergingSubsampleFor(framePixels, rungs, mergeBudget())
                 return WorkEstimator.resolutionOptions(directions, rungs,
-                    framePixels / (f.toLong() * f), calibration())
+                    framePixels / (f.toLong() * f), calibration(),
+                    sensorPixels = framePixels)
             } finally {
                 store.close()
             }
@@ -412,7 +442,7 @@ class ProcessingService : Service() {
                     ?: 1_000_000L
                 val f = StoredCapture.mergingSubsampleFor(framePixels, rungs, mergeBudget())
                 WorkEstimator.estimate(Math.max(1, directions), rungs,
-                    framePixels / (f.toLong() * f), width, calibration())
+                    framePixels / (f.toLong() * f), width, calibration(), framePixels)
             } catch (e: Exception) {
                 null
             }

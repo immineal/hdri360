@@ -31,7 +31,17 @@ class Calibration(
     /** Nanoseconds per rendered sample, i.e. per output pixel per contributing frame. */
     @JvmField val renderNsPerSample: Double,
     /** Where these numbers came from, so an estimate can be questioned. */
-    @JvmField val basis: String
+    @JvmField val basis: String,
+    /**
+     * Nanoseconds per sensor pixel to turn a stored mosaic into working colour.
+     *
+     * Separate from the merge because it is charged per *sensor* pixel while the
+     * merge is charged per working pixel, and on a phone the two differ by a
+     * factor of sixteen. Leaving it out is what made the estimate say a minute
+     * for a job that took three: the demosaic and the read are most of the work,
+     * and neither of them shrinks when the frames do.
+     */
+    @JvmField val decodeNsPerPixel: Double = 0.0
 )
 
 /** An estimate, broken down so that a user who does not believe it can see why. */
@@ -87,17 +97,32 @@ object WorkEstimator {
     /** Conservative sustained write rate for phone flash, in bytes per second. */
     private const val WRITE_BYTES_PER_SEC = 40.0 * 1024 * 1024
 
+    /** Conservative sustained read rate for the same flash. */
+    private const val READ_BYTES_PER_SEC = 200.0 * 1024 * 1024
+
+    /** Stored working frames are half float, one channel per sensor photosite. */
+    private const val STORED_BYTES_PER_PIXEL = 2L
+
     /** Half-float RGB. */
     private const val OUTPUT_BYTES_PER_PIXEL = 3L * 2
 
     @JvmStatic
+    @JvmOverloads
     fun estimate(directions: Int, rungs: Int, framePixels: Long,
-                 panoramaWidth: Int, cal: Calibration): WorkEstimate {
+                 panoramaWidth: Int, cal: Calibration,
+                 sensorPixels: Long = framePixels): WorkEstimate {
         if (directions <= 0 || rungs <= 0 || framePixels <= 0)
             throw IllegalArgumentException("nothing to estimate")
         val h = Equirect.heightFor(panoramaWidth).toLong()
         val outPixels = panoramaWidth.toLong() * h
-        val merge = directions.toLong() * rungs * framePixels * cal.mergeNsPerSample / 1e9
+        val frames = directions.toLong() * rungs
+        // Reading and demosaicing are charged per sensor pixel, not per working
+        // pixel: reducing a frame happens after both, so neither gets cheaper.
+        val read = frames * Math.max(sensorPixels, framePixels) *
+            STORED_BYTES_PER_PIXEL / READ_BYTES_PER_SEC
+        val decode = frames * Math.max(sensorPixels, framePixels) * cal.decodeNsPerPixel / 1e9
+        val merge = read + decode +
+            directions.toLong() * rungs * framePixels * cal.mergeNsPerSample / 1e9
         val align = directions.toLong() * (FEATURE_PIXELS + MATCH_EQUIVALENT_PIXELS) *
             cal.alignNsPerPixel / 1e9
         val render = outPixels * directions * cal.renderNsPerSample / 1e9
@@ -125,8 +150,11 @@ object WorkEstimator {
     @JvmStatic
     @JvmOverloads
     fun resolutionOptions(directions: Int, rungs: Int, framePixels: Long, cal: Calibration,
-                          widths: IntArray = intArrayOf(8192, 4096, 2048)): List<ResolutionOption> =
-        widths.map { ResolutionOption(it, estimate(directions, rungs, framePixels, it, cal)) }
+                          widths: IntArray = intArrayOf(8192, 4096, 2048),
+                          sensorPixels: Long = framePixels): List<ResolutionOption> =
+        widths.map {
+            ResolutionOption(it, estimate(directions, rungs, framePixels, it, cal, sensorPixels))
+        }
 
     /**
      * Times each stage on a small synthetic problem and scales per unit of work.
@@ -141,9 +169,11 @@ object WorkEstimator {
         val mergeNs = timeMerge()
         val alignNs = timeAlign()
         val renderNs = timeRender()
+        val decodeNs = timeDecode()
         return Calibration(mergeNs, alignNs, renderNs,
             String.format(Locale.US, "measured here on %d cores",
-                Runtime.getRuntime().availableProcessors()))
+                Runtime.getRuntime().availableProcessors()),
+            decodeNs)
     }
 
     private fun timeMerge(): Double {
@@ -161,6 +191,21 @@ object WorkEstimator {
         HdrMerger.merge(bracket, cfg)
         val elapsed = System.nanoTime() - t0
         return Math.max(1e-3, elapsed / (3.0 * w * h))
+    }
+
+    /** Turning a stored mosaic into working colour, per sensor pixel. */
+    private fun timeDecode(): Double {
+        val w = 512
+        val h = 384
+        val mosaic = com.immineal.hdri360.core.image.BayerImage(w, h,
+            com.immineal.hdri360.core.image.CfaPattern.RGGB)
+        for (i in mosaic.plane.data.indices) mosaic.plane.data[i] = pattern(i, 1)
+        com.immineal.hdri360.core.image.Demosaic.halfResolution(mosaic)   // warm up
+        val t0 = System.nanoTime()
+        val out = com.immineal.hdri360.core.image.Demosaic.halfResolution(mosaic)
+        com.immineal.hdri360.core.image.ImageOps.downsample2x(out)
+        val elapsed = System.nanoTime() - t0
+        return Math.max(1e-3, elapsed / (w.toDouble() * h))
     }
 
     private fun timeAlign(): Double {

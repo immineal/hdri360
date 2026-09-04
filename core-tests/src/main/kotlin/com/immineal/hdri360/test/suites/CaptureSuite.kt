@@ -259,7 +259,7 @@ class CaptureSuite : TestCase {
             t.eq(1L, cam.burstsRequested.toLong(), "no second burst while the first may still land")
 
             // Past it, the controller recovers rather than waiting forever.
-            now += 5_000_000_000L
+            now += CaptureController.Config().burstTimeoutNs + 1_000_000_000L
             c.onOrientation(c.plan.targets[target].rotation, true, now)
             now = aimAtNext(c, now + 300_000_000L).second
             t.greaterThan(cam.burstsRequested.toDouble(), 1.0,
@@ -473,7 +473,7 @@ class CaptureSuite : TestCase {
             val staleBurst = cam.lastBurst
             val staleRung = cam.lastRungs[0]
             cam.abandon()
-            now += 6_000_000_000L
+            now += CaptureController.Config().burstTimeoutNs + 1_000_000_000L
             c.onOrientation(c.plan.targets[first].rotation, true, now)   // times out
 
             val before = c.snapshot().framesTaken
@@ -503,7 +503,7 @@ class CaptureSuite : TestCase {
             var tries = 0
             while (!c.snapshot().abandoned[silent] && tries++ < 10) {
                 cam.abandon()                                  // the camera never reports
-                now += 6_000_000_000L                          // past the burst timeout
+                now += CaptureController.Config().burstTimeoutNs + 1_000_000_000L
                 c.onOrientation(c.plan.targets[silent].rotation, true, now)
                 now = settleOn(c, silent, now + 300_000_000L)
             }

@@ -310,9 +310,19 @@ class CaptureSession(
         val out = File(bundle, String.format(Locale.US, "t%03d_b%d.dng",
             frame.targetIndex, frame.bracketIndex))
         try {
+            val started = SystemClock.elapsedRealtime()
             DngCreator(chars, result).use { creator ->
                 BufferedOutputStream(FileOutputStream(out)).use { creator.writeImage(it, image) }
             }
+            // The bundle is written on the camera's own thread, because the image
+            // and its metadata are both about to go away - so what it costs is
+            // time the next frame of the burst spends waiting. Worth knowing.
+            val took = SystemClock.elapsedRealtime() - started
+            dngTotalMs += took
+            dngCount++
+            if (dngCount % 25 == 1)
+                CaptureLog.log("DNG t${frame.targetIndex} b${frame.bracketIndex} in ${took} ms " +
+                    "(${dngCount} written, ${dngTotalMs / dngCount} ms average)")
         } catch (e: Exception) {
             Log.w(TAG, "no DNG for this frame; the capture continues", e)
             out.delete()
@@ -396,6 +406,8 @@ class CaptureSession(
     }
 
     private val haptics = Haptics(context)
+    private var dngTotalMs = 0L
+    private var dngCount = 0
     private var lastShot = 0
     private var lastAbandoned = 0
     private var lastAligned = false
