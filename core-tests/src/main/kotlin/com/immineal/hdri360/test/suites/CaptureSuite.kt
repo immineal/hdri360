@@ -50,6 +50,8 @@ class CaptureSuite : TestCase {
         override fun setListener(listener: CameraSource.Listener?) { bound = listener }
         var lastPreview: ExposureSettings? = null
         override fun startPreview(settings: ExposureSettings) { lastPreview = settings; previewStarts++ }
+        var lastMetering: ExposureSettings? = null
+        override fun setMeteringExposure(settings: ExposureSettings) { lastMetering = settings }
         override fun setPreviewMeteringEnabled(enabled: Boolean) { meteringEnabled = enabled }
         override fun close() { closed = true }
 
@@ -602,6 +604,8 @@ class CaptureSuite : TestCase {
         t.check(CaptureTier.MANUAL_YUV.drivesExposure, "manual YUV still drives the bracket")
         t.check(!CaptureTier.LOCKED_AUTO.drivesExposure, "locked auto does not")
         theSweepWaitsForTheBrightEnd(t)
+        theViewfinderIsNotTheLightMeter(t)
+        stoppingEarlyIsNotFinishing(t)
     }
 
     /**
@@ -688,5 +692,97 @@ class CaptureSuite : TestCase {
             cam.bound?.onPreviewFrame(ordinary, 1.0 / 500)
             t.check(!c.scanReady(), "one direction is not a metered room")
         }
+    }
+
+    /**
+     * A viewfinder and a light meter want different exposures.
+     *
+     * Metering puts the brightest tenth of a percent just under saturation so the
+     * top of the range can be read. Shown on screen, that is a black rectangle
+     * with a window in it - and the sweep is precisely when a person most needs
+     * to see where they are pointing. Driven from one number, the preview
+     * appeared for the length of the camera's own auto-exposure probe and then
+     * went black for the rest of the capture.
+     *
+     * What has to hold: while the meter walks the exposure down towards the
+     * highlights, the preview stays somewhere a person can see.
+     */
+    private fun theViewfinderIsNotTheLightMeter(t: TestKit) {
+        val cam = FakeCamera(profile())
+        val c = CaptureController(cam, CountingSink())
+        cam.setListener(c)
+        c.beginScan()
+
+        // A room with a window: almost all of it dim, a few pixels blazing. Metered
+        // for the window, everything else is black.
+        val room = ImageF(16, 16, 1)
+        java.util.Arrays.fill(room.data, 0.004f)
+        room.data[0] = 1.0f
+        room.data[1] = 1.0f
+        room.data[2] = 1.0f
+
+        var now = 1_000_000_000L
+        var meteringWalkedDown = false
+        val base = profile().exposureLimits.baseIso
+        var previousMetering = Double.MAX_VALUE
+        for (i in c.plan.targets.indices) {
+            c.onOrientation(c.plan.targets[i].rotation, false, now)
+            cam.bound?.onPreviewFrame(room, 1.0 / 60)
+            now += 50_000_000L
+            val m = cam.lastMetering?.relativeExposure(base)
+            if (m != null) {
+                if (m < previousMetering) meteringWalkedDown = true
+                previousMetering = m
+            }
+        }
+
+        t.check(meteringWalkedDown,
+            "the meter shortens its exposure to get the highlights off the rail")
+        val shown = cam.lastPreview
+        t.check(shown != null, "and the viewfinder is given an exposure of its own")
+        val metered = cam.lastMetering
+        t.check(metered != null, "as is the meter")
+
+        // The scene's dim body sits at 0.004 of full scale at the exposure the
+        // frames came in at. A viewable preview has to lift that towards the
+        // middle, which means a longer exposure than the meter is using - not the
+        // same one.
+        val shownRel = shown!!.relativeExposure(base)
+        val meteredRel = metered!!.relativeExposure(base)
+        t.greaterThan(shownRel / meteredRel, 4.0,
+            "the viewfinder is exposed for the room, not for the window")
+    }
+
+    /**
+     * A capture stopped by hand is not a complete sphere.
+     *
+     * The finish message was worded from failures alone, so a sphere abandoned
+     * after five of thirty-four directions - nothing failed, the rest were simply
+     * never reached - reported "captured all 34 directions", on screen and in the
+     * log. The log is the only record of what a capture actually did.
+     */
+    private fun stoppingEarlyIsNotFinishing(t: TestKit) {
+        val cam = FakeCamera(profile())
+        val c = CaptureController(cam, CountingSink())
+        cam.setListener(c)
+        c.beginScan()
+        scanEverything(c, cam, 1_000_000_000L)
+        t.check(c.finishScanAndPlan(), "the sweep planned a ladder")
+
+        var now = 5_000_000_000L
+        for (i in 0 until 2) {
+            val step = aimAtNext(c, now)
+            now = step.second
+            cam.deliver(cam.lastRungs.size)
+        }
+        c.finish()
+        val snap = c.snapshot()
+        t.eq(CaptureController.State.FINISHED.toString(), snap.state.toString(),
+            "finishing by hand finishes the capture")
+        t.check(snap.directionsShot < snap.shot.size, "with directions left unshot")
+        val said = snap.message ?: ""
+        t.check(!said.contains("all"), "and it does not report a whole sphere: " + said)
+        t.check(said.contains(snap.directionsShot.toString()),
+            "it says how many were actually taken: " + said)
     }
 }

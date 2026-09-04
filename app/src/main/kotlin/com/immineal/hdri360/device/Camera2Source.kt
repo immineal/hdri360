@@ -90,6 +90,11 @@ class Camera2Source private constructor(
     private val lock = Any()
     private var listener: CameraSource.Listener? = null
     private var previewSettings: ExposureSettings = profile.exposureLimits.realize(1.0 / 120.0)
+    /**
+     * What metering frames are taken at. Separate from the viewfinder's exposure
+     * because the two want different things: see CameraSource.setMeteringExposure.
+     */
+    private var meteringSettings: ExposureSettings = profile.exposureLimits.realize(1.0 / 120.0)
     private var meteringEnabled = false
     private var closed = false
 
@@ -117,6 +122,21 @@ class Camera2Source private constructor(
     override fun startPreview(settings: ExposureSettings) {
         synchronized(lock) { previewSettings = settings }
         applyPreview()
+    }
+
+    override fun setMeteringExposure(settings: ExposureSettings) {
+        val ridesThePreview = synchronized(lock) {
+            meteringSettings = settings
+            meteringReader != null
+        }
+        // Where metering comes off a second stream of the repeating request there
+        // is only one exposure to give, and a measurement that is wrong is worse
+        // than a viewfinder that is dark - so on that path the meter still wins.
+        // The RAW tiers take metering as their own capture and are unaffected.
+        if (ridesThePreview) {
+            synchronized(lock) { previewSettings = settings }
+            applyPreview()
+        }
     }
 
     override fun setPreviewMeteringEnabled(enabled: Boolean) {
@@ -262,7 +282,7 @@ class Camera2Source private constructor(
             try {
                 val b = device.createCaptureRequest(CameraDevice.TEMPLATE_PREVIEW)
                 b.addTarget(reader.surface)
-                applyManualSettings(b, synchronized(lock) { previewSettings })
+                applyManualSettings(b, synchronized(lock) { meteringSettings })
                 b.setTag(METERING_TAG)
                 s.capture(b.build(), meteringCallback, handler)
             } catch (e: Exception) {

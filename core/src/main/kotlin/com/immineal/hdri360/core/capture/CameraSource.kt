@@ -126,8 +126,21 @@ interface CameraSource {
 
     fun setListener(listener: Listener?)
 
-    /** Continuous preview at these settings; also how metering drives exposure. */
+    /** Continuous preview at these settings: the viewfinder, and only that. */
     fun startPreview(settings: ExposureSettings)
+
+    /**
+     * The exposure metering frames are taken at, which is not the one the
+     * viewfinder is shown at.
+     *
+     * Metering puts the brightest part of the scene just under saturation so the
+     * top of the range can be read. That is the right exposure for a measurement
+     * and a useless one to look at: in an ordinary room it leaves everything but
+     * the window black, and the sweep is exactly when a person most needs to see
+     * where they are pointing. Driving both from one number is why the preview
+     * went black a fraction of a second into every capture.
+     */
+    fun setMeteringExposure(settings: ExposureSettings)
 
     /** Whether preview frames are delivered to the listener. Metering is expensive. */
     fun setPreviewMeteringEnabled(enabled: Boolean)

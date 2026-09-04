@@ -203,6 +203,11 @@ class CaptureController(
     private var lastBracketNs = Long.MIN_VALUE
 
     private var previewExposure = source.profile.exposureLimits.realize(config.initialScanExposure)
+    /**
+     * What metering frames are taken at, which is not what the viewfinder is
+     * shown at. See CameraSource.setMeteringExposure.
+     */
+    private var meteringExposure = source.profile.exposureLimits.realize(config.initialScanExposure)
     private var observer: Observer? = null
 
     fun setObserver(o: Observer?) {
@@ -248,6 +253,7 @@ class CaptureController(
         }
         source.setPreviewMeteringEnabled(true)
         source.startPreview(previewExposure)
+        source.setMeteringExposure(meteringExposure)
         publish()
     }
 
@@ -362,6 +368,7 @@ class CaptureController(
 
     override fun onPreviewFrame(luma: ImageF, relativeExposure: Double) {
         var next: com.immineal.hdri360.core.hdr.ExposureSettings? = null
+        var show: com.immineal.hdri360.core.hdr.ExposureSettings? = null
         synchronized(lock) {
             if (state != State.SCANNING) return
             val p = pose ?: return
@@ -380,14 +387,30 @@ class CaptureController(
             if (!SceneMeter.isWellExposed(stats, config.meter)) {
                 val want = SceneMeter.suggestRelativeExposure(stats, relativeExposure, config.meter)
                 val realised = source.profile.exposureLimits.realize(want)
-                if (realised.iso != previewExposure.iso ||
-                    realised.exposureTimeSec != previewExposure.exposureTimeSec) {
-                    previewExposure = realised
+                if (realised.iso != meteringExposure.iso ||
+                    realised.exposureTimeSec != meteringExposure.exposureTimeSec) {
+                    meteringExposure = realised
                     next = realised
                 }
             }
+
+            // And separately, something to look at. The sweep is when a person
+            // most needs to see where they are pointing, and the exposure that
+            // reads the top of the range is not one they can see anything in.
+            val view = SceneMeter.viewingRelativeExposure(stats, config.previewMedianTarget)
+            if (view.isFinite() && view > 0) {
+                val lim = source.profile.exposureLimits
+                val ceiling = lim.maxHandheldTimeSec * lim.maxIso / lim.baseIso.toDouble()
+                val realised = lim.realize(Math.min(view, ceiling))
+                if (realised.iso != previewExposure.iso ||
+                    realised.exposureTimeSec != previewExposure.exposureTimeSec) {
+                    previewExposure = realised
+                    show = realised
+                }
+            }
         }
-        next?.let { source.startPreview(it) }
+        next?.let { source.setMeteringExposure(it) }
+        show?.let { source.startPreview(it) }
         publish()
     }
 
@@ -595,8 +618,18 @@ class CaptureController(
     private fun finishedMessageLocked(): String {
         val got = shot.count { it }
         val lost = abandoned.count { it }
-        return if (lost == 0) "captured all $targetCount directions"
-        else "captured $got of $targetCount directions; $lost could not be shot"
+        val never = targetCount - got - lost
+        // "All" has to mean all. A capture stopped by hand after five directions
+        // has nothing marked as lost, so judging by failures alone reported it as
+        // a complete sphere - in the log as well as on screen, which is the one
+        // record of what a capture actually did.
+        return when {
+            got == targetCount -> "captured all $targetCount directions"
+            lost == 0 -> "stopped after $got of $targetCount directions"
+            never == 0 -> "captured $got of $targetCount directions; $lost could not be shot"
+            else -> "captured $got of $targetCount directions; $lost could not be shot, " +
+                    "$never never reached"
+        }
     }
 
     private fun buildSnapshot(): Snapshot {

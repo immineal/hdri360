@@ -380,10 +380,12 @@ class EndToEndSuite : TestCase {
         @JvmField var pose: Mat3 = Mat3.IDENTITY
         private var listener: CameraSource.Listener? = null
         private var preview: ExposureSettings = profile.exposureLimits.realize(1.0 / 120.0)
+        var metering: ExposureSettings? = null
         private var timestamp = 1L
 
         override fun setListener(listener: CameraSource.Listener?) { this.listener = listener }
         override fun startPreview(settings: ExposureSettings) { preview = settings }
+        override fun setMeteringExposure(settings: ExposureSettings) { metering = settings }
         override fun setPreviewMeteringEnabled(enabled: Boolean) { }
         override fun close() { }
 
