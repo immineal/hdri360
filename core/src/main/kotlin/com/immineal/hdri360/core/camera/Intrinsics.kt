@@ -63,6 +63,27 @@ class Intrinsics(
         return doubleArrayOf(fx * x * f + cx, fy * y * f + cy)
     }
 
+    /**
+     * [project] without the allocation: writes {u, v} into [out] and returns
+     * whether the bearing projects at all.
+     *
+     * Same expressions in the same order as the allocating version - a renderer
+     * that walks a frame at a time calls this once per output pixel per frame,
+     * and a DoubleArray each time is the difference between a render and a
+     * garbage collection.
+     */
+    fun project(dx: Double, dy: Double, dz: Double, out: DoubleArray): Boolean {
+        if (!(dz > 1e-12)) return false
+        val x = dx / dz
+        val y = dy / dz
+        val r2 = x * x + y * y
+        if (hasDistortion() && radialDerivative(r2) <= 0) return false
+        val f = radialFactor(r2)
+        out[0] = fx * x * f + cx
+        out[1] = fy * y * f + cy
+        return true
+    }
+
     /** Unit bearing in camera coordinates for a pixel. */
     fun unproject(u: Double, v: Double): Vec3 {
         val xd = (u - cx) / fx

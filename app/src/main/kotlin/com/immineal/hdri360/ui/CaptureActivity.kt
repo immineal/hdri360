@@ -14,6 +14,8 @@ import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.layout.BoxWithConstraints
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
@@ -42,6 +44,9 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.graphicsLayer
+import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
@@ -50,6 +55,7 @@ import androidx.compose.ui.viewinterop.AndroidView
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import com.immineal.hdri360.device.CaptureSession
 import com.immineal.hdri360.device.CaptureUiState
+import com.immineal.hdri360.device.Diagnostics
 import com.immineal.hdri360.device.ProcessingService
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
@@ -238,7 +244,75 @@ private fun StartScreen(state: CaptureUiState, onStart: (String, File?) -> Unit)
             Text(state.message, color = Color(0xFFFF8A80),
                 style = MaterialTheme.typography.bodySmall)
         }
+        Spacer(Modifier.height(28.dp))
+        DiagnosticsRow()
     }
+}
+
+/**
+ * The only way anything about a failure ever leaves this phone.
+ *
+ * There is no network permission and no telemetry, which is the right default
+ * and also means a capture that went wrong somewhere else is invisible unless
+ * the person holding it decides otherwise. So the report is built on request,
+ * put in Downloads where they can find it, and handed to the share sheet - the
+ * log, what the device and its cameras are, and each capture's own bookkeeping.
+ * No frames, no imagery beyond the preview the app already made.
+ */
+@Composable
+private fun DiagnosticsRow() {
+    val context = LocalContext.current
+    var status by remember { mutableStateOf<String?>(null) }
+    var busy by remember { mutableStateOf(false) }
+    Column(Modifier.fillMaxWidth()) {
+        OutlinedButton(
+            onClick = {
+                if (busy) return@OutlinedButton
+                busy = true
+                status = null
+                val main = android.os.Handler(android.os.Looper.getMainLooper())
+                Thread({
+                    var uri: android.net.Uri? = null
+                    val text = try {
+                        val bundle = Diagnostics.build(context)
+                        uri = Diagnostics.publish(context, bundle)
+                        bundle.name + " - " + Diagnostics.describe(uri)
+                    } catch (e: Exception) {
+                        "could not build a report: " + (e.message ?: e.javaClass.simpleName)
+                    }
+                    val share = uri
+                    main.post {
+                        status = text
+                        busy = false
+                        if (share != null) {
+                            try {
+                                context.startActivity(Intent.createChooser(
+                                    Diagnostics.shareIntent(share), "Send the report"))
+                            } catch (e: Exception) {
+                                status = text + " (nothing on this phone can send it)"
+                            }
+                        }
+                    }
+                }, "hdri-diagnostics").start()
+            },
+            modifier = Modifier.fillMaxWidth()
+        ) {
+            Text(if (busy) "Collecting..." else "Save a diagnostics report")
+        }
+        Spacer(Modifier.height(6.dp))
+        Text(status ?: "The log, the device and what each capture did. No photographs, " +
+            "and nothing is sent anywhere unless you send it.",
+            style = MaterialTheme.typography.bodySmall, color = Color(0xFF9A9A9A))
+    }
+}
+
+/** How far the phone is rolled from the pose the current target wants. */
+private fun rollOf(state: CaptureUiState): Double? {
+    val pose = state.pose ?: return null
+    val snap = state.snapshot ?: return null
+    val i = snap.currentTarget
+    if (i < 0 || i >= state.targets.size) return null
+    return com.immineal.hdri360.core.pano.CaptureGuide.rollErrorDeg(pose, state.targets[i])
 }
 
 @Composable
@@ -246,7 +320,24 @@ private fun CaptureScreen(state: CaptureUiState, rotationDeg: Int,
                           onSurface: (SurfaceTexture?) -> Unit,
                           onFinish: () -> Unit, onSkipScan: () -> Unit) {
     val snap = state.snapshot
-    Box(Modifier.fillMaxSize()) {
+    BoxWithConstraints(Modifier.fillMaxSize()) {
+        // The camera hands over frames in the sensor's own orientation, which on
+        // almost every phone is a quarter turn from the way the phone is held. So
+        // the preview is laid out landscape, at the sensor's aspect ratio, and
+        // then turned - rather than stretched into a portrait box, which is what
+        // made the picture disagree with the guidance drawn on top of it.
+        val density = LocalDensity.current
+        val viewW = with(density) { maxWidth.toPx() }
+        val viewH = with(density) { maxHeight.toPx() }
+        val k = state.intrinsics
+        val aspect = if (k != null && k.height > 0) k.width.toFloat() / k.height else 4f / 3f
+        val quarterTurned = (((rotationDeg % 360) + 360) % 360) / 90 % 2 == 1
+        // Cover the screen without distorting: pick the short side from whichever
+        // way round the frame ends up, then let the long side follow the aspect.
+        val shortPx = if (quarterTurned) Math.max(viewW, viewH / aspect)
+                      else Math.max(viewH, viewW / aspect)
+        val longPx = shortPx * aspect
+
         AndroidView(factory = { ctx ->
             TextureView(ctx).apply {
                 surfaceTextureListener = object : TextureView.SurfaceTextureListener {
@@ -259,7 +350,10 @@ private fun CaptureScreen(state: CaptureUiState, rotationDeg: Int,
                     override fun onSurfaceTextureUpdated(st: SurfaceTexture) { }
                 }
             }
-        }, modifier = Modifier.fillMaxSize())
+        }, modifier = Modifier
+            .align(Alignment.Center)
+            .size(with(density) { longPx.toDp() }, with(density) { shortPx.toDp() })
+            .graphicsLayer { rotationZ = rotationDeg.toFloat() })
 
         SphereOverlay(
             targets = state.targets,
@@ -271,7 +365,10 @@ private fun CaptureScreen(state: CaptureUiState, rotationDeg: Int,
             aligned = snap?.aligned ?: false,
             steady = snap?.steady ?: false,
             modifier = Modifier.fillMaxSize(),
-            rotationDeg = rotationDeg)
+            rotationDeg = rotationDeg,
+            frameWidthPx = longPx,
+            frameHeightPx = shortPx,
+            rollErrorDeg = rollOf(state))
 
         Column(Modifier.align(Alignment.TopCenter).fillMaxWidth()
             .background(Color(0xAA000000)).safeDrawingPadding().padding(12.dp)) {
@@ -388,6 +485,12 @@ private fun ProcessingScreen(p: ProcessingService.State, onReview: (File) -> Uni
         if (p.error != null) {
             Spacer(Modifier.height(12.dp))
             Text(p.error, color = Color(0xFFFF8A80), style = MaterialTheme.typography.bodySmall)
+            Spacer(Modifier.height(6.dp))
+            Text("The frames are still on the phone; nothing was lost. Processing can be " +
+                "started again from the capture screen.",
+                style = MaterialTheme.typography.bodySmall, color = Color(0xFFB0B0B0))
+            Spacer(Modifier.height(14.dp))
+            DiagnosticsRow()
         }
         if (p.finished) {
             Spacer(Modifier.height(22.dp))

@@ -81,7 +81,12 @@ object StreamLadder {
 
     @JvmStatic
     fun plansFor(r: DeviceReport): List<StreamPlan> {
-        val preview = pickPreview(r.yuvSizes) ?: return emptyList()
+        // Matched to the sensor's own shape, so the preview is the capture frame
+        // scaled down rather than a crop of it. A 16:9 preview of a 4:3 capture
+        // shows a different field of view from the one being recorded, and every
+        // marker drawn on it is then in the wrong place.
+        val native = (r.rawSizes + r.yuvSizes).maxByOrNull { it.pixels() }
+        val preview = pickPreview(r.yuvSizes, native) ?: return emptyList()
         val threeStreams = r.hardwareLevel.allowsThreeStreams()
         // A manual sensor is what makes the bracket ours rather than the camera's.
         // LEGACY never has one, whatever it reports.
@@ -143,10 +148,17 @@ object StreamLadder {
         return out
     }
 
-    private fun pickPreview(sizes: List<SensorSize>): SensorSize? {
+    private fun pickPreview(sizes: List<SensorSize>, native: SensorSize?): SensorSize? {
         if (sizes.isEmpty()) return null
         val usable = sizes.filter { it.width <= PREVIEW_MAX_WIDTH }
-        val pool = if (usable.isEmpty()) listOf(sizes.minByOrNull { it.pixels() }!!) else usable
+        var pool = if (usable.isEmpty()) listOf(sizes.minByOrNull { it.pixels() }!!) else usable
+        // Same shape as what is being captured, where the device offers one.
+        if (native != null && native.height > 0) {
+            val want = native.width.toDouble() / native.height
+            val matched = pool.filter { it.height > 0 &&
+                Math.abs(it.width.toDouble() / it.height - want) < 0.02 }
+            if (matched.isNotEmpty()) pool = matched
+        }
         var best = pool[0]
         for (s in pool) {
             val d = Math.abs(s.width - PREVIEW_TARGET_WIDTH)

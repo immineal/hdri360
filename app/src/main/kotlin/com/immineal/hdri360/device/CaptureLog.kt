@@ -51,6 +51,11 @@ object CaptureLog {
         write("WARN  $message" + (cause?.let { "\n" + stackOf(it) } ?: ""))
     }
 
+    fun error(message: String, cause: Throwable? = null) {
+        Log.e(TAG, message, cause)
+        write("ERROR $message" + (cause?.let { "\n" + stackOf(it) } ?: ""))
+    }
+
     fun file(): File? = file
 
     /** Everything recorded so far, for the user to attach to a message themselves. */

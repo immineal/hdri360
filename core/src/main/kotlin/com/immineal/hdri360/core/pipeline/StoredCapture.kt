@@ -59,30 +59,37 @@ object StoredCapture {
     }
 
     /**
-     * How much to shrink each frame so the whole job fits in [budgetBytes].
+     * How much to shrink each frame so that merging one bracket fits in
+     * [budgetBytes].
      *
-     * The merged radiance for every direction has to be resident at once - the
-     * renderer walks all of them for each output row - so the memory the job
-     * needs is set by the sphere, not by one frame. On a phone with a 512 MB heap
-     * a thirty-two direction sphere at three megapixels a frame is over a
-     * gigabyte of merged float, and no amount of care during merging changes
-     * that.
+     * What sets the size of the job is no longer the sphere. With merged
+     * directions parked on disk, the peak is one bracket: the stored mosaic being
+     * read, the colour image it demosaics to, the rungs held while they are
+     * combined, and the radiance that comes out. The sphere itself can be any
+     * size, which is the point of spooling it.
      *
-     * Reducing here rather than failing is the honest trade: the alternative is a
-     * capture the user cannot process at all. What is chosen gets said out loud.
+     * Reducing rather than failing is still the honest trade - the alternative is
+     * a capture the user cannot process at all - and what is chosen gets said out
+     * loud in the report.
      */
     @JvmStatic
-    fun workingSubsampleFor(directions: Int, framePixels: Long, budgetBytes: Long): Int {
-        if (directions <= 0 || framePixels <= 0 || budgetBytes <= 0) return 1
+    fun mergingSubsampleFor(framePixels: Long, rungs: Int, budgetBytes: Long): Int {
+        if (framePixels <= 0 || rungs <= 0 || budgetBytes <= 0) return 1
         var f = 1
-        // Three channels of float per merged pixel, plus the confidence map.
-        while (f < 8 && directions * (framePixels / (f.toLong() * f)) * BYTES_PER_MERGED_PIXEL
-               > budgetBytes) f *= 2
+        while (f < 8 && mergePeakBytes(framePixels, rungs, f) > budgetBytes) f *= 2
         return f
     }
 
-    /** Three float channels of radiance plus one of confidence. */
-    const val BYTES_PER_MERGED_PIXEL = 16L
+    /** Peak bytes one worker needs to merge a bracket reduced by [f]. */
+    @JvmStatic
+    fun mergePeakBytes(framePixels: Long, rungs: Int, f: Int): Long {
+        val working = framePixels / (f.toLong() * f)
+        // The stored plane, read whole; the colour image it becomes; the rungs held
+        // for the merge; and the radiance plus confidence that come out of it.
+        val mosaic = framePixels * 4
+        val demosaiced = if (f >= 2) framePixels / 4 * 12 else framePixels * 12
+        return mosaic + demosaiced + rungs * working * 12 + working * 16
+    }
 
     /** The bracket for one direction, read now. */
     @JvmStatic
@@ -170,15 +177,23 @@ object StoredCapture {
             var image = reader.read(r)
             // A single-channel frame with a CFA phase is a mosaic, not a grey
             // image, and the pipeline works in colour from here on.
+            var f = subsample
             if (image.channels == 1 && r.cfaOrdinal >= 0) {
                 val pattern = CfaPattern.entries.getOrElse(r.cfaOrdinal) { session.cfa }
-                image = Demosaic.malvarHeCutler(
-                    BayerImage(image.width, image.height, pattern, image.data))
+                val mosaic = BayerImage(image.width, image.height, pattern, image.data)
+                // When the frame is going to be halved anyway, take one pixel per
+                // CFA block instead of interpolating twelve megapixels to three
+                // channels and then throwing three quarters of them away. Every
+                // channel is then a photosite that measured that colour, and the
+                // interpolation error is not there to be carried forward - at the
+                // cost of a half-pixel offset between the colour planes, which is
+                // half a pixel of an image that has already been halved.
+                if (f >= 2) { image = Demosaic.halfResolution(mosaic); f /= 2 }
+                else image = Demosaic.malvarHeCutler(mosaic)
             }
             whiteBalance(image, session.neutralGains)
             // Reduced here, one rung at a time, so the full size copy is collectable
             // before the next rung is read rather than after the whole bracket is.
-            var f = subsample
             while (f > 1) { image = ImageOps.downsample2x(image); f /= 2 }
             out.add(Exposure.of(image, r.settings, session.baseIso))
         }

@@ -51,8 +51,18 @@ class CaptureController(
         @JvmField var plan = CapturePlanConfig()
         @JvmField var meter = MeterConfig()
         @JvmField var bracket = BracketConfig()
-        /** How close the pose must be to a target, roll included, before firing. */
-        @JvmField var alignmentToleranceDeg = 6.0
+        /** How close the camera's axis must be to a target's direction before firing. */
+        @JvmField var alignmentToleranceDeg = 7.0
+        /**
+         * How far the phone may be rolled about that axis and still fire.
+         *
+         * Wider than the aim tolerance on purpose: rolling a frame turns its
+         * footprint about its own centre, which at the plan's overlap costs
+         * nothing, while mis-aiming it moves the footprint off the part of the
+         * sphere the plan assigned it. Judging both by one number is what makes a
+         * sphere unshootable by hand.
+         */
+        @JvmField var rollToleranceDeg = 15.0
         /** Shutter lockout, so one steady moment does not fire twice. */
         @JvmField var minBracketIntervalNs = 250_000_000L
         /**
@@ -121,7 +131,15 @@ class CaptureController(
 
     fun interface Observer { fun onChanged(snapshot: Snapshot) }
 
-    @JvmField val plan: CapturePlan = CapturePlan.forCamera(source.profile.intrinsics, config.plan)
+    /**
+     * Where to point, in poses the phone can actually be held in.
+     *
+     * The roll comes from the camera's own SENSOR_ORIENTATION: undoing it is what
+     * makes "upright" mean upright to the person holding the phone rather than to
+     * the sensor inside it.
+     */
+    @JvmField val plan: CapturePlan = CapturePlan.forCamera(
+        source.profile.intrinsics, config.plan, -source.profile.sensorOrientationDeg.toDouble())
     private val targetCount = plan.targets.size
 
     private val lock = Any()
@@ -343,7 +361,8 @@ class CaptureController(
             yawOffset = offset[0]
             pitchOffset = offset[1]
             aligned = CaptureGuide.withinTolerance(cameraToWorld, t,
-                Math.toRadians(config.alignmentToleranceDeg))
+                Math.toRadians(config.alignmentToleranceDeg),
+                Math.toRadians(config.rollToleranceDeg))
 
             if (pendingTarget >= 0) return@synchronized
             if (!aligned || !steady) return@synchronized
@@ -403,19 +422,14 @@ class CaptureController(
             // predecessor marked it done on the burst's metadata, so a short burst
             // left a hole that nothing later would fill.
             if (pendingReceived >= requested && requested > 0) {
-                shot[targetIndex] = true
-                settled[targetIndex] = true
-                abandoned[targetIndex] = false
-                attempts[targetIndex] = 0
+                settleLocked(targetIndex, true)
             } else {
                 attempts[targetIndex]++
                 message = if (attempts[targetIndex] >= config.maxBurstAttempts)
                     "direction ${targetIndex + 1} kept failing; moving on"
                 else "direction ${targetIndex + 1} came back short; retrying"
-                if (attempts[targetIndex] >= config.maxBurstAttempts) {
-                    abandoned[targetIndex] = true
-                    settled[targetIndex] = true
-                }
+                if (attempts[targetIndex] >= config.maxBurstAttempts)
+                    settleLocked(targetIndex, false)
             }
             pendingTarget = -1
             pendingBurst = 0L
@@ -452,11 +466,11 @@ class CaptureController(
         if (nowNs - burstStartedNs < config.burstTimeoutNs) return
         val t = pendingTarget
         if (pendingReceived >= pendingRungs && pendingRungs > 0) {
-            shot[t] = true
+            settleLocked(t, true)
         } else {
             attempts[t]++
             if (attempts[t] >= config.maxBurstAttempts) {
-                shot[t] = true
+                settleLocked(t, false)
                 message = "direction ${t + 1} timed out repeatedly; moving on"
             } else {
                 message = "direction ${t + 1} timed out; retrying"
@@ -471,12 +485,31 @@ class CaptureController(
     private fun abandonBurstLocked(why: String) {
         if (pendingTarget < 0) return
         attempts[pendingTarget]++
-        if (attempts[pendingTarget] >= config.maxBurstAttempts) shot[pendingTarget] = true
+        if (attempts[pendingTarget] >= config.maxBurstAttempts)
+            settleLocked(pendingTarget, false)
         message = why
         pendingTarget = -1
         pendingBurst = 0L
         pendingRungs = 0
         pendingReceived = 0
+    }
+
+    /**
+     * Records the fate of a direction, once and in one place.
+     *
+     * Captured and given-up-on are different states and one flag cannot hold
+     * both: writing shot[t] on the way out of a failure makes the app report a
+     * sphere it does not have, and makes a resumed capture skip the one direction
+     * with no frames in it. Not writing settled[t] is the opposite failure - the
+     * guide keeps offering a direction nothing will ever complete, and the
+     * capture never reaches its end at all. Both were live defects; this is the
+     * single path that cannot express either.
+     */
+    private fun settleLocked(t: Int, captured: Boolean) {
+        shot[t] = captured
+        abandoned[t] = !captured
+        settled[t] = true
+        if (captured) attempts[t] = 0
     }
 
     /** Nearest target within a cone, so a sweep only meters what it pointed at. */

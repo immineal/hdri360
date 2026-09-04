@@ -23,14 +23,22 @@ class CaptureTarget(
          * so the panorama comes out unmirrored.
          */
         @JvmStatic
-        fun lookingAt(forward: Vec3): CaptureTarget {
+        @JvmOverloads
+        fun lookingAt(forward: Vec3, rollDeg: Double = 0.0): CaptureTarget {
             val f = forward.normalized()
             val up = Vec3(0.0, 1.0, 0.0)
             val ref = if (Math.abs(f.dot(up)) > 0.999) Vec3(0.0, 0.0, 1.0) else up
             // Component of world-down perpendicular to the optical axis.
             val down = ref.negate().sub(f.scale(ref.negate().dot(f))).normalized()
             val right = down.cross(f)                     // X = Y x Z keeps the triad right-handed
-            val R = Mat3.fromColumns(right, down, f).orthonormalized()
+            var R = Mat3.fromColumns(right, down, f).orthonormalized()
+            // A roll about the optical axis, for a sensor whose rows do not run
+            // along the world's horizon when the phone is held the way people hold
+            // phones. See CapturePlan.forCamera: without it the app asks for a pose
+            // nobody adopts, and the shutter never fires.
+            if (rollDeg != 0.0)
+                R = R.mul(com.immineal.hdri360.core.math.SO3.exp(
+                    Vec3(0.0, 0.0, Math.toRadians(rollDeg)))).orthonormalized()
             val lat = Math.toDegrees(Math.asin(Math.max(-1.0, Math.min(1.0, f.y))))
             val lon = Math.toDegrees(Math.atan2(-f.x, f.z))
             return CaptureTarget(f, lon, lat, R)

@@ -34,11 +34,21 @@ fun SphereOverlay(
     steady: Boolean,
     modifier: Modifier = Modifier,
     /** Clockwise degrees to rotate projected coordinates into the view's frame. */
-    rotationDeg: Int = 0
+    rotationDeg: Int = 0,
+    /**
+     * The preview's laid-out size in view pixels, before it is rotated - exactly
+     * what the preview surface was given. Markers are placed through the same
+     * transform, so they land on the thing they are pointing at rather than near
+     * it.
+     */
+    frameWidthPx: Float = 0f,
+    frameHeightPx: Float = 0f,
+    /** Degrees the phone is rolled from the target's pose, or null when unknown. */
+    rollErrorDeg: Double? = null
 ) {
     Canvas(modifier = modifier) {
         if (pose == null || intrinsics == null || targets.isEmpty()) return@Canvas
-        val map = ViewMap(intrinsics, size, rotationDeg)
+        val map = ViewMap(intrinsics, size, rotationDeg, frameWidthPx, frameHeightPx)
 
         for (i in targets.indices) {
             val done = shot != null && i < shot.size && shot[i]
@@ -60,11 +70,29 @@ fun SphereOverlay(
         // The reticle. Green only when a bracket could actually fire right now,
         // so it means "hold still", not "roughly there".
         val ready = aligned && steady
+        val centre = Offset(size.width / 2, size.height / 2)
+        val radius = size.minDimension * 0.055f
         drawCircle(
             color = if (ready) OK else if (aligned) NEAR else IDLE,
-            radius = size.minDimension * 0.055f,
-            center = Offset(size.width / 2, size.height / 2),
+            radius = radius,
+            center = centre,
             style = Stroke(width = if (ready) 6f else 3f))
+
+        // How far the phone is rolled from the pose the plan wants. Drawn rather
+        // than worded, because "turn it left" depends on which way round you think
+        // you are holding it and a line does not.
+        if (rollErrorDeg != null && Math.abs(rollErrorDeg) > 1.5) {
+            val a = Math.toRadians(rollErrorDeg)
+            val ux = Math.cos(a).toFloat()
+            val uy = Math.sin(a).toFloat()
+            val reach = radius * 2.4f
+            val level = if (Math.abs(rollErrorDeg) <= 8) NEAR else MISSED
+            drawLine(IDLE, Offset(centre.x - reach, centre.y), Offset(centre.x + reach, centre.y),
+                strokeWidth = 2f)
+            drawLine(level,
+                Offset(centre.x - ux * reach, centre.y - uy * reach),
+                Offset(centre.x + ux * reach, centre.y + uy * reach), strokeWidth = 5f)
+        }
     }
 }
 
@@ -130,33 +158,37 @@ private fun DrawScope.drawEdgeArrow(x: Double, y: Double, z: Double, rotationDeg
 /**
  * Capture pixels into view pixels.
  *
- * The preview and the capture stream are the same optics but not the same frame:
- * the sensor is mounted at some rotation, and the view is letterboxed to whatever
- * aspect it happens to have. Both are undone here rather than hoped away.
+ * The preview is laid out in the sensor's own orientation and then turned, since
+ * a phone's sensor is mounted a quarter turn from the way the phone is held. The
+ * markers go through that same turn - which is the whole point of doing it here
+ * rather than by eye. Rotating one and not the other is what makes the guidance
+ * read as inverted: the arrow says right, the dot is below, and the user is
+ * being asked to trust two things that disagree.
  */
 private class ViewMap(
     private val k: Intrinsics,
     private val size: Size,
-    private val rotationDeg: Int
+    rotationDeg: Int,
+    frameWidthPx: Float,
+    frameHeightPx: Float
 ) {
-    private val quarterTurns = ((rotationDeg % 360) + 360) % 360 / 90
+    private val radians = Math.toRadians(rotationDeg.toDouble())
+    private val cos = Math.cos(radians)
+    private val sin = Math.sin(radians)
+    // Fall back to covering the view in the sensor's own orientation when the
+    // caller has not said how the preview was laid out.
+    private val fw = if (frameWidthPx > 0) frameWidthPx.toDouble() else size.width.toDouble()
+    private val fh = if (frameHeightPx > 0) frameHeightPx.toDouble() else size.height.toDouble()
 
     fun toView(px: Double, py: Double): Offset? {
-        // Normalised, centred, so the rotation is a plain quarter turn.
-        var nx = (px - (k.width - 1) / 2.0) / k.width
-        var ny = (py - (k.height - 1) / 2.0) / k.height
-        var w = k.width.toDouble()
-        var h = k.height.toDouble()
-        repeat(quarterTurns) {
-            val t = nx
-            nx = -ny
-            ny = t
-            val tw = w; w = h; h = tw
-        }
-        // Centre-crop to the view, which is what a preview surface does.
-        val scale = Math.max(size.width / w, size.height / h)
-        val x = (size.width / 2 + nx * w * scale).toFloat()
-        val y = (size.height / 2 + ny * h * scale).toFloat()
+        // Normalised and centred, so the layout is a scale and the mounting is a
+        // rotation, in that order - the same two steps the preview surface takes.
+        val nx = (px - (k.width - 1) / 2.0) / k.width
+        val ny = (py - (k.height - 1) / 2.0) / k.height
+        val lx = nx * fw
+        val ly = ny * fh
+        val x = (size.width / 2 + lx * cos - ly * sin).toFloat()
+        val y = (size.height / 2 + lx * sin + ly * cos).toFloat()
         if (!x.isFinite() || !y.isFinite()) return null
         val margin = size.minDimension * 0.5f
         if (x < -margin || y < -margin || x > size.width + margin || y > size.height + margin)

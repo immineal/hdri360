@@ -43,6 +43,17 @@ class Mat3(rowMajor9: DoubleArray) {
         m[2] * v.x + m[5] * v.y + m[8] * v.z
     )
 
+    /**
+     * R^T * (x, y, z) into [out], for loops that run tens of millions of times and
+     * must not allocate a vector per sample. Same arithmetic in the same order as
+     * [mulTranspose], so the results are bit for bit the same.
+     */
+    fun mulTranspose(x: Double, y: Double, z: Double, out: DoubleArray) {
+        out[0] = m[0] * x + m[3] * y + m[6] * z
+        out[1] = m[1] * x + m[4] * y + m[7] * z
+        out[2] = m[2] * x + m[5] * y + m[8] * z
+    }
+
     fun transpose() = Mat3(doubleArrayOf(m[0], m[3], m[6], m[1], m[4], m[7], m[2], m[5], m[8]))
 
     fun add(o: Mat3): Mat3 {

@@ -40,6 +40,16 @@ object PanoramaRenderer {
         /** Feather, in seam-grid pixels, applied across a region boundary. */
         @JvmField var seamFeather = 2.5
         @JvmField var seam = SeamFinder.Config()
+        /**
+         * Largest block of rows accumulated at once, in bytes.
+         *
+         * The composite is built one frame at a time, which means the running sums
+         * for a block of output rows have to stay resident while every frame is
+         * walked over them. That block is the only thing here that scales with the
+         * output, so it is what gets bounded; the frames themselves come and go one
+         * at a time however big the sphere is.
+         */
+        @JvmField var maxAccumulatorBytes = 48L shl 20
     }
 
     class Result internal constructor(
@@ -114,7 +124,13 @@ object PanoramaRenderer {
      */
     @JvmStatic
     fun buildSeamMap(frames: List<FrameSource>?, cfg: Config): SeamMap? {
-        if (frames == null || frames.size < 2) return null
+        if (frames == null || frames.isEmpty()) return null
+        return buildSeamMap(FrameSet.of(frames), cfg)
+    }
+
+    @JvmStatic
+    fun buildSeamMap(frames: FrameSet, cfg: Config): SeamMap? {
+        if (frames.size < 2) return null
         if (cfg.seamWidth <= 0) return null
         val sw = cfg.seamWidth
         val sh = Equirect.heightFor(sw)
@@ -126,31 +142,40 @@ object PanoramaRenderer {
         val maxCand = Math.min(nf, 8)
         val problem = SeamFinder.Problem(sw, sh, nf, maxCand)
 
-        val axes = arrayOfNulls<Vec3>(nf)
-        val cosLimit = DoubleArray(nf)
-        for (i in 0 until nf) {
-            val f = frames[i]
-            axes[i] = f.rotation.mul(Vec3(0.0, 0.0, 1.0))
-            cosLimit[i] = Math.cos(Math.min(Math.PI, f.intrinsics.maxAngleFromAxisRad() + 1e-3))
-        }
-
-        Parallel.forRanges(sh, 512) { bandFrom, bandTo ->
-        for (y in bandFrom until bandTo) {
-            for (x in 0 until sw) {
-                val i = y * sw + x
-                val dir = Equirect.direction(x.toDouble(), y.toDouble(), sw, sh)
-                for (fi in 0 until nf) {
-                    if (dir.dot(axes[fi]!!) < cosLimit[fi]) continue
-                    val f = frames[fi]
-                    val cam = f.rotation.mulTranspose(dir)
-                    if (!(cam.z > 1e-9)) continue
-                    val p = f.intrinsics.project(cam) ?: continue
+        // One frame at a time, exactly as the render does - and in frame order, so
+        // each direction's candidate list comes out in the same order it would
+        // have from the pixel-major walk. The seam solve depends on that order.
+        val cone = Cone(frames)
+        val lonTable = Equirect.longitudeTable(sw)
+        for (fi in 0 until nf) {
+            if (!cone.touchesRows(fi, 0, sh, sh)) continue
+            val f = frames.open(fi)
+            val iw = f.radiance.width
+            val ih = f.radiance.height
+            val ch = f.radiance.channels
+            val conf = f.confidence
+            val rot = f.rotation
+            val k = f.intrinsics
+            val gain = f.gain
+            Parallel.forRanges(sh, 512) { bandFrom, bandTo ->
+            val cam = DoubleArray(3)
+            val p = DoubleArray(2)
+            for (y in bandFrom until bandTo) {
+                val lat = Equirect.latitudeOf(y.toDouble(), sh)
+                val sinLat = Math.sin(lat)
+                val cosLat = Math.cos(lat)
+                for (x in 0 until sw) {
+                    val dx = -lonTable[2 * x] * cosLat
+                    val dz = lonTable[2 * x + 1] * cosLat
+                    if (dx * cone.ax[fi] + sinLat * cone.ay[fi] + dz * cone.az[fi] <
+                        cone.cosLimit[fi]) continue
+                    rot.mulTranspose(dx, sinLat, dz, cam)
+                    if (!(cam[2] > 1e-9)) continue
+                    if (!k.project(cam[0], cam[1], cam[2], p)) continue
                     val u = p[0]; val v = p[1]
-                    val iw = f.radiance.width; val ih = f.radiance.height
                     if (u < -0.5 || v < -0.5 || u > iw - 0.5 || v > ih - 0.5) continue
                     var weight = featherWeight(u, v, iw, ih, cfg.featherPx)
                     if (weight <= 0) continue
-                    val conf = f.confidence
                     if (conf != null) {
                         val cx = clamp(Math.round(u).toInt(), 0, iw - 1)
                         val cy = clamp(Math.round(v).toInt(), 0, ih - 1)
@@ -160,18 +185,18 @@ object PanoramaRenderer {
                     // Log radiance, because the seam cost has to mean the same thing
                     // in the sky and in the shadows. Gain is applied first so two
                     // frames are compared after photometric alignment, not before.
-                    val ch = f.radiance.channels
                     var lum = if (ch >= 3)
                         (ImageOps.LUMA_R * f.radiance.sampleBilinear(u, v, 0) +
                          ImageOps.LUMA_G * f.radiance.sampleBilinear(u, v, 1) +
                          ImageOps.LUMA_B * f.radiance.sampleBilinear(u, v, 2)).toDouble()
                     else f.radiance.sampleBilinear(u, v, 0).toDouble()
-                    lum *= f.gain
+                    lum *= gain
                     val logLum = Math.log(Math.max(1e-8, lum)).toFloat()
-                    problem.add(i, fi, logLum, weight.toFloat())
+                    problem.add(y * sw + x, fi, logLum, weight.toFloat())
                 }
             }
-        }
+            }
+            frames.release(fi)
         }
 
         val solved = SeamFinder.solve(problem, cfg.seam)
@@ -249,87 +274,194 @@ object PanoramaRenderer {
     fun renderRows(frames: List<FrameSource>?, cfg: Config, rowStart: Int, rowEnd: Int,
                    seam: SeamMap? = null): Result {
         if (frames == null || frames.isEmpty()) throw IllegalArgumentException("no frames to render")
+        return renderRows(FrameSet.of(frames), cfg, rowStart, rowEnd, seam)
+    }
+
+    /**
+     * The same render, over frames that are fetched one at a time.
+     *
+     * Walking frames on the outside rather than the inside is what bounds the
+     * memory: the running sums for a block of rows stay resident, each frame is
+     * opened, added and dropped, and the peak is one frame however many there
+     * are. The arithmetic is unchanged - every pixel still accumulates its frames
+     * in ascending frame order - so this produces the same numbers as asking
+     * every frame about every pixel would.
+     */
+    @JvmStatic
+    @JvmOverloads
+    fun renderRows(frames: FrameSet, cfg: Config, rowStart: Int, rowEnd: Int,
+                   seam: SeamMap? = null): Result {
+        val nf = frames.size
+        if (nf == 0) throw IllegalArgumentException("no frames to render")
         val w = cfg.width
         val h = Equirect.heightFor(w)
         if (w != 2 * h) throw IllegalArgumentException("panorama width must be even and 2:1")
         if (rowStart < 0 || rowEnd > h || rowEnd <= rowStart)
             throw IllegalArgumentException(
                 "bad row range " + rowStart + ".." + rowEnd + " for height " + h)
-        val channels = frames[0].radiance.channels
-        for (f in frames)
-            if (f.radiance.channels != channels)
+        val channels = frames.optics(0).channels
+        for (i in 0 until nf)
+            if (frames.optics(i).channels != channels)
                 throw IllegalArgumentException("frames differ in channel count")
 
         val rows = rowEnd - rowStart
         val out = ImageF(w, rows, channels)
         val coverage = FloatArray(w * rows)
         val contributors = ShortArray(w * rows)
-        // Precompute each frame's viewing cone so the inner loop can reject the
-        // frames that cannot possibly see a direction with one dot product. With
-        // thirty-odd frames on a sphere this is the difference between a few
-        // seconds and a few minutes.
-        val nf = frames.size
-        val axes = arrayOfNulls<Vec3>(nf)
-        val cosLimit = DoubleArray(nf)
-        for (i in 0 until nf) {
-            val f = frames[i]
-            axes[i] = f.rotation.mul(Vec3(0.0, 0.0, 1.0))
-            cosLimit[i] = Math.cos(Math.min(Math.PI, f.intrinsics.maxAngleFromAxisRad() + 1e-3))
-        }
 
-        Parallel.forRanges(rowEnd - rowStart) { bandFrom, bandTo ->
-        val acc = DoubleArray(channels)
-        for (y in rowStart + bandFrom until rowStart + bandTo) {
-            for (x in 0 until w) {
-                val dir = Equirect.direction(x.toDouble(), y.toDouble(), w, h)
-                Arrays.fill(acc, 0.0)
-                var wsum = 0.0
-                var count = 0
+        val cone = Cone(frames)
+        val lonTable = Equirect.longitudeTable(w)
 
-                for (fi in 0 until nf) {
-                    if (dir.dot(axes[fi]!!) < cosLimit[fi]) continue
-                    val f = frames[fi]
-                    val cam = f.rotation.mulTranspose(dir)
-                    if (!(cam.z > 1e-9)) continue
-                    val p = f.intrinsics.project(cam) ?: continue
-                    val u = p[0]
-                    val v = p[1]
-                    val iw = f.radiance.width
-                    val ih = f.radiance.height
-                    if (u < -0.5 || v < -0.5 || u > iw - 0.5 || v > ih - 0.5) continue
+        // Sums per output pixel: the radiance accumulator, the weight, and the
+        // contributor count. This is the only thing that grows with the output.
+        val bytesPerPixel = 8L * channels + 8L + 4L
+        val bandRows = Math.max(1, Math.min(rows.toLong(),
+            cfg.maxAccumulatorBytes / (bytesPerPixel * w)).toInt())
+        val acc = DoubleArray(bandRows * w * channels)
+        val wsum = DoubleArray(bandRows * w)
+        val hits = IntArray(bandRows * w)
 
-                    var weight = featherWeight(u, v, iw, ih, cfg.featherPx)
-                    if (weight <= 0) continue
-                    if (cfg.cosinePower > 0) {
-                        val cos = cam.normalized().z
-                        weight *= Math.pow(Math.max(0.0, cos), cfg.cosinePower)
-                    }
-                    val conf = f.confidence
-                    if (conf != null) {
-                        val cx = clamp(Math.round(u).toInt(), 0, iw - 1)
-                        val cy = clamp(Math.round(v).toInt(), 0, ih - 1)
-                        weight *= conf[cy * iw + cx].toDouble()
-                    }
-                    if (seam != null) {
-                        weight *= seam.shareAt(fi, (x + 0.5) / w, (y + 0.5) / h)
-                    }
-                    if (weight <= 0) continue
+        var y0 = rowStart
+        while (y0 < rowEnd) {
+            val y1 = Math.min(rowEnd, y0 + bandRows)
+            val bandPixels = (y1 - y0) * w
+            Arrays.fill(acc, 0, bandPixels * channels, 0.0)
+            Arrays.fill(wsum, 0, bandPixels, 0.0)
+            Arrays.fill(hits, 0, bandPixels, 0)
 
-                    for (c in 0 until channels)
-                        acc[c] += weight * f.gain * f.radiance.sampleBilinear(u, v, c)
-                    wsum += weight
-                    count++
+            for (fi in 0 until nf) {
+                if (!cone.touchesRows(fi, y0, y1, h)) continue
+                val f = frames.open(fi)
+                accumulate(f, fi, cone, lonTable, cfg, seam, w, h, channels,
+                    y0, y1, acc, wsum, hits)
+                frames.release(fi)
+            }
+
+            Parallel.forRanges(y1 - y0) { from, to ->
+            for (y in from until to) {
+                val src = y * w
+                val dst = (y0 - rowStart + y) * w
+                for (x in 0 until w) {
+                    val i = src + x
+                    val o = dst + x
+                    coverage[o] = wsum[i].toFloat()
+                    contributors[o] = Math.min(Short.MAX_VALUE.toInt(), hits[i]).toShort()
+                    if (wsum[i] > 0)
+                        for (c in 0 until channels)
+                            out.data[o * channels + c] =
+                                (acc[i * channels + c] / wsum[i]).toFloat()
                 }
+            }
+            }
+            y0 = y1
+        }
+        return Result(out, coverage, contributors)
+    }
 
-                val i = (y - rowStart) * w + x
-                coverage[i] = wsum.toFloat()
-                contributors[i] = Math.min(Short.MAX_VALUE.toInt(), count).toShort()
-                if (wsum > 0)
-                    for (c in 0 until channels) out.data[i * channels + c] = (acc[c] / wsum).toFloat()
+    /** Adds one frame's contribution to the running sums for rows [y0, y1). */
+    private fun accumulate(f: FrameSource, fi: Int, cone: Cone, lonTable: DoubleArray,
+                           cfg: Config, seam: SeamMap?, w: Int, h: Int, channels: Int,
+                           y0: Int, y1: Int,
+                           acc: DoubleArray, wsum: DoubleArray, hits: IntArray) {
+        val iw = f.radiance.width
+        val ih = f.radiance.height
+        val conf = f.confidence
+        val rot = f.rotation
+        val k = f.intrinsics
+        val gain = f.gain
+        val ax = cone.ax[fi]
+        val ay = cone.ay[fi]
+        val az = cone.az[fi]
+        val cosLimit = cone.cosLimit[fi]
+
+        Parallel.forRanges(y1 - y0) { from, to ->
+        val cam = DoubleArray(3)
+        val p = DoubleArray(2)
+        for (yy in from until to) {
+            val y = y0 + yy
+            val lat = Equirect.latitudeOf(y.toDouble(), h)
+            val sinLat = Math.sin(lat)
+            val cosLat = Math.cos(lat)
+            val rowBase = yy * w
+            for (x in 0 until w) {
+                val dx = -lonTable[2 * x] * cosLat
+                val dz = lonTable[2 * x + 1] * cosLat
+                if (dx * ax + sinLat * ay + dz * az < cosLimit) continue
+                rot.mulTranspose(dx, sinLat, dz, cam)
+                if (!(cam[2] > 1e-9)) continue
+                if (!k.project(cam[0], cam[1], cam[2], p)) continue
+                val u = p[0]
+                val v = p[1]
+                if (u < -0.5 || v < -0.5 || u > iw - 0.5 || v > ih - 0.5) continue
+
+                var weight = featherWeight(u, v, iw, ih, cfg.featherPx)
+                if (weight <= 0) continue
+                if (cfg.cosinePower > 0) {
+                    val n = Math.sqrt(cam[0] * cam[0] + cam[1] * cam[1] + cam[2] * cam[2])
+                    val cos = cam[2] * (1.0 / n)
+                    weight *= Math.pow(Math.max(0.0, cos), cfg.cosinePower)
+                }
+                if (conf != null) {
+                    val cx = clamp(Math.round(u).toInt(), 0, iw - 1)
+                    val cy = clamp(Math.round(v).toInt(), 0, ih - 1)
+                    weight *= conf[cy * iw + cx].toDouble()
+                }
+                if (seam != null) {
+                    weight *= seam.shareAt(fi, (x + 0.5) / w, (y + 0.5) / h)
+                }
+                if (weight <= 0) continue
+
+                val i = rowBase + x
+                for (c in 0 until channels)
+                    acc[i * channels + c] += weight * gain * f.radiance.sampleBilinear(u, v, c)
+                wsum[i] += weight
+                hits[i]++
             }
         }
         }
-        return Result(out, coverage, contributors)
+    }
+
+    /**
+     * Each frame's viewing cone, and the band of latitudes it can possibly reach.
+     *
+     * The latitude bounds are what make a frame-at-a-time render affordable: a
+     * frame near the horizon cannot contribute to the rows around the zenith, so
+     * it is never opened for them. The test is exact rather than conservative -
+     * a direction outside the cone's latitude band is outside the cone, so the
+     * pixels skipped here are precisely the ones the per-pixel test would have
+     * rejected anyway.
+     */
+    private class Cone(frames: FrameSet) {
+        @JvmField val ax: DoubleArray
+        @JvmField val ay: DoubleArray
+        @JvmField val az: DoubleArray
+        @JvmField val cosLimit: DoubleArray
+        private val latMin: DoubleArray
+        private val latMax: DoubleArray
+
+        init {
+            val n = frames.size
+            ax = DoubleArray(n); ay = DoubleArray(n); az = DoubleArray(n)
+            cosLimit = DoubleArray(n)
+            latMin = DoubleArray(n); latMax = DoubleArray(n)
+            for (i in 0 until n) {
+                val o = frames.optics(i)
+                val axis = o.rotation.mul(Vec3(0.0, 0.0, 1.0))
+                ax[i] = axis.x; ay[i] = axis.y; az[i] = axis.z
+                val alpha = o.intrinsics.maxAngleFromAxisRad() + 1e-3
+                cosLimit[i] = Math.cos(Math.min(Math.PI, alpha))
+                val lat = Math.asin(Math.max(-1.0, Math.min(1.0, axis.y)))
+                latMin[i] = lat - alpha
+                latMax[i] = lat + alpha
+            }
+        }
+
+        fun touchesRows(i: Int, y0: Int, y1: Int, height: Int): Boolean {
+            if (latMax[i] - latMin[i] >= Math.PI) return true
+            val top = Equirect.latitudeOf(y0.toDouble(), height)
+            val bottom = Equirect.latitudeOf((y1 - 1).toDouble(), height)
+            return latMax[i] >= bottom && latMin[i] <= top
+        }
     }
 
     /** Smoothstep ramp from 0 at the frame border to 1 once featherPx inside it. */

@@ -105,6 +105,22 @@ object WorkEstimator {
         return WorkEstimate(merge, align, render, write)
     }
 
+    /**
+     * The output width at which one panorama pixel is one source pixel.
+     *
+     * A frame's angular resolution is its field of view over its width; an
+     * equirectangular panorama spans 360 degrees. Rendering much above this
+     * resamples data that is not there, and much below it throws away data that
+     * is - so this is the size worth recommending, and the one the report should
+     * be read against.
+     */
+    @JvmStatic
+    fun matchedWidth(k: Intrinsics): Int {
+        val hfov = k.horizontalFovDeg()
+        if (!(hfov > 0)) return 4096
+        return Math.max(1024, Math.min(16384, Math.round(360.0 * k.width / hfov).toInt()))
+    }
+
     /** The sizes offered, best first. Resolution is the only dial worth giving a user. */
     @JvmStatic
     @JvmOverloads

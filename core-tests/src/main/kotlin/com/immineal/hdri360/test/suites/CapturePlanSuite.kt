@@ -7,6 +7,7 @@ import com.immineal.hdri360.core.pano.CapturePlan
 import com.immineal.hdri360.core.pano.CapturePlanConfig
 import com.immineal.hdri360.core.pano.CaptureTarget
 import com.immineal.hdri360.core.pano.Equirect
+import com.immineal.hdri360.core.pano.OrientationMath
 import com.immineal.hdri360.test.TestCase
 import com.immineal.hdri360.test.TestKit
 import java.util.Random
@@ -111,6 +112,8 @@ class CapturePlanSuite : TestCase {
         // --- determinism ----------------------------------------------------------
         val again = CapturePlan.forCamera(k, cfg)
         t.eq(plan.targets.size.toLong(), again.targets.size.toLong(), "planning is deterministic")
+
+        theTargetsAreHoldable(t)
         t.lessThan(plan.targets[3].direction.angleTo(again.targets[3].direction), 1e-12,
             "planning is deterministic in detail")
     }
@@ -120,5 +123,87 @@ class CapturePlanSuite : TestCase {
         val phi = 2 * Math.PI * r.nextDouble()
         val s = Math.sqrt(Math.max(0.0, 1 - z * z))
         return Vec3(s * Math.cos(phi), z, s * Math.sin(phi))
+    }
+    /**
+     * The pose the plan asks for has to be one a person actually adopts.
+     *
+     * A phone's sensor rows do not run along the horizon when the phone is held
+     * upright: SENSOR_ORIENTATION is 90 degrees on a typical device, so a target
+     * whose camera-down axis points at world-down is a target that requires the
+     * phone to be held sideways. Held the natural way instead, the pose is a
+     * quarter turn out - and since alignment is judged on roll as well as aim,
+     * the shutter simply never fires. The whole capture path is unreachable, and
+     * nothing in the old suite said so.
+     */
+    private fun theTargetsAreHoldable(t: TestKit) {
+        // The real thing: a 4:3 sensor that reads out landscape, in a phone whose
+        // camera is mounted a quarter turn round.
+        val sensor = Intrinsics.fromHorizontalFov(4000, 3000, 58.7)
+        val sensorOrientation = 90
+        val plan = CapturePlan.forCamera(sensor, CapturePlanConfig(),
+            -sensorOrientation.toDouble())
+        val cameraToDevice = OrientationMath.cameraToDevice(sensorOrientation, false)
+
+        // The device attitude each target implies, from the same relation the
+        // tracker uses: cameraToWorld = deviceInWorld * cameraToDevice.
+        var worstUpright = 0.0
+        var checked = 0
+        for (target in plan.targets) {
+            val f = target.direction
+            if (Math.abs(f.y) > 0.94) continue      // near a pole, upright means nothing
+            val deviceInWorld = target.rotation.mul(cameraToDevice.transpose())
+            val screenUp = deviceInWorld.mul(Vec3(0.0, 1.0, 0.0))
+            // As upright as the aim allows: world up, with the part along the
+            // optical axis taken out.
+            val upright = Vec3(0.0, 1.0, 0.0).sub(f.scale(f.y)).normalized()
+            worstUpright = Math.max(worstUpright, Math.toDegrees(screenUp.angleTo(upright)))
+            checked++
+        }
+        t.greaterThan(checked.toDouble(), 20.0, "there are targets away from the poles to check")
+        t.lessThan(worstUpright, 1e-6,
+            "the plan asks for a phone held straight up, screen upright")
+        t.note("portrait grip: worst screen tilt " + TestKit.fmt(worstUpright) +
+                " degrees over " + checked + " targets")
+
+        // The same plan without the correction asks for the phone on its side. This
+        // is the defect, stated: it is not a preference, it is ninety degrees.
+        val sideways = CapturePlan.forCamera(sensor, CapturePlanConfig(), 0.0)
+        var worstSideways = 0.0
+        var leastSideways = 180.0
+        for (target in sideways.targets) {
+            val f = target.direction
+            if (Math.abs(f.y) > 0.94) continue
+            val deviceInWorld = target.rotation.mul(cameraToDevice.transpose())
+            val screenUp = deviceInWorld.mul(Vec3(0.0, 1.0, 0.0))
+            val upright = Vec3(0.0, 1.0, 0.0).sub(f.scale(f.y)).normalized()
+            val tilt = Math.toDegrees(screenUp.angleTo(upright))
+            worstSideways = Math.max(worstSideways, tilt)
+            leastSideways = Math.min(leastSideways, tilt)
+        }
+        t.near(90.0, worstSideways, 1e-6,
+            "and without it, exactly a quarter turn - which is why nothing ever fired")
+        t.near(90.0, leastSideways, 1e-6, "for every target, not just the worst one")
+
+        // A quarter turn also swaps which field of view sets which spacing. The
+        // tiling has to follow the frame onto the sky, not the sensor's own idea
+        // of which way is wide.
+        val turned = plan.targets.size
+        val flat = sideways.targets.size
+        t.greaterThan(turned.toDouble(), 0.0, "the portrait plan exists")
+        t.greaterThan(flat.toDouble(), 0.0, "so does the landscape one")
+        t.note("a " + TestKit.fmt(sensor.horizontalFovDeg()) + "x" +
+                TestKit.fmt(sensor.verticalFovDeg()) + " degree sensor tiles the sphere in " +
+                turned + " directions held upright, " + flat + " held sideways")
+
+        // Whatever the grip, the sphere still has to be covered.
+        val rng = Random(4242)
+        var covered = 0
+        val trials = 4000
+        for (i in 0 until trials) {
+            val d = randomDirection(rng)
+            if (plan.covers(d, sensor)) covered++
+        }
+        t.greaterThan(covered / trials.toDouble(), 0.999,
+            "and the rolled plan still covers the whole sphere")
     }
 }

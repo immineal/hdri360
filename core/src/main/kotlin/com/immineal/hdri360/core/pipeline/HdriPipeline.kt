@@ -14,6 +14,8 @@ import com.immineal.hdri360.core.math.Vec3
 import com.immineal.hdri360.core.pano.BriefMatcher
 import com.immineal.hdri360.core.pano.FastCornerDetector
 import com.immineal.hdri360.core.pano.FeatureSet
+import com.immineal.hdri360.core.pano.FrameOptics
+import com.immineal.hdri360.core.pano.FrameSet
 import com.immineal.hdri360.core.pano.FrameSource
 import com.immineal.hdri360.core.pano.HorizonEstimator
 import com.immineal.hdri360.core.pano.PanoramaRenderer
@@ -158,6 +160,16 @@ object HdriPipeline {
         @JvmField var mergeConcurrency = 0
         @JvmField var merge = MergeConfig()
         /**
+         * Where merged directions are kept while the sphere is solved.
+         *
+         * Null holds them in memory, which only works when the whole sphere fits -
+         * on a phone, thirty-two directions of merged radiance does not. A
+         * [FrameSpool] parks them in a directory instead and the composite reads
+         * them back one at a time; the numbers that come out are the same either
+         * way, which the suite checks rather than assumes.
+         */
+        @JvmField var mergedFrames: MergedFrames? = null
+        /**
          * What the output radiance means. Supplied by the caller because only it
          * knows whether the capture was a genuine measurement - the pipeline sees
          * pixels and exposures, not which capability tier produced them.
@@ -183,10 +195,8 @@ object HdriPipeline {
         @JvmField val gains: DoubleArray,
         @JvmField val placed: BooleanArray,
         @JvmField val pairs: List<PairResult>,
-        @JvmField val frames: List<FrameSource>,
         @JvmField val baRmsDeg: Double,
         @JvmField val coveredFraction: Double,
-        @JvmField val merges: List<MergeResult>,
         /** Confidence of the recovered horizon, or -1 if levelling was not attempted. */
         @JvmField val horizonConfidence: Double,
         /** Recovered shared radial distortion, 0 when it was not solved for. */
@@ -195,8 +205,12 @@ object HdriPipeline {
         @JvmField val radianceScale: RadianceScale,
         /**
          * The frames actually composited, gains applied - the unplaced ones dropped.
+         *
+         * A set rather than a list because on a phone they are not all in memory:
+         * whoever writes the full-resolution output walks it the same way the
+         * pipeline's own render did, opening one frame at a time.
          */
-        @JvmField val renderable: List<FrameSource>,
+        @JvmField val renderable: FrameSet,
         /**
          * Which frame owns which part of the sphere, or null when seams are off.
          *
@@ -221,8 +235,19 @@ object HdriPipeline {
         val n = inputs.size
         report(progress, "merging", 0.0)
 
-        // 1. Merge brackets.
-        val mergedArr = arrayOfNulls<MergeResult>(n)
+        // 1. Merge each bracket to radiance, and describe it while it is in hand.
+        //
+        // Detection lives in this loop rather than in one of its own because of
+        // where the memory goes: a merged direction is tens of megabytes and a
+        // feature set is a few kilobytes, so describing a frame before letting go
+        // of it means the sphere never has to be read twice - and with the frames
+        // spooled to disk, reading it twice is a real cost rather than a free one.
+        val store = opt.mergedFrames ?: ResidentFrames(n)
+        if (store.size != n)
+            throw IllegalArgumentException("the frame store holds " + store.size +
+                " frames but " + n + " were given")
+        val features = arrayOfNulls<FeatureSet>(n)
+        val workingIntrinsics = arrayOfNulls<Intrinsics>(n)
         val mergeDone = java.util.concurrent.atomic.AtomicInteger()
         val mergeThreads = if (opt.mergeConcurrency > 0) opt.mergeConcurrency else Parallel.threads
         val restoreThreads = Parallel.threads
@@ -231,31 +256,25 @@ object HdriPipeline {
             Parallel.forEach(n) { i ->
                 // Scoped so a deferred bracket becomes collectable the moment it has
                 // been merged, rather than at the end of the stage.
-                mergedArr[i] = HdrMerger.merge(inputs[i].openBracket(), opt.merge)
+                val merged = HdrMerger.merge(inputs[i].openBracket(), opt.merge)
+                val det = DetectionImage.build(merged.radiance, opt.featureWorkingWidth)
+                val fc = FastCornerDetector.Config()
+                fc.threshold = opt.fastThreshold
+                fc.maxFeatures = opt.maxFeaturesPerFrame
+                features[i] = FeatureSet.describe(det.image, FastCornerDetector.detect(det.image, fc))
+                workingIntrinsics[i] = inputs[i].intrinsics.scaled(det.scale)
+                store.put(i, merged.radiance,
+                    confidenceOf(merged, opt.confidenceSnrReference),
+                    FrameOptics(inputs[i].intrinsics, Mat3.IDENTITY, 1.0,
+                        merged.radiance.channels))
                 report(progress, "merging", mergeDone.incrementAndGet() / n.toDouble())
             }
         } finally {
             Parallel.threads = restoreThreads
         }
-        val merges = ArrayList<MergeResult>(n)
-        for (i in 0 until n) merges.add(mergedArr[i]!!)
+        report(progress, "features", 1.0)
 
-        // 2. Features.
-        report(progress, "features", 0.0)
-        val features = arrayOfNulls<FeatureSet>(n)
-        val workingIntrinsics = arrayOfNulls<Intrinsics>(n)
-        val featureDone = java.util.concurrent.atomic.AtomicInteger()
-        Parallel.forEach(n) { i ->
-            val det = DetectionImage.build(merges[i].radiance, opt.featureWorkingWidth)
-            val fc = FastCornerDetector.Config()
-            fc.threshold = opt.fastThreshold
-            fc.maxFeatures = opt.maxFeaturesPerFrame
-            features[i] = FeatureSet.describe(det.image, FastCornerDetector.detect(det.image, fc))
-            workingIntrinsics[i] = inputs[i].intrinsics.scaled(det.scale)
-            report(progress, "features", featureDone.incrementAndGet() / n.toDouble())
-        }
-
-        // 3. Pairwise rotations.
+        // 2. Pairwise rotations.
         report(progress, "matching", 0.0)
         val mc = BriefMatcher.Config()
         val totalPairs = n * (n - 1) / 2
@@ -321,14 +340,14 @@ object HdriPipeline {
             pairCorr[k]?.let { correspondences.addAll(it) }
         }
 
-        // 4. Initial poses from a maximum spanning tree over the pair graph.
+        // 3. Initial poses from a maximum spanning tree over the pair graph.
         report(progress, "aligning", 0.0)
         val rotationsInit = arrayOfNulls<Mat3>(n)
         val placed = BooleanArray(n)
         initialiseRotations(inputs, pairs, rotationsInit, placed)
         var rotations = Array(n) { rotationsInit[it]!! }
 
-        // 5. Global refinement.
+        // 4. Global refinement.
         val bo = RotationBundleAdjuster.Options()
         bo.huberRad = Math.toRadians(opt.baHuberDeg)
         bo.priorWeight = opt.priorWeight
@@ -364,30 +383,35 @@ object HdriPipeline {
         }
         report(progress, "aligning", 1.0)
 
-        // 6. Photometric alignment and compositing.
+        // 5. Photometric alignment and compositing.
         report(progress, "blending", 0.0)
-        val frames = ArrayList<FrameSource>(n)
+        val channels = store.optics(0).channels
         for (i in 0 until n) {
             val optics = if (k1 != 0.0) inputs[i].intrinsics.withDistortion(k1, 0.0, 0.0)
                          else inputs[i].intrinsics
-            frames.add(FrameSource(merges[i].radiance, optics,
-                rotations[i], confidenceOf(merges[i], opt.confidenceSnrReference), 1.0))
+            store.setOptics(i, FrameOptics(optics, rotations[i], 1.0, channels))
         }
         var gains = DoubleArray(n)
         Arrays.fill(gains, 1.0)
         if (opt.solvePhotometric && pairs.isNotEmpty()) {
-            val samples = samplePairs(frames, pairs, opt)
-            if (samples.isNotEmpty()) {
-                gains = PhotometricAligner.solveGainsRobust(n, samples, 1e-4, 4)
-                for (i in 0 until n) frames[i] = frames[i].withGain(gains[i])
-            }
+            val samples = samplePairs(store, pairs, opt)
+            if (samples.isNotEmpty()) gains = PhotometricAligner.solveGainsRobust(n, samples, 1e-4, 4)
         }
+        for (i in 0 until n)
+            store.setOptics(i, FrameOptics(store.optics(i).intrinsics, rotations[i],
+                gains[i], channels))
 
         // Frames that never connected would be composited at an arbitrary pose,
         // which is worse than leaving a hole: drop them unless a prior placed them.
-        var renderable = ArrayList<FrameSource>()
-        for (i in 0 until n) if (placed[i]) renderable.add(frames[i])
-        if (renderable.isEmpty()) renderable = frames
+        var keep = IntArray(0)
+        run {
+            var count = 0
+            for (i in 0 until n) if (placed[i]) count++
+            keep = IntArray(if (count > 0) count else n)
+            var w = 0
+            for (i in 0 until n) if (placed[i] || count == 0) keep[w++] = i
+        }
+        val renderable = FrameSet.select(store, keep)
 
         val rc = PanoramaRenderer.Config()
         rc.width = opt.panoramaWidth
@@ -402,7 +426,7 @@ object HdriPipeline {
         report(progress, "blending", 1.0)
 
         return Result(rendered.panorama, rendered.coverage, rotations, gains, placed,
-            pairs, frames, baRms, rendered.coveredFraction(), merges, horizonConfidence, k1,
+            pairs, baRms, rendered.coveredFraction(), horizonConfidence, k1,
             opt.radianceScale, renderable, seamMap)
     }
 
@@ -499,14 +523,30 @@ object HdriPipeline {
                 ImageOps.LUMA_B * img.data[pixel * c + 2]).toDouble()
     }
 
-    /** Radiance samples in the overlap of each solved pair, for the gain solve. */
-    private fun samplePairs(frames: List<FrameSource>, pairs: List<PairResult>,
+    /**
+     * Radiance samples in the overlap of each solved pair, for the gain solve.
+     *
+     * Positions first, pixels second. Which points get sampled is decided from
+     * the geometry and the random sequence alone, so the whole sample set is
+     * known before a single frame is opened - and the frames can then be read one
+     * at a time, in order, instead of two at a time in pair order. On a sphere
+     * that is the difference between holding two directions and holding all of
+     * them.
+     *
+     * A sample whose radiance turns out to be zero in either frame is dropped
+     * afterwards rather than replaced, because replacing it would make the choice
+     * of positions depend on the pixels, which is exactly what has to be avoided.
+     */
+    private fun samplePairs(frames: FrameSet, pairs: List<PairResult>,
                             opt: Options): List<PhotometricAligner.Sample> {
-        val out = ArrayList<PhotometricAligner.Sample>()
         val rng = Random(opt.seed)
+        val sampleA = ArrayList<Int>()
+        val sampleB = ArrayList<Int>()
+        val posA = ArrayList<DoubleArray>()
+        val posB = ArrayList<DoubleArray>()
         for (p in pairs) {
-            val a = frames[p.a]
-            val b = frames[p.b]
+            val a = frames.optics(p.a)
+            val b = frames.optics(p.b)
             var taken = 0
             var attempts = 0
             while (taken < opt.photometricSamplesPerPair &&
@@ -520,13 +560,33 @@ object HdriPipeline {
                 val q = b.intrinsics.project(cam) ?: continue
                 if (q[0] < b.intrinsics.width * 0.15 || q[0] > b.intrinsics.width * 0.85) continue
                 if (q[1] < b.intrinsics.height * 0.15 || q[1] > b.intrinsics.height * 0.85) continue
-
-                val va = luminance(a.radiance, u, v)
-                val vb = luminance(b.radiance, q[0], q[1])
-                if (!(va > 1e-6) || !(vb > 1e-6)) continue
-                out.add(PhotometricAligner.Sample(p.a, p.b, va, vb, 1.0))
+                sampleA.add(p.a)
+                sampleB.add(p.b)
+                posA.add(doubleArrayOf(u, v))
+                posB.add(q)
                 taken++
             }
+        }
+
+        // One pass over the frames, filling in both ends of every sample.
+        val valueA = DoubleArray(sampleA.size)
+        val valueB = DoubleArray(sampleA.size)
+        for (fi in 0 until frames.size) {
+            var needed = false
+            for (s in sampleA.indices) if (sampleA[s] == fi || sampleB[s] == fi) { needed = true; break }
+            if (!needed) continue
+            val f = frames.open(fi)
+            for (s in sampleA.indices) {
+                if (sampleA[s] == fi) valueA[s] = luminance(f.radiance, posA[s][0], posA[s][1])
+                if (sampleB[s] == fi) valueB[s] = luminance(f.radiance, posB[s][0], posB[s][1])
+            }
+            frames.release(fi)
+        }
+
+        val out = ArrayList<PhotometricAligner.Sample>(sampleA.size)
+        for (s in sampleA.indices) {
+            if (!(valueA[s] > 1e-6) || !(valueB[s] > 1e-6)) continue
+            out.add(PhotometricAligner.Sample(sampleA[s], sampleB[s], valueA[s], valueB[s], 1.0))
         }
         return out
     }

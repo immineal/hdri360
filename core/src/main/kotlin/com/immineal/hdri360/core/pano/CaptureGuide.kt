@@ -30,6 +30,30 @@ object CaptureGuide {
     fun withinTolerance(currentPose: Mat3, target: CaptureTarget, toleranceRad: Double): Boolean =
         SO3.angleBetween(currentPose, target.rotation) <= toleranceRad
 
+    /** How far the camera's own axis is from the target direction, roll ignored. */
+    @JvmStatic
+    fun axisErrorRad(currentPose: Mat3, target: CaptureTarget): Double =
+        currentPose.mul(Vec3(0.0, 0.0, 1.0)).angleTo(target.direction)
+
+    /**
+     * Aim and roll judged separately, because they are not equally costly to get
+     * wrong.
+     *
+     * Where the camera points decides which part of the sphere is captured, and
+     * an error there leaves a hole the plan budgeted no overlap for. Roll only
+     * turns the footprint about its own centre: at the plan's overlap a frame can
+     * be rolled a good deal further than it can be mis-aimed before anything is
+     * actually lost. Holding both to one tight number is what makes a sphere
+     * unshootable by hand - the aim is reached, the wrist is a few degrees off,
+     * and the shutter never fires.
+     */
+    @JvmStatic
+    fun withinTolerance(currentPose: Mat3, target: CaptureTarget,
+                        axisRad: Double, rollRad: Double): Boolean {
+        if (axisErrorRad(currentPose, target) > axisRad) return false
+        return Math.abs(Math.toRadians(rollErrorDeg(currentPose, target))) <= rollRad
+    }
+
     /**
      * How far to turn, expressed in the camera's own frame so the arrow can point
      * straight at it: {yaw, pitch} in degrees, positive meaning right and up.

@@ -12,6 +12,8 @@ import com.immineal.hdri360.core.hdr.ExposureSettings
 import com.immineal.hdri360.core.image.CfaPattern
 import com.immineal.hdri360.core.image.ImageF
 import com.immineal.hdri360.core.math.Mat3
+import com.immineal.hdri360.core.math.SO3
+import com.immineal.hdri360.core.math.Vec3
 import com.immineal.hdri360.test.TestCase
 import com.immineal.hdri360.test.TestKit
 
@@ -480,6 +482,100 @@ class CaptureSuite : TestCase {
                 1L, true), ImageF(4, 4, 1))
             t.eq(before.toLong(), c.snapshot().framesTaken.toLong(),
                 "a frame from a burst already written off is not counted")
+        }
+
+        // --- a direction whose bursts never come back at all ---------------------------
+        // Distinct from a short burst: nothing completes, so the only thing that
+        // ever settles this direction is the timeout. That path used to write
+        // shot[t] on the way out and never write settled[t], which both reported a
+        // direction the app did not have and left the guide offering it forever -
+        // a capture that could not finish.
+        run {
+            val cam = FakeCamera(profile())
+            val c = CaptureController(cam, CountingSink())
+            cam.setListener(c)
+            c.beginScan()
+            var now = scanEverything(c, cam, 1_000_000_000L)
+            c.finishScanAndPlan()
+
+            val silent = aimAtNext(c, now + 300_000_000L).first
+            t.greaterThan(silent.toDouble(), -1.0, "a direction is chosen")
+            var tries = 0
+            while (!c.snapshot().abandoned[silent] && tries++ < 10) {
+                cam.abandon()                                  // the camera never reports
+                now += 6_000_000_000L                          // past the burst timeout
+                c.onOrientation(c.plan.targets[silent].rotation, true, now)
+                now = settleOn(c, silent, now + 300_000_000L)
+            }
+            val after = c.snapshot()
+            t.check(after.abandoned[silent], "repeated timeouts give up on the direction")
+            t.check(!after.shot[silent], "without claiming it was captured")
+            t.eq(0L, after.directionsShot.toLong(), "so the sphere is still empty")
+
+            var guard = 0
+            while (c.snapshot().state == CaptureController.State.CAPTURING && guard++ < 300) {
+                val (target, then) = aimAtNext(c, now + 300_000_000L)
+                now = then
+                if (target < 0) break
+                if (cam.lastTarget == target) cam.deliver(cam.lastRungs.size)
+            }
+            t.eq(CaptureController.State.FINISHED.toString(), c.snapshot().state.toString(),
+                "and the rest of the sphere still reaches the end")
+            t.eq((c.plan.targets.size - 1).toLong(),
+                c.snapshot().directionsShot.toLong(), "with an honest count")
+        }
+
+        // --- aim and roll are judged separately ------------------------------------------
+        // One tolerance for both is what makes a sphere unshootable by hand: the
+        // aim is reached, the wrist is a few degrees off, and the shutter never
+        // fires. Rolling a frame turns its footprint about its own centre, which
+        // the plan's overlap absorbs; mis-aiming moves it off the sphere.
+        run {
+            val cfg = CaptureController.Config()
+            cfg.alignmentToleranceDeg = 7.0
+            cfg.rollToleranceDeg = 15.0
+            val cam = FakeCamera(profile())
+            val c = CaptureController(cam, CountingSink(), cfg)
+            cam.setListener(c)
+            c.beginScan()
+            var now = scanEverything(c, cam, 1_000_000_000L)
+            c.finishScanAndPlan()
+
+            c.onOrientation(c.plan.targets[0].rotation, false, now)
+            val target = c.snapshot().currentTarget
+            val pose = c.plan.targets[target].rotation
+
+            // Rolled ten degrees about the optical axis: aimed correctly, so it fires.
+            val rolled = pose.mul(SO3.exp(Vec3(0.0, 0.0, Math.toRadians(10.0))))
+            now += 400_000_000L
+            c.onOrientation(rolled, true, now)
+            now += 300_000_000L
+            c.onOrientation(rolled, true, now)
+            t.eq(1L, cam.burstsRequested.toLong(),
+                "a frame rolled inside the roll tolerance still fires")
+            t.lessThan(Math.toDegrees(SO3.angleBetween(rolled, pose)), 11.0,
+                "and that pose really is further off than the aim tolerance alone allows")
+            cam.deliver(cam.lastRungs.size)
+
+            // Mis-aimed by ten degrees: not fired, whatever the roll does.
+            val next = c.snapshot().currentTarget
+            val nextPose = c.plan.targets[next].rotation
+            val misaimed = nextPose.mul(SO3.exp(Vec3(Math.toRadians(10.0), 0.0, 0.0)))
+            now += 400_000_000L
+            c.onOrientation(misaimed, true, now)
+            now += 400_000_000L
+            c.onOrientation(misaimed, true, now)
+            t.eq(1L, cam.burstsRequested.toLong(),
+                "but a direction the camera is not actually pointed at does not")
+            t.check(!c.snapshot().aligned, "and the screen says so")
+
+            // Rolled past the roll tolerance is refused too - it is forgiving, not absent.
+            val overRolled = nextPose.mul(SO3.exp(Vec3(0.0, 0.0, Math.toRadians(25.0))))
+            now += 400_000_000L
+            c.onOrientation(overRolled, true, now)
+            now += 400_000_000L
+            c.onOrientation(overRolled, true, now)
+            t.eq(1L, cam.burstsRequested.toLong(), "a wildly rolled frame is still refused")
         }
 
         // --- what the tiers claim ----------------------------------------------------

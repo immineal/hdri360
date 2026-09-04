@@ -32,6 +32,29 @@ object Equirect {
         return Vec3(-Math.sin(lon) * cosLat, Math.sin(lat), Math.cos(lon) * cosLat)
     }
 
+    /** Latitude of a row, in radians. */
+    @JvmStatic
+    fun latitudeOf(v: Double, height: Int): Double = Math.PI / 2 - ((v + 0.5) / height) * Math.PI
+
+    /**
+     * sin and cos of every column's longitude, interleaved as {sin, cos} pairs.
+     *
+     * A render that walks one frame at a time visits each output pixel once per
+     * frame, and recomputing two transcendentals per visit costs more than the
+     * projection itself. The values are exactly what [direction] computes, so a
+     * render built on these is bit for bit a render built on that.
+     */
+    @JvmStatic
+    fun longitudeTable(width: Int): DoubleArray {
+        val out = DoubleArray(2 * width)
+        for (x in 0 until width) {
+            val lon = ((x + 0.5) / width) * 2 * Math.PI - Math.PI
+            out[2 * x] = Math.sin(lon)
+            out[2 * x + 1] = Math.cos(lon)
+        }
+        return out
+    }
+
     @JvmStatic
     fun pixel(dir: Vec3, width: Int, height: Int): DoubleArray {
         checkAspect(width, height)

@@ -17,6 +17,7 @@ import com.immineal.hdri360.core.capture.FrameStore
 import com.immineal.hdri360.core.hdr.ToneMapper
 import com.immineal.hdri360.core.io.ExrWriter
 import com.immineal.hdri360.core.pipeline.Calibration
+import com.immineal.hdri360.core.pipeline.FrameSpool
 import com.immineal.hdri360.core.pipeline.HdriPipeline
 import com.immineal.hdri360.core.pipeline.OutputWriter
 import com.immineal.hdri360.core.pipeline.ResolutionOption
@@ -70,15 +71,20 @@ class ProcessingService : Service() {
 
     private fun run(dir: File, width: Int) {
         val started = SystemClock.elapsedRealtime()
+        var spool: FrameSpool? = null
         try {
             val store = FrameStore.open(dir)
                 ?: throw IllegalStateException("that capture is not readable any more")
             val shape = shapeOf(store)
-            val subsample = StoredCapture.workingSubsampleFor(
-                shape.directions, shape.framePixels, mergedBudget())
+            val subsample = StoredCapture.mergingSubsampleFor(
+                shape.framePixels, shape.rungs, mergeBudget())
+            val workingPixels = shape.framePixels / (subsample.toLong() * subsample)
+            val heapMb = Runtime.getRuntime().maxMemory() / (1024 * 1024)
             CaptureLog.log("processing ${shape.directions} directions x ${shape.rungs} rungs, " +
-                "frames ${shape.framePixels} px, working at 1/$subsample, " +
-                "heap ${Runtime.getRuntime().maxMemory() / (1024 * 1024)} MB")
+                "frames ${shape.framePixels} px, working at 1/$subsample " +
+                "(${workingPixels / 1000} kpx/frame), output ${width}x${width / 2}, " +
+                "heap $heapMb MB, merge peak " +
+                "${StoredCapture.mergePeakBytes(shape.framePixels, shape.rungs, subsample) shr 20} MB")
             val inputs = StoredCapture.inputs(store, subsample = subsample)
             if (inputs.isEmpty())
                 throw IllegalStateException("no direction was completely shot, so there is " +
@@ -88,13 +94,31 @@ class ProcessingService : Service() {
             // works is a phone the user force-quits.
             Parallel.threads = Math.max(1, Runtime.getRuntime().availableProcessors() - 1)
 
+            // The merged sphere goes to disk rather than into the heap. Thirty-two
+            // directions of merged radiance is well over a gigabyte; the alternative
+            // was to shrink every frame until the whole sphere fitted, which meant
+            // working at an eighth of the sensor to hold data the renderer only ever
+            // reads one frame at a time.
+            val workDir = File(dir, WORK)
+            val needed = FrameSpool.bytesNeeded(inputs.size, workingPixels, 3)
+            val free = dir.usableSpace
+            CaptureLog.log("parking ${inputs.size} merged frames in $workDir: " +
+                "${needed shr 20} MB needed, ${free shr 20} MB free")
+            if (free in 1 until needed)
+                throw IllegalStateException("this sphere needs ${needed shr 20} MB of working " +
+                    "space and there is only ${free shr 20} MB free")
+            spool = FrameSpool(workDir, inputs.size)
+
             val opt = StoredCapture.optionsFor(store.session, PREVIEW_SOLVE_WIDTH)
+            opt.mergedFrames = spool
             // Merging a bracket needs the whole bracket resident, so the number of
             // brackets in flight has to be bounded by memory rather than by cores.
             // Unbounded, this is where the phone died.
-            opt.mergeConcurrency = mergeWorkers(shape.framePixels / (subsample.toLong() * subsample))
+            opt.mergeConcurrency = mergeWorkers(shape.framePixels, shape.rungs, subsample)
             opt.priorWeight = if (store.records().any { it.pose != null }) 0.5 else 0.0
             opt.levelHorizon = opt.priorWeight == 0.0
+            CaptureLog.log("merging ${opt.mergeConcurrency} brackets at a time on " +
+                "${Parallel.threads} threads, prior weight ${opt.priorWeight}")
 
             val estimate = estimateFor(store, width)
             publish(State(true, "Starting", 0.0, remaining(estimate?.seconds ?: 0.0, 0.0)))
@@ -123,9 +147,16 @@ class ProcessingService : Service() {
                 }
             }
             if (!tmp.renameTo(exr)) throw IllegalStateException("could not finish writing $exr")
+            CaptureLog.log("wrote $exr: $stats")
 
             writePreview(dir, result)
             val elapsed = (SystemClock.elapsedRealtime() - started) / 1000.0
+            CaptureLog.log(String.format(Locale.US,
+                "solved %d of %d directions, %d pairs, %.3f deg residual, k1 %.4f, " +
+                "horizon %.2f, %.1f stops in %.1f s",
+                result.placed.count { it }, result.placed.size, result.pairs.size,
+                result.baRmsDeg, result.k1, result.horizonConfidence,
+                stats.dynamicRangeStops, elapsed))
             File(dir, "report.json").writeText(
                 OutputWriter.report(result, store.session, stats, width, elapsed).toString(),
                 StandardCharsets.UTF_8)
@@ -137,12 +168,18 @@ class ProcessingService : Service() {
                 String.format(Locale.US, "processed in %.1f s at %d px", elapsed, width))
 
             publish(State(false, "Done in ${Math.round(elapsed)} s", 1.0, "", true, dir))
-            notify("Sphere finished", 1.0)
+            notifyDone(String.format(Locale.US, "%d x %d, %.1f stops, %.0f s",
+                width, width / 2, stats.dynamicRangeStops, elapsed), false)
         } catch (e: Throwable) {
             Log.e(TAG, "processing failed", e)
+            CaptureLog.error("processing failed", e)
             publish(State(false, "Processing stopped", 0.0, "", true, dir,
                 e.message ?: e.javaClass.simpleName))
+            notifyDone(e.message ?: e.javaClass.simpleName, true)
         } finally {
+            // Scratch, whatever happened. Leaving it behind fills the phone, and
+            // the frames it was built from are still on disk to try again from.
+            try { spool?.close() } catch (e: Exception) { CaptureLog.warn("spool: " + e) }
             running.set(false)
             stopForegroundCompat()
             stopSelf()
@@ -151,7 +188,10 @@ class ProcessingService : Service() {
 
     private fun writePreview(dir: File, result: HdriPipeline.Result) {
         try {
-            val small = OutputWriter.preview(result, PREVIEW_WIDTH)
+            // The pipeline already rendered the sphere at this size while solving
+            // it; rendering it again would be a second full pass over every frame
+            // for a picture that is already in hand.
+            val small = result.panorama
             // The viewer needs linear radiance, not a picture: its exposure slider
             // is only meaningful over values the tone mapper has not yet decided.
             FileOutputStream(File(dir, "viewer.exr")).use {
@@ -213,14 +253,41 @@ class ProcessingService : Service() {
         else startForeground(NOTIFICATION_ID, n)
     }
 
+    /**
+     * Takes the progress notification away with the service.
+     *
+     * Detaching left it on the shade with a full progress bar and no job behind
+     * it, which is a notification that lies about the state of the phone. What is
+     * worth leaving is a single line saying it finished - and that one dismisses
+     * itself.
+     */
     private fun stopForegroundCompat() {
-        if (Build.VERSION.SDK_INT >= 24) stopForeground(Service.STOP_FOREGROUND_DETACH)
-        else @Suppress("DEPRECATION") stopForeground(false)
+        if (Build.VERSION.SDK_INT >= 24) stopForeground(Service.STOP_FOREGROUND_REMOVE)
+        else @Suppress("DEPRECATION") stopForeground(true)
     }
 
     private fun notify(stage: String, fraction: Double) {
         getSystemService(NotificationManager::class.java)
             ?.notify(NOTIFICATION_ID, build(stage, fraction))
+    }
+
+    /** The one line worth leaving behind, which clears itself if nobody looks. */
+    private fun notifyDone(text: String, failed: Boolean) {
+        val open = Intent(this, com.immineal.hdri360.ui.CaptureActivity::class.java)
+            .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TOP)
+        val pending = android.app.PendingIntent.getActivity(this, 0, open,
+            android.app.PendingIntent.FLAG_IMMUTABLE or
+            android.app.PendingIntent.FLAG_UPDATE_CURRENT)
+        val b = Notification.Builder(this, CHANNEL)
+            .setContentTitle(if (failed) "The sphere was not finished" else "Sphere finished")
+            .setContentText(text)
+            .setSmallIcon(android.R.drawable.ic_menu_gallery)
+            .setAutoCancel(true)
+            .setOngoing(false)
+            .setContentIntent(pending)
+        if (Build.VERSION.SDK_INT >= 26)
+            b.setTimeoutAfter(if (failed) FAILED_NOTICE_MS else DONE_NOTICE_MS)
+        getSystemService(NotificationManager::class.java)?.notify(DONE_NOTIFICATION_ID, b.build())
     }
 
     private fun build(stage: String, fraction: Double): Notification {
@@ -238,8 +305,15 @@ class ProcessingService : Service() {
         private const val TAG = "Hdri360.Processing"
         private const val CHANNEL = "processing"
         private const val NOTIFICATION_ID = 1
+        private const val DONE_NOTIFICATION_ID = 2
+        /** How long the finished notice lingers before Android clears it. */
+        private const val DONE_NOTICE_MS = 60_000L
+        private const val FAILED_NOTICE_MS = 10 * 60_000L
         private const val EXTRA_DIR = "dir"
         private const val EXTRA_WIDTH = "width"
+
+        /** Scratch directory for the merged sphere, deleted when the run ends. */
+        const val WORK = "work"
 
         /** Solving and merging run at a working size; the output is rendered after. */
         const val PREVIEW_SOLVE_WIDTH = 2048
@@ -253,24 +327,24 @@ class ProcessingService : Service() {
          * brackets being merged into it, the panorama strips, and the room the
          * runtime needs not to spend its life collecting.
          */
-        private const val MERGED_HEAP_SHARE = 0.35
-        private const val TRANSIENT_HEAP_SHARE = 0.25
+        private const val MERGE_HEAP_SHARE = 0.45
 
-        private fun mergedBudget(): Long =
-            (Runtime.getRuntime().maxMemory() * MERGED_HEAP_SHARE).toLong()
+        /** What one bracket may cost while it is being merged. */
+        private fun mergeBudget(): Long =
+            (Runtime.getRuntime().maxMemory() * MERGE_HEAP_SHARE).toLong()
 
         /**
          * How many brackets may be merged at once.
          *
-         * Each worker holds one rung at full size while it demosaics - the mosaic
-         * plus its three channel result - so the cost per worker follows the frame,
-         * not the sphere.
+         * A worker holds the mosaic it is reading, the colour image it becomes, the
+         * rungs waiting to be combined and the radiance that comes out. That is the
+         * peak, it is per worker, and it does not care how big the sphere is.
          */
-        private fun mergeWorkers(workingPixels: Long): Int {
-            val perWorker = Math.max(1L, workingPixels * 16)
-            val budget = (Runtime.getRuntime().maxMemory() * TRANSIENT_HEAP_SHARE).toLong()
+        private fun mergeWorkers(framePixels: Long, rungs: Int, subsample: Int): Int {
+            val perWorker = Math.max(1L,
+                StoredCapture.mergePeakBytes(framePixels, rungs, subsample))
             val cores = Math.max(1, Runtime.getRuntime().availableProcessors() - 1)
-            return Math.max(1, Math.min(cores.toLong(), budget / perWorker).toInt())
+            return Math.max(1, Math.min(cores.toLong(), mergeBudget() / perWorker).toInt())
         }
 
         private val flow = MutableStateFlow(State())
@@ -312,7 +386,7 @@ class ProcessingService : Service() {
                     ?.let { it.width.toLong() * it.height } ?: 1_000_000L
                 // Estimate the work that will actually be done, which is at the
                 // reduced size the memory allows, not the size on disk.
-                val f = StoredCapture.workingSubsampleFor(directions, framePixels, mergedBudget())
+                val f = StoredCapture.mergingSubsampleFor(framePixels, rungs, mergeBudget())
                 return WorkEstimator.resolutionOptions(directions, rungs,
                     framePixels / (f.toLong() * f), calibration())
             } finally {
@@ -336,7 +410,7 @@ class ProcessingService : Service() {
                 val rungs = Math.max(1, records.size / Math.max(1, directions))
                 val framePixels = records.firstOrNull()?.let { it.width.toLong() * it.height }
                     ?: 1_000_000L
-                val f = StoredCapture.workingSubsampleFor(directions, framePixels, mergedBudget())
+                val f = StoredCapture.mergingSubsampleFor(framePixels, rungs, mergeBudget())
                 WorkEstimator.estimate(Math.max(1, directions), rungs,
                     framePixels / (f.toLong() * f), width, calibration())
             } catch (e: Exception) {

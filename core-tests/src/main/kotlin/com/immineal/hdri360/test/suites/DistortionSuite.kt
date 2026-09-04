@@ -205,6 +205,91 @@ class DistortionSuite : TestCase {
         t.throwsException({ RotationBundleAdjuster.solve(init, obs, null, wrongCount) },
             "a mismatched intrinsics count is an error")
 
+        // --- a capture with no rotational baseline cannot measure a lens ---------
+        //
+        // Every frame shot from one aim - a phone on a desk, or a bench test with
+        // the aim check disabled - matches each point to itself at the same image
+        // radius. Distortion cancels exactly, k1 is unobservable, and yet the
+        // solver will happily find one and improve the residual with it. This is
+        // not hypothetical: a real capture on the phone returned k1 = 0.133 from
+        // eighteen frames that shared a single aim.
+        run {
+            val jitter = Array(frames) { i ->
+                SO3.exp(Vec3(0.004 * Math.sin(i * 1.7), 0.004 * Math.cos(i * 2.3),
+                             0.002 * Math.sin(i * 0.9)))
+            }
+            val stuck = ArrayList<RotationBundleAdjuster.Correspondence>()
+            for (i in 0 until frames) {
+                for (j in i + 1 until frames) {
+                    var made = 0
+                    var attempts = 0
+                    while (made < 60 && attempts < 4000) {
+                        attempts++
+                        val u = r.nextDouble() * (undistorted.width - 1)
+                        val v = r.nextDouble() * (undistorted.height - 1)
+                        val world = jitter[i].mul(trueCamera.unproject(u, v))
+                        val q = trueCamera.project(jitter[j].mulTranspose(world)) ?: continue
+                        if (q[0] < 0 || q[1] < 0 ||
+                            q[0] > undistorted.width - 1 || q[1] > undistorted.height - 1) continue
+                        val pa = doubleArrayOf(u + r.nextGaussian() * pixelNoise,
+                                               v + r.nextGaussian() * pixelNoise)
+                        val pb = doubleArrayOf(q[0] + r.nextGaussian() * pixelNoise,
+                                               q[1] + r.nextGaussian() * pixelNoise)
+                        stuck.add(RotationBundleAdjuster.Correspondence(i, j,
+                            undistorted.unproject(pa[0], pa[1]),
+                            undistorted.unproject(pb[0], pb[1]),
+                            1.0, pa, pb))
+                        made++
+                    }
+                }
+            }
+            t.greaterThan(stuck.size.toDouble(), 300.0, "the degenerate fixture has plenty of matches")
+
+            val spread = RotationBundleAdjuster.distortionLeverage(obs, cameras)
+            val none = RotationBundleAdjuster.distortionLeverage(stuck, cameras)
+            t.greaterThan(spread, 0.05,
+                "a real sphere pairs points at genuinely different radii")
+            t.lessThan(none, spread / 20.0,
+                "frames sharing one aim pair every point with itself")
+            t.note("radial leverage: " + TestKit.fmt(spread) + " over a sweep, " +
+                    TestKit.fmt(none) + " from a single aim")
+
+            val stuckInit = Array(frames) { i ->
+                if (i == 0) jitter[0]
+                else SO3.exp(randomVec(r).scale(Math.toRadians(0.5))).mul(jitter[i])
+            }
+            val degenerate = RotationBundleAdjuster.Options()
+            degenerate.solveDistortion = true
+            degenerate.distortionIntrinsics = cameras
+            val stuckResult = RotationBundleAdjuster.solve(stuckInit, stuck, null, degenerate)
+            t.near(0.0, stuckResult.k1, 1e-12,
+                "a capture with no rotational baseline reports no distortion at all")
+
+            // And the refusal has to be the gate's doing, not an accident of the
+            // fit: with the gate opened up, this is exactly the number that came
+            // back off the phone.
+            val ungated = RotationBundleAdjuster.Options()
+            ungated.solveDistortion = true
+            ungated.distortionIntrinsics = cameras
+            ungated.distortionMinSignalDeg = 0.0
+            val loose = RotationBundleAdjuster.solve(stuckInit, stuck, null, ungated)
+            t.check(Math.abs(loose.k1) > 0.02,
+                "the ungated solver really does invent a coefficient from this data")
+
+            // The threshold has to sit between the two cases with room on both
+            // sides, or it is a number that happens to work rather than a decision.
+            val gate = RotationBundleAdjuster.Options().distortionMinSignalDeg
+            val inventedDeg = Math.toDegrees(Math.abs(loose.k1) * none)
+            val realDeg = Math.toDegrees(Math.abs(k1Result.k1) * spread)
+            t.lessThan(inventedDeg * 2.0, gate,
+                "what the invented coefficient claims to have measured is far under the gate")
+            t.greaterThan(realDeg, gate * 5.0,
+                "and what the real one claims is far over it")
+            t.note("displacement claimed: " + TestKit.fmt(inventedDeg) +
+                    " deg from one aim, " + TestKit.fmt(realDeg) +
+                    " deg from a sweep, gate at " + TestKit.fmt(gate) + " deg")
+        }
+
         foldOverTests(t)
     }
 

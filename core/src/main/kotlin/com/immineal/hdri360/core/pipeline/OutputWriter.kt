@@ -6,6 +6,7 @@ import com.immineal.hdri360.core.io.ExrStreamWriter
 import com.immineal.hdri360.core.io.ExrWriter
 import com.immineal.hdri360.core.io.Json
 import com.immineal.hdri360.core.pano.Equirect
+import com.immineal.hdri360.core.pano.FrameSet
 import com.immineal.hdri360.core.pano.FrameSource
 import com.immineal.hdri360.core.pano.PanoramaRenderer
 import java.io.OutputStream
@@ -29,8 +30,15 @@ object OutputWriter {
 
     class Config {
         @JvmField var panoramaWidth = 8192
-        /** Rows rendered at once. Smaller is less memory and slightly more overhead. */
-        @JvmField var stripRows = 128
+        /**
+         * Rows rendered at once.
+         *
+         * Also how often each frame is re-opened: the composite walks frames on
+         * the outside of a strip, so a strip half the size reads the sphere twice
+         * as often. Wide enough that a frame spans two or three strips, narrow
+         * enough that a strip of an 8K panorama is tens of megabytes.
+         */
+        @JvmField var stripRows = 256
         @JvmField var compression = ExrWriter.Compression.ZIPS
         @JvmField var featherPx = 60.0
         @JvmField var seamFeather = 2.5
@@ -74,8 +82,15 @@ object OutputWriter {
     @JvmOverloads
     fun writeExr(out: OutputStream, frames: List<FrameSource>,
                  seamMap: PanoramaRenderer.SeamMap?, cfg: Config,
+                 progress: Progress? = null): Stats =
+        writeExr(out, FrameSet.of(frames), seamMap, cfg, progress)
+
+    @JvmStatic
+    @JvmOverloads
+    fun writeExr(out: OutputStream, frames: FrameSet,
+                 seamMap: PanoramaRenderer.SeamMap?, cfg: Config,
                  progress: Progress? = null): Stats {
-        if (frames.isEmpty()) throw IllegalArgumentException("nothing was placed, so nothing to write")
+        if (frames.size == 0) throw IllegalArgumentException("nothing was placed, so nothing to write")
         val width = cfg.panoramaWidth
         val height = Equirect.heightFor(width)
 
@@ -112,6 +127,12 @@ object OutputWriter {
     @JvmStatic
     @JvmOverloads
     fun preview(frames: List<FrameSource>, seamMap: PanoramaRenderer.SeamMap?,
+                width: Int, cfg: Config = Config()): ImageF =
+        preview(FrameSet.of(frames), seamMap, width, cfg)
+
+    @JvmStatic
+    @JvmOverloads
+    fun preview(frames: FrameSet, seamMap: PanoramaRenderer.SeamMap?,
                 width: Int, cfg: Config = Config()): ImageF {
         val render = PanoramaRenderer.Config()
         render.width = width

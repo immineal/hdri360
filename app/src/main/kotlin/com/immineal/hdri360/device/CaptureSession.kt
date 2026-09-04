@@ -210,6 +210,28 @@ class CaptureSession(
         ladder?.let { l ->
             CaptureLog.log("ladder: " + l.ladder.steps.joinToString(" | ") { it.toString() })
         }
+        // Now that the ladder exists, the size of the capture is actually known -
+        // which it was not when the camera was opened. A sphere is hundreds of
+        // frames, and running out of space at direction forty is a capture lost.
+        ladder?.let { l ->
+            val k = src.profile.intrinsics
+            val perFrame = 2L * k.width * k.height          // half float on disk
+            val perDng = 2L * k.width * k.height            // the bundle the user keeps
+            val needed = l.totalShots().toLong() * (perFrame + perDng)
+            val free = root.parentFile?.usableSpace ?: 0L
+            CaptureLog.log("space: ${l.totalShots()} frames need about " +
+                "${needed shr 20} MB, ${free shr 20} MB free")
+            if (free in 1 until needed) {
+                val short = "This sphere needs about ${needed shr 20} MB and only " +
+                    "${free shr 20} MB is free"
+                CaptureLog.warn(short)
+                flow.value = flow.value.let {
+                    CaptureUiState(it.phase, it.message, it.tierNote, it.snapshot, it.targets,
+                        it.pose, it.intrinsics, it.sessionDir, it.lenses, it.chosenLens, short,
+                        null, it.sensorOrientationDeg)
+                }
+            }
+        }
         // The store can only be created once the ladder exists, because a resumed
         // capture has to come back on the same one.
         val session = StoredSession(
@@ -299,7 +321,42 @@ class CaptureSession(
 
     // ---------------------------------------------------------------- observing
 
+    /**
+     * A line per thing that actually happened, because the log is the only
+     * account of a capture that went wrong on a phone that is not in front of me.
+     *
+     * Per direction rather than per frame: a sphere is a hundred and sixty frames
+     * and a log nobody can read is not a log. What is worth knowing afterwards is
+     * which directions landed, in what order, how long each took, and which ones
+     * were given up on.
+     */
+    private fun logProgress(snap: CaptureController.Snapshot) {
+        val shot = snap.directionsShot
+        val lost = snap.abandoned.count { it }
+        val now = SystemClock.elapsedRealtime()
+        // Felt, not seen: the zenith is shot with the screen facing the floor.
+        if (snap.aligned && !lastAligned) haptics.onTarget()
+        lastAligned = snap.aligned
+        if (shot > lastShot) haptics.captured()
+        if (lost > lastAbandoned) haptics.missed()
+        if (shot != lastShot || lost != lastAbandoned) {
+            val since = if (lastSettledMs == 0L) 0L else now - lastSettledMs
+            lastSettledMs = now
+            CaptureLog.log("direction ${shot + lost} of ${snap.shot.size} settled " +
+                "(${shot} shot, ${lost} given up) after ${since} ms, " +
+                "${snap.framesTaken}/${snap.framesPlanned} frames")
+            lastShot = shot
+            lastAbandoned = lost
+        }
+        val m = snap.message
+        if (m != null && m != lastMessage) {
+            lastMessage = m
+            CaptureLog.log("state ${snap.state}: $m")
+        }
+    }
+
     private fun publish(snap: CaptureController.Snapshot) {
+        logProgress(snap)
         val src = synchronized(lock) { source }
         val pose = synchronized(lock) { tracker }?.currentPose()
         val ctrl = synchronized(lock) { controller }
@@ -325,6 +382,7 @@ class CaptureSession(
         }
 
         if (phase == CaptureUiState.Phase.FINISHED) {
+            haptics.finished()
             CaptureLog.log("capture finished: ${snap.directionsShot} of ${snap.shot.size} " +
                 "directions, ${snap.framesTaken} frames")
             val done = synchronized(lock) {
@@ -336,6 +394,13 @@ class CaptureSession(
             }
         }
     }
+
+    private val haptics = Haptics(context)
+    private var lastShot = 0
+    private var lastAbandoned = 0
+    private var lastAligned = false
+    private var lastSettledMs = 0L
+    private var lastMessage: String? = null
 
     companion object {
         private const val TAG = "Hdri360.Session"

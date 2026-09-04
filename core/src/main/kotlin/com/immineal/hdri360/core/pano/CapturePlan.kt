@@ -64,10 +64,29 @@ class CapturePlan private constructor(targets: List<CaptureTarget>) {
     }
 
     companion object {
+        /**
+         * Where to point, for a camera held with [rollDeg] of roll about its own
+         * optical axis.
+         *
+         * The roll is not a refinement, it is the difference between a plan that
+         * can be followed and one that cannot. A phone's sensor rows almost never
+         * run along the world's horizon when the phone is held upright: on a
+         * typical device SENSOR_ORIENTATION is 90 degrees, so asking for frames
+         * whose sensor rows are horizontal is asking the user to hold the phone
+         * sideways, with a portrait screen and sideways guidance - and if they
+         * hold it the natural way instead, the pose is ninety degrees out and the
+         * shutter never fires at all.
+         *
+         * The roll also decides the tiling, because it decides which way round the
+         * frame is on the sky: a quarter turn swaps the field of view that sets the
+         * ring spacing with the one that sets the azimuth spacing.
+         */
         @JvmStatic
-        fun forCamera(k: Intrinsics, cfg: CapturePlanConfig): CapturePlan {
-            val hfov = k.horizontalFovDeg()
-            val vfov = k.verticalFovDeg()
+        @JvmOverloads
+        fun forCamera(k: Intrinsics, cfg: CapturePlanConfig, rollDeg: Double = 0.0): CapturePlan {
+            val quarterTurned = Math.abs(Math.round(rollDeg / 90.0)) % 2 == 1L
+            val hfov = if (quarterTurned) k.verticalFovDeg() else k.horizontalFovDeg()
+            val vfov = if (quarterTurned) k.horizontalFovDeg() else k.verticalFovDeg()
             val keep = Math.max(0.05, 1.0 - cfg.overlapFraction)
             val vStep = vfov * keep
 
@@ -84,7 +103,7 @@ class CapturePlan private constructor(targets: List<CaptureTarget>) {
             }
 
             val out = ArrayList<CaptureTarget>()
-            if (cfg.includePoles) out.add(CaptureTarget.lookingAt(Vec3(0.0, -1.0, 0.0)))
+            if (cfg.includePoles) out.add(CaptureTarget.lookingAt(Vec3(0.0, -1.0, 0.0), rollDeg))
 
             var reverse = false
             for (pitch in pitches) {
@@ -94,13 +113,14 @@ class CapturePlan private constructor(targets: List<CaptureTarget>) {
                 val ring = ArrayList<CaptureTarget>()
                 for (i in 0 until count) {
                     val yaw = -180.0 + 360.0 * i / count
-                    ring.add(CaptureTarget.lookingAt(CaptureTarget.directionFor(yaw, pitch)))
+                    ring.add(CaptureTarget.lookingAt(
+                        CaptureTarget.directionFor(yaw, pitch), rollDeg))
                 }
                 if (reverse) Collections.reverse(ring)
                 reverse = !reverse
                 out.addAll(ring)
             }
-            if (cfg.includePoles) out.add(CaptureTarget.lookingAt(Vec3(0.0, 1.0, 0.0)))
+            if (cfg.includePoles) out.add(CaptureTarget.lookingAt(Vec3(0.0, 1.0, 0.0), rollDeg))
             return CapturePlan(out)
         }
     }

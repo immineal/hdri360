@@ -89,6 +89,26 @@ object RotationBundleAdjuster {
          * failure mode for the other.
          */
         @JvmField var distortionMinGain = 0.01
+        /**
+         * Smallest image displacement, in degrees, that a recovered k1 must
+         * actually account for before it is believed.
+         *
+         * A residual improvement is not evidence that the lens was measured. What
+         * makes k1 observable is seeing the same scene point at *different* image
+         * radii in the two frames: distortion moves a point by k1*r^3, so a
+         * correspondence whose two radii agree carries no information about k1 at
+         * all, and a whole capture of those - every frame shot from one aim, which
+         * is exactly what a bench test produces - leaves the coefficient free to
+         * absorb noise. It does, and the fit improves, and the number is
+         * meaningless.
+         *
+         * So the coefficient is also asked what it claims to have measured:
+         * |k1| times the correspondences' actual radial leverage, as an angle. A
+         * real lens on a real sphere lands near a degree; the degenerate case
+         * lands three orders of magnitude below it, which is why the threshold
+         * does not need to be delicate.
+         */
+        @JvmField var distortionMinSignalDeg = 0.05
     }
 
     class Result internal constructor(
@@ -153,11 +173,49 @@ object RotationBundleAdjuster {
             rms(fitted.rotations, obs, camerasFor(fitted.k1, baseIntrinsics, true)), fitted.k1)
 
         // Keep the coefficient only if it earned its place against an otherwise
-        // identically-fitted model.
+        // identically-fitted model, *and* if the data could have measured it at
+        // all. The two gates catch different failures: the first rejects a k1 that
+        // does not help, the second a k1 that helps for the wrong reason.
         val improved = reference.rmsErrorRad - withK1.rmsErrorRad
-        if (improved > reference.rmsErrorRad * opt.distortionMinGain) return withK1
-        return reference
+        if (improved <= reference.rmsErrorRad * opt.distortionMinGain) return reference
+        val signalRad = Math.abs(withK1.k1) * distortionLeverage(obs, baseIntrinsics)
+        if (signalRad < Math.toRadians(opt.distortionMinSignalDeg)) return reference
+        return withK1
     }
+
+    /**
+     * How much radial separation the correspondences actually offer, in normalised
+     * image units per unit of k1.
+     *
+     * Brown-Conrady moves a point at normalised radius r out to r(1 + k1 r^2), so
+     * what a matched pair says about k1 is the difference of its two radial
+     * displacements, |rA^3 - rB^3|. Averaged over the correspondences that is the
+     * angular signal one unit of k1 would produce - and, multiplied by a recovered
+     * k1, the angle that coefficient claims to have measured.
+     *
+     * Zero for a capture whose frames all share an aim: every point lands at the
+     * same radius in both views, the distortion cancels exactly, and no amount of
+     * fitting can recover what the geometry did not encode.
+     */
+    @JvmStatic
+    fun distortionLeverage(obs: List<Correspondence>?, base: Array<Intrinsics>?): Double {
+        if (obs == null || base == null) return 0.0
+        var sum = 0.0
+        var n = 0
+        for (o in obs) {
+            val pa = o.pixelA ?: continue
+            val pb = o.pixelB ?: continue
+            if (o.frameA >= base.size || o.frameB >= base.size) continue
+            val ra = normalisedRadius(base[o.frameA], pa)
+            val rb = normalisedRadius(base[o.frameB], pb)
+            sum += Math.abs(ra * ra * ra - rb * rb * rb)
+            n++
+        }
+        return if (n == 0) 0.0 else sum / n
+    }
+
+    private fun normalisedRadius(k: Intrinsics, pixel: DoubleArray): Double =
+        Math.hypot((pixel[0] - k.cx) / k.fx, (pixel[1] - k.cy) / k.fy)
 
     private fun optimise(initialR: Array<Mat3>, initialK1: Double,
                          obs: List<Correspondence>?, priors: Array<Mat3>?, opt: Options,
