@@ -4,6 +4,7 @@ import com.immineal.hdri360.test.suites.BracketPlannerSuite
 import com.immineal.hdri360.test.suites.CameraModelSuite
 import com.immineal.hdri360.test.suites.CaptureSuite
 import com.immineal.hdri360.test.suites.FrameStoreSuite
+import com.immineal.hdri360.test.suites.TrackingSuite
 import com.immineal.hdri360.test.suites.ProcessingSuite
 import com.immineal.hdri360.test.suites.StreamLadderSuite
 import com.immineal.hdri360.test.suites.ImageSuite
@@ -60,6 +61,7 @@ object TestRunner {
         "PhotometrySuite" to ::PhotometrySuite,
         "CapturePlanSuite" to ::CapturePlanSuite,
         "FrameStoreSuite" to ::FrameStoreSuite,
+        "TrackingSuite" to ::TrackingSuite,
         "StreamLadderSuite" to ::StreamLadderSuite,
         "ProcessingSuite" to ::ProcessingSuite,
         "FeatureSuite" to ::FeatureSuite,
