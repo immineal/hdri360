@@ -52,6 +52,12 @@ class CaptureController(
         @JvmField var meter = MeterConfig()
         @JvmField var bracket = BracketConfig()
         /** How close the camera's axis must be to a target's direction before firing. */
+        /**
+         * How much of the sphere the sweep must have pointed at before its
+         * measurements are taken to describe the room. Below this the ladder is
+         * being planned from a corner of it.
+         */
+        @JvmField var scanCoverageEnough = 0.35
         @JvmField var alignmentToleranceDeg = 7.0
         /**
          * How far the phone may be rolled about that axis and still fire.
@@ -167,6 +173,13 @@ class CaptureController(
     /** Directions the guide should stop offering: captured, or given up on. */
     private val settled = BooleanArray(targetCount)
     private val perTarget = arrayOfNulls<SceneStats>(targetCount)
+    /**
+     * The shortest exposure at which the sweep has still seen the top of the
+     * scale, or +inf if it has never been clipped. A clipped reading bounds the
+     * scene's brightest radiance from below and no further, so a ladder built on
+     * it is short at the top by an unknown amount.
+     */
+    private var shortestClippedRelative = Double.POSITIVE_INFINITY
     private val attempts = IntArray(targetCount)
     private var bracketPlan: BracketPlan? = null
     private var framesTaken = 0
@@ -240,6 +253,38 @@ class CaptureController(
 
     /** Fraction of directions that have been metered at least once. */
     fun scanCoverage(): Double = synchronized(lock) { meteredFraction() }
+
+    /**
+     * Whether the sweep has learned enough to commit to one ladder.
+     *
+     * Coverage alone is not enough, and closing on it is what produced a sphere
+     * with a fifth of its pixels clipped. A frame that saturates only says the
+     * scene is brighter than the sensor could read at that exposure - so while
+     * the brightest thing the sweep has seen is still on the rail, the top of
+     * the ladder is being planned from a number that is known to be too low.
+     *
+     * The one case where waiting cannot help is a scene that still saturates the
+     * camera at its fastest: there is nothing shorter to try, and the honest
+     * response is to plan what can be planned and say the top is clipped.
+     */
+    fun scanReady(): Boolean = synchronized(lock) {
+        if (meteredFraction() < config.scanCoverageEnough) return false
+        val measured = perTarget.filterNotNull()
+        if (measured.isEmpty()) return false
+        if (!SceneStats.union(measured).highlightsClipped) return true
+        val floor = source.profile.exposureLimits.minRelativeExposure()
+        return shortestClippedRelative <= floor * 1.05
+    }
+
+    /** True while the sweep is holding on for an unclipped look at the bright end. */
+    fun scanWaitingForHighlights(): Boolean = synchronized(lock) {
+        if (meteredFraction() < config.scanCoverageEnough) return false
+        val measured = perTarget.filterNotNull()
+        if (measured.isEmpty()) return false
+        val floor = source.profile.exposureLimits.minRelativeExposure()
+        return SceneStats.union(measured).highlightsClipped &&
+               shortestClippedRelative > floor * 1.05
+    }
 
     /**
      * The ladder this capture committed to, once the scan has closed.
@@ -329,6 +374,8 @@ class CaptureController(
                 perTarget[target] =
                     if (prior == null) stats else SceneStats.union(listOf(prior, stats))
             }
+            if (stats.highlightsClipped)
+                shortestClippedRelative = Math.min(shortestClippedRelative, relativeExposure)
 
             if (!SceneMeter.isWellExposed(stats, config.meter)) {
                 val want = SceneMeter.suggestRelativeExposure(stats, relativeExposure, config.meter)

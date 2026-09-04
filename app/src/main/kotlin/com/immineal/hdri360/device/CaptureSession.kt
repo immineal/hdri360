@@ -44,7 +44,9 @@ class CaptureUiState(
     /** Clockwise degrees between the sensor's frame and the phone's natural one. */
     @JvmField val sensorOrientationDeg: Int = 90,
     /** The most recent sphere that has been built, if there is one to look at. */
-    @JvmField val finished: File? = null
+    @JvmField val finished: File? = null,
+    /** True while the sweep is holding on for an unclipped look at the bright end. */
+    @JvmField val waitingForHighlights: Boolean = false
 ) {
     enum class Phase { IDLE, OPENING, SCANNING, CAPTURING, FINISHED, FAILED }
 }
@@ -398,14 +400,27 @@ class CaptureSession(
         flow.value = CaptureUiState(phase, snap.message ?: "", src?.profile?.note ?: "",
             snap, ctrl?.plan?.targets ?: emptyList(), pose, src?.profile?.intrinsics, dir,
             lenses, src?.profile?.id, flow.value.warning, null,
-            src?.profile?.sensorOrientationDeg ?: 90)
+            src?.profile?.sensorOrientationDeg ?: 90, null,
+            ctrl?.scanWaitingForHighlights() == true)
 
         // The sweep ends by itself once it has seen enough. A capture the user has
         // to remember to advance is a capture that gets abandoned half metered.
-        if (snap.state == CaptureController.State.SCANNING &&
-            snap.scanCoverage >= SCAN_ENOUGH &&
-            SystemClock.elapsedRealtime() - scanStartedMs > MIN_SCAN_MS) {
-            finishScan()
+        //
+        // "Enough" is the controller's judgement, not a coverage number: a sweep
+        // whose brightest look is still saturated has not measured the top of
+        // the room, only established that it is higher than it could read. The
+        // hard cap is there because a scene can stay on the rail for reasons no
+        // amount of sweeping fixes, and a capture that never starts is worse
+        // than one whose highlights are honestly labelled clipped.
+        if (snap.state == CaptureController.State.SCANNING) {
+            val elapsed = SystemClock.elapsedRealtime() - scanStartedMs
+            val ready = ctrl?.scanReady() == true
+            if (elapsed > MIN_SCAN_MS && (ready || elapsed > MAX_SCAN_MS)) {
+                if (!ready) CaptureLog.warn(
+                    "the sweep never got an unclipped look at the brightest part of " +
+                    "the room; the ladder's top rung may be short", null)
+                finishScan()
+            }
         }
 
         if (phase == CaptureUiState.Phase.FINISHED) {
@@ -450,6 +465,11 @@ class CaptureSession(
          */
         private const val SCAN_ENOUGH = 0.35
         private const val MIN_SCAN_MS = 3000L
+        /**
+         * How long the sweep may hold out for a look at the bright end before
+         * giving up and planning what it has.
+         */
+        private const val MAX_SCAN_MS = 60_000L
         private const val MIN_FREE_BYTES = 1500L * 1024 * 1024
     }
 }

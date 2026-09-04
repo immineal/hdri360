@@ -601,5 +601,92 @@ class CaptureSuite : TestCase {
         t.check(!CaptureTier.LOCKED_AUTO.measuresRadiance, "and locked auto certainly is")
         t.check(CaptureTier.MANUAL_YUV.drivesExposure, "manual YUV still drives the bracket")
         t.check(!CaptureTier.LOCKED_AUTO.drivesExposure, "locked auto does not")
+        theSweepWaitsForTheBrightEnd(t)
+    }
+
+    /**
+     * A sweep that closes while it is still looking at the top of the scale.
+     *
+     * The scan used to end on geometric coverage alone. But a saturated frame
+     * does not measure the brightest radiance in the room - it only says the
+     * room is brighter than the sensor could read at that exposure. Planning the
+     * ladder from that number makes its shortest rung too long, and the sphere
+     * comes back with its highlights burnt out: the first full capture off the
+     * phone metered seven frames in fourteen seconds, three of them clipped,
+     * closed anyway, and clipped 22.5% of the finished panorama.
+     *
+     * So coverage is necessary and not sufficient. The one case where waiting
+     * cannot help is a scene that still saturates the camera at its fastest -
+     * there is nothing shorter to try.
+     */
+    private fun theSweepWaitsForTheBrightEnd(t: TestKit) {
+        val bright = ImageF(8, 8, 1)
+        java.util.Arrays.fill(bright.data, 1.0f)          // every pixel on the rail
+        val ordinary = ImageF(8, 8, 1)
+        java.util.Arrays.fill(ordinary.data, 0.35f)
+
+        // --- clipped, with shutter left to spend -------------------------------
+        run {
+            val cam = FakeCamera(profile())
+            val c = CaptureController(cam, CountingSink())
+            cam.setListener(c)
+            c.beginScan()
+            var now = 1_000_000_000L
+            for (i in c.plan.targets.indices) {
+                c.onOrientation(c.plan.targets[i].rotation, false, now)
+                cam.bound?.onPreviewFrame(bright, 1.0 / 500)
+                now += 50_000_000L
+            }
+            t.greaterThan(c.scanCoverage(), 0.9, "the sweep covered the sphere")
+            t.check(!c.scanReady(),
+                "but it does not close while the brightest thing it has seen is off the scale")
+            t.check(c.scanWaitingForHighlights(),
+                "and it can say that is what it is waiting for")
+        }
+
+        // --- clipped at the camera's fastest ------------------------------------
+        run {
+            val cam = FakeCamera(profile())
+            val c = CaptureController(cam, CountingSink())
+            cam.setListener(c)
+            c.beginScan()
+            val floor = profile().exposureLimits.minRelativeExposure()
+            var now = 1_000_000_000L
+            for (i in c.plan.targets.indices) {
+                c.onOrientation(c.plan.targets[i].rotation, false, now)
+                cam.bound?.onPreviewFrame(bright, floor)
+                now += 50_000_000L
+            }
+            t.check(c.scanReady(),
+                "a room that saturates the camera at its fastest is as measured as it can be")
+            t.check(!c.scanWaitingForHighlights(), "so nothing is being waited for")
+            t.check(c.finishScanAndPlan(), "and the ladder is planned rather than refused")
+        }
+
+        // --- an ordinary room ----------------------------------------------------
+        run {
+            val cam = FakeCamera(profile())
+            val c = CaptureController(cam, CountingSink())
+            cam.setListener(c)
+            c.beginScan()
+            var now = 1_000_000_000L
+            for (i in c.plan.targets.indices) {
+                c.onOrientation(c.plan.targets[i].rotation, false, now)
+                cam.bound?.onPreviewFrame(ordinary, 1.0 / 500)
+                now += 50_000_000L
+            }
+            t.check(c.scanReady(), "a scene the sweep could actually read closes at once")
+        }
+
+        // --- half a sweep is never enough ----------------------------------------
+        run {
+            val cam = FakeCamera(profile())
+            val c = CaptureController(cam, CountingSink())
+            cam.setListener(c)
+            c.beginScan()
+            c.onOrientation(c.plan.targets[0].rotation, false, 1_000_000_000L)
+            cam.bound?.onPreviewFrame(ordinary, 1.0 / 500)
+            t.check(!c.scanReady(), "one direction is not a metered room")
+        }
     }
 }

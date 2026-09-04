@@ -428,7 +428,12 @@ private fun CaptureScreen(state: CaptureUiState, rotationDeg: Int,
             // to ask of a person and the phase it belongs to has no other clue in
             // it. Said once, at the top, in the phase it applies to.
             val how = when (state.phase) {
-                CaptureUiState.Phase.SCANNING ->
+                CaptureUiState.Phase.SCANNING -> if (state.waitingForHighlights)
+                    "Still looking for the brightest part of the room - a window, a " +
+                    "lamp, the sky. Point at it for a moment. Until it has been read " +
+                    "without saturating, the top of the exposure ladder would be a " +
+                    "guess and the highlights would burn out."
+                    else
                     "Turn slowly all the way round, then look up at the ceiling and " +
                     "down at the floor. This finds the brightest and darkest of the " +
                     "room and sets one exposure ladder for the whole sphere. It ends " +
