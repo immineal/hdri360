@@ -8,6 +8,6 @@ dependencyResolutionManagement {
 
 rootProject.name = "hdri360"
 
-// The Android app module joins in phase 4; the core, its suite and the desktop
-// harness are plain Kotlin/JVM and deliberately buildable without the Android SDK.
-include(":core", ":core-tests", ":tools")
+// The core, its suite and the desktop harness are plain Kotlin/JVM and remain
+// buildable without the Android SDK; only :app needs it.
+include(":core", ":core-tests", ":tools", ":app")
