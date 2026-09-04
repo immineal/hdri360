@@ -48,6 +48,23 @@ class ExposureLadder private constructor(
     }
 
     companion object {
+        /**
+         * Rebuilds a ladder that was planned earlier and stored.
+         *
+         * A capture that was interrupted has to resume on the ladder it started
+         * on: re-planning would put the second half of the sphere on a different
+         * radiance scale from the first, and no later gain solve fully repairs
+         * that.
+         */
+        @JvmStatic
+        @JvmOverloads
+        fun of(steps: List<ExposureSettings>, baseIso: Int,
+               clampedLow: Boolean = false, clampedHigh: Boolean = false): ExposureLadder {
+            if (steps.isEmpty()) throw IllegalArgumentException("a ladder needs at least one rung")
+            if (baseIso <= 0) throw IllegalArgumentException("base ISO must be positive")
+            return ExposureLadder(ArrayList(steps), baseIso, clampedLow, clampedHigh)
+        }
+
         @JvmStatic
         fun build(lim: DeviceExposureLimits, relLow: Double, relHigh: Double, evStep: Double):
                 ExposureLadder = build(lim, relLow, relHigh, evStep, 2, 24)
