@@ -9,6 +9,7 @@ import android.os.Bundle
 import android.view.TextureView
 import android.view.WindowManager
 import androidx.activity.ComponentActivity
+import androidx.activity.compose.BackHandler
 import androidx.activity.compose.setContent
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.background
@@ -34,6 +35,7 @@ import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
+import androidx.compose.material3.TextButton
 import androidx.compose.material3.darkColorScheme
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
@@ -119,10 +121,18 @@ class CaptureActivity : ComponentActivity() {
                             StartScreen(state, ::openReview) { lens, resume ->
                                 wanted = Pair(lens, resume)
                             }
-                        else -> CaptureScreen(state, sensorRotation(state),
-                            onSurface = { st -> onPreviewSurface(st) },
-                            onFinish = { session.finish() },
-                            onSkipScan = { session.finishScan() })
+                        else -> {
+                            // Back leaves the capture, not the app. Swiping in from
+                            // the edge is how a person says "not this after all",
+                            // and closing the whole app in answer is a poor
+                            // reading of that.
+                            BackHandler(true) { wanted = null; session.cancel() }
+                            CaptureScreen(state, sensorRotation(state),
+                                onSurface = { st -> onPreviewSurface(st) },
+                                onFinish = { session.finish() },
+                                onSkipScan = { session.finishScan() },
+                                onCancel = { wanted = null; session.cancel() })
+                        }
                     }
                 }
             }
@@ -350,7 +360,8 @@ private fun rollOf(state: CaptureUiState): Double? {
 @Composable
 private fun CaptureScreen(state: CaptureUiState, rotationDeg: Int,
                           onSurface: (SurfaceTexture?) -> Unit,
-                          onFinish: () -> Unit, onSkipScan: () -> Unit) {
+                          onFinish: () -> Unit, onSkipScan: () -> Unit,
+                          onCancel: () -> Unit) {
     val snap = state.snapshot
     BoxWithConstraints(Modifier.fillMaxSize()) {
         // The camera hands over frames in the sensor's own orientation, which on
@@ -513,6 +524,9 @@ private fun CaptureScreen(state: CaptureUiState, rotationDeg: Int,
                     OutlinedButton(onSkipScan) { Text("Done sweeping") }
                 if (state.phase == CaptureUiState.Phase.CAPTURING)
                     OutlinedButton(onFinish) { Text("Finish here") }
+                // "Done" and "finish" both mean "keep this". Changing your mind
+                // needs its own word, and a way out that is not the app's exit.
+                TextButton(onCancel) { Text("Cancel") }
             }
         }
     }

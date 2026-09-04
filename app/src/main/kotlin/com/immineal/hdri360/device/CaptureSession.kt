@@ -86,11 +86,32 @@ class CaptureSession(
 
     init {
         CaptureLog.start(context)
+        publishIdle()
+    }
+
+    private fun publishIdle() {
         flow.value = CaptureUiState(
             lenses = lenses,
             chosenLens = CameraProbe.defaultLens(lenses)?.cameraId,
             resumable = unfinishedCapture(),
             finished = finishedCapture())
+    }
+
+    /**
+     * Puts the camera down and goes back to the start screen.
+     *
+     * Distinct from stop(), which leaves the last state showing because it is
+     * also what runs when the sphere is handed over for processing. A capture
+     * somebody has changed their mind about needs a way out that is not "finish
+     * it" - and until now the only way out of a sweep was to leave the app.
+     * Whatever frames were taken stay on disk and are offered again as an
+     * unfinished capture.
+     */
+    fun cancel() {
+        val had = synchronized(lock) { store?.dir }
+        stop()
+        if (had != null) CaptureLog.log("capture cancelled: $had")
+        publishIdle()
     }
 
     /**

@@ -138,5 +138,33 @@ class MeteringSuite : TestCase {
         t.greaterThan(all.dynamicRangeEv(), 20.0, "sun plus interior is a >20 EV scene")
         t.throwsException({ SceneStats.union(emptyList()) },
             "union of nothing is an error, not a silent default")
+
+        // --- one bright direction must not carry the whole sweep -------------------
+        // The union's middle is what the viewfinder is exposed for during the
+        // sweep. Averaging medians arithmetically lets a single direction that
+        // happened to contain a window drag it up by two orders of magnitude, and
+        // the preview then goes black on a room that is perfectly visible - which
+        // is what a sweep past a window actually did.
+        run {
+            val dim = ArrayList<SceneStats>()
+            for (i in 0 until 9)
+                dim.add(SceneStats(0.01, 1.0, 0.1, 0.0, 0.0, false, false))
+            val window = SceneStats(0.01, 20000.0, 1000.0, 0.0, 0.0, false, false)
+            val typical = SceneStats.union(dim)
+            t.near(0.1, typical.medianRadiance, 1e-9,
+                "nine directions of the same room average to that room")
+
+            val withWindow = SceneStats.union(dim + window)
+            t.greaterThan(withWindow.highRadiance, 19999.0,
+                "the bright end still reaches the window, which the ladder needs")
+            t.lessThan(withWindow.medianRadiance, 0.4,
+                "but the middle stays near the room, which the viewfinder needs")
+
+            // Said as the thing that matters: the exposure a person would be shown.
+            val alone = SceneMeter.viewingRelativeExposure(typical)
+            val after = SceneMeter.viewingRelativeExposure(withWindow)
+            t.lessThan(Math.abs(Math.log(after / alone) / Math.log(2.0)), 2.0,
+                "sweeping past a window moves the viewfinder by under two stops")
+        }
     }
 }

@@ -45,7 +45,8 @@ class SceneStats(
                 throw IllegalArgumentException("cannot take the union of no measurements")
             var lo = Double.MAX_VALUE
             var hi = 0.0
-            var med = 0.0
+            var logMed = 0.0
+            var medCount = 0
             var clip = 0.0
             var black = 0.0
             var clipped = false
@@ -53,13 +54,27 @@ class SceneStats(
             for (s in parts) {
                 lo = Math.min(lo, s.lowRadiance)
                 hi = Math.max(hi, s.highRadiance)
-                med += s.medianRadiance
+                // The middle is averaged in the space radiance lives in.
+                //
+                // The ends are extremes and take the extreme, which is what a
+                // ladder that must cover everything needs. The middle is a
+                // typical value, and radiance spans orders of magnitude - so an
+                // arithmetic mean of medians is not a typical anything: one
+                // direction holding a window is a thousand times the rest and
+                // carries the average on its own. The preview is exposed from
+                // this, and a sweep past a window took it ten stops down, which
+                // is a black screen in a room you can see perfectly well.
+                if (s.medianRadiance > 0 && s.medianRadiance.isFinite()) {
+                    logMed += Math.log(s.medianRadiance)
+                    medCount++
+                }
                 clip = Math.max(clip, s.clippedFraction)
                 black = Math.max(black, s.blackFraction)
                 clipped = clipped or s.highlightsClipped
                 crushed = crushed or s.shadowsCrushed
             }
-            return SceneStats(lo, hi, med / parts.size, clip, black, clipped, crushed)
+            val med = if (medCount > 0) Math.exp(logMed / medCount) else 0.0
+            return SceneStats(lo, hi, med, clip, black, clipped, crushed)
         }
     }
 }
