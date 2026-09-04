@@ -64,19 +64,34 @@ object OrientationMath {
      * Camera axes expressed in device coordinates.
      *
      * SENSOR_ORIENTATION is defined as the clockwise rotation needed to make the
-     * captured image upright in the device's natural orientation. Undoing that
-     * gives the sensor's own right and down directions:
-     *   right = ( cos t,  sin t, 0), down = ( sin t, -cos t, 0)
-     * and their cross product is (0, 0, -1) for every t - the back camera always
-     * looks out of the back of the phone, as it should.
+     * captured image upright in the device's natural orientation. Turning the
+     * raw image clockwise by t therefore gives the picture, so the raw image's
+     * own axes are found by turning the picture's axes back:
+     *
+     *   image right (1, 0) -> ( cos t,  sin t) in picture coordinates
+     *   image down  (0, 1) -> (-sin t,  cos t)
+     *
+     * and the picture is drawn on the screen, whose axes in the device frame are
+     * right = (1, 0, 0) and down = (0, -1, 0). Substituting:
+     *
+     *   right = ( cos t, -sin t, 0), down = (-sin t, -cos t, 0)
+     *
+     * with cross product (0, 0, -1) for every t - the back camera always looks
+     * out of the back of the phone, as it should.
+     *
+     * The sign matters and is not cosmetic: taking t for -t leaves every length,
+     * every determinant and the optical axis itself unchanged, and rolls the
+     * live pose 180 degrees about that axis on any phone whose camera is mounted
+     * at 90 or 270. The guidance then leads the person away from the target in
+     * both screen axes at once.
      */
     @JvmStatic
     fun cameraToDevice(sensorOrientationDeg: Int, frontFacing: Boolean): Mat3 {
         val t = Math.toRadians(sensorOrientationDeg.toDouble())
         val c = Math.cos(t)
         val s = Math.sin(t)
-        var right = Vec3(c, s, 0.0)
-        val down = Vec3(s, -c, 0.0)
+        var right = Vec3(c, -s, 0.0)
+        val down = Vec3(-s, -c, 0.0)
         if (frontFacing) {
             // The front camera looks the other way; keep the triad right-handed.
             val forward = Vec3(0.0, 0.0, 1.0)

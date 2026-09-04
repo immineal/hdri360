@@ -157,7 +157,7 @@ class CaptureController(
      * the sensor inside it.
      */
     @JvmField val plan: CapturePlan = CapturePlan.forCamera(
-        source.profile.intrinsics, config.plan, -source.profile.sensorOrientationDeg.toDouble())
+        source.profile.intrinsics, config.plan, source.profile.sensorOrientationDeg.toDouble())
     private val targetCount = plan.targets.size
 
     private val lock = Any()

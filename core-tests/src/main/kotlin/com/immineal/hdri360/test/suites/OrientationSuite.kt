@@ -89,6 +89,86 @@ class OrientationSuite : TestCase {
                     "the roll is about the optical axis ($sensor)")
         }
 
+        // --- and a roll in the direction the sensor actually is ---------------------
+        // The size of the roll was pinned above and its axis with it, but never
+        // its sign - and every other case here uses SENSOR_ORIENTATION 0, where
+        // the two signs agree. So a phone whose camera is mounted the usual
+        // quarter turn round was rolled 180 degrees the wrong way, in the live
+        // pose the guidance is drawn from, without one assertion noticing.
+        //
+        // SENSOR_ORIENTATION is defined as the clockwise rotation that makes the
+        // captured image upright. So at 90 degrees the raw image is a quarter
+        // turn anticlockwise from upright, and the sky - the top of the upright
+        // picture - sits at the raw image's left edge. Held upright and level,
+        // that is where world up must land:
+        //
+        //     sensor   0 -> up    is image up      (0, -1, 0)
+        //     sensor  90 -> up    is image left   (-1,  0, 0)
+        //     sensor 180 -> up    is image down    (0,  1, 0)
+        //     sensor 270 -> up    is image right   (1,  0, 0)
+        val worldUp = Vec3(0.0, 1.0, 0.0)
+        val expectUp = arrayOf(
+            Vec3(0.0, -1.0, 0.0), Vec3(-1.0, 0.0, 0.0),
+            Vec3(0.0, 1.0, 0.0), Vec3(1.0, 0.0, 0.0))
+        for (i in 0 until 4) {
+            val sensor = i * 90
+            val R = OrientationMath.cameraToWorld(upright, sensor, false)
+            val inImage = R.mulTranspose(worldUp)
+            t.lessThan(inImage.angleTo(expectUp[i]), 1e-9,
+                "held upright at sensor orientation $sensor, the sky is where the " +
+                "sensor's mounting says it is")
+        }
+
+        // The same statement from the other end: rotating the raw image clockwise
+        // by SENSOR_ORIENTATION must bring the sky to the top of the picture. This
+        // is the thing a person sees, and the direction it fails in is the
+        // direction the guidance leads them the wrong way.
+        for (i in 0 until 4) {
+            val sensor = i * 90
+            val R = OrientationMath.cameraToWorld(upright, sensor, false)
+            val inImage = R.mulTranspose(worldUp)
+            val a = Math.toRadians(sensor.toDouble())
+            // Image coordinates are y-down, so this matrix turns the picture
+            // clockwise - the same turn the preview is given before it is shown.
+            val sx = inImage.x * Math.cos(a) - inImage.y * Math.sin(a)
+            val sy = inImage.x * Math.sin(a) + inImage.y * Math.cos(a)
+            t.near(0.0, sx, 1e-9, "turned upright at $sensor, up is not sideways")
+            t.lessThan(sy, -0.99, "turned upright at $sensor, up is up the screen")
+        }
+
+        // --- and the guidance points the way the person is looking ------------------
+        // The whole of it, end to end, in the terms someone holding the phone
+        // would use: a target above you is drawn above the middle of the screen,
+        // and one to your right is drawn to the right. Every piece below was
+        // individually correct while the assembly led the user away from the
+        // target in both axes at once, so it is the assembly that is asserted.
+        run {
+            val kg = Intrinsics.fromHorizontalFov(4000, 3000, 70.0)
+            for (sensor in intArrayOf(0, 90, 180, 270)) {
+                val R = OrientationMath.cameraToWorld(upright, sensor, false)
+                val a = Math.toRadians(sensor.toDouble())
+                // Where a world direction lands on the upright screen: through
+                // the camera model, then the same clockwise turn the preview is
+                // given. Positive y is down the screen.
+                fun onScreen(d: Vec3): DoubleArray {
+                    val cam = R.mulTranspose(d)
+                    val p = kg.project(cam)
+                        ?: throw IllegalStateException("a target in front did not project")
+                    val nx = (p[0] - (kg.width - 1) / 2.0) / kg.width
+                    val ny = (p[1] - (kg.height - 1) / 2.0) / kg.height
+                    return doubleArrayOf(nx * Math.cos(a) - ny * Math.sin(a),
+                                         nx * Math.sin(a) + ny * Math.cos(a))
+                }
+                val above = onScreen(CaptureTarget.directionFor(0.0, 10.0))
+                t.lessThan(above[1], -0.02, "a target above you is drawn above centre ($sensor)")
+                t.lessThan(Math.abs(above[0]), 0.02, "and not off to one side ($sensor)")
+
+                val right = onScreen(CaptureTarget.directionFor(10.0, 0.0))
+                t.greaterThan(right[0], 0.02, "a target to your right is drawn right ($sensor)")
+                t.lessThan(Math.abs(right[1]), 0.02, "and not above or below ($sensor)")
+            }
+        }
+
         // --- always a valid rotation, whatever the sensor says ---------------------
         for (i in 0 until 300) {
             val rq = Quat.fromAxisAngle(

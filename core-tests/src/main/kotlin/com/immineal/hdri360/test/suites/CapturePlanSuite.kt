@@ -141,7 +141,7 @@ class CapturePlanSuite : TestCase {
         val sensor = Intrinsics.fromHorizontalFov(4000, 3000, 58.7)
         val sensorOrientation = 90
         val plan = CapturePlan.forCamera(sensor, CapturePlanConfig(),
-            -sensorOrientation.toDouble())
+            sensorOrientation.toDouble())
         val cameraToDevice = OrientationMath.cameraToDevice(sensorOrientation, false)
 
         // The device attitude each target implies, from the same relation the
