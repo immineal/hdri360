@@ -28,6 +28,7 @@ import com.immineal.hdri360.test.suites.HorizonSuite
 import com.immineal.hdri360.test.suites.BlendSuite
 import com.immineal.hdri360.test.suites.WriterSuite
 import com.immineal.hdri360.test.suites.StreamingSuite
+import com.immineal.hdri360.test.suites.EndToEndSuite
 import com.immineal.hdri360.test.suites.PipelineSuite
 import java.io.PrintWriter
 import java.io.StringWriter
@@ -77,6 +78,7 @@ object TestRunner {
         "ToneMapSuite" to ::ToneMapSuite,
         "OrientationSuite" to ::OrientationSuite,
         "PipelineSuite" to ::PipelineSuite,
+        "EndToEndSuite" to ::EndToEndSuite,
     )
 
     /** @return a human-readable report; throws AssertionError if anything failed. */
