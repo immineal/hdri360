@@ -240,6 +240,7 @@ class Camera2Source private constructor(
     }
 
     @Volatile private var previewReported = false
+    @Volatile private var previewLastReport: String? = null
     /** The colour matrix the camera chose, frozen alongside the white balance. */
     @Volatile private var lockedColorTransform: android.hardware.camera2.params.ColorSpaceTransform? = null
 
@@ -260,7 +261,13 @@ class Camera2Source private constructor(
             val got = actualSettings(result)
             val tone = result.get(CaptureResult.TONEMAP_MODE)
             val xf = result.get(CaptureResult.COLOR_CORRECTION_TRANSFORM)
-            CaptureLog.log("preview got $got, tonemap $tone, colour $xf")
+            // Once per distinct answer. The request is rebuilt after every burst,
+            // so reporting each one puts a line per direction in the log and the
+            // colour matrix is long: what is worth knowing is when it changes.
+            val line = "preview got $got, tonemap $tone, colour $xf"
+            if (line == previewLastReport) return
+            previewLastReport = line
+            CaptureLog.log(line)
         }
     }
 

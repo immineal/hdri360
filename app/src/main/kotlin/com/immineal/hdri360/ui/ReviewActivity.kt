@@ -25,6 +25,7 @@ import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.Slider
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
+import androidx.compose.material3.TextButton
 import androidx.compose.material3.darkColorScheme
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
@@ -39,6 +40,7 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.compose.ui.viewinterop.AndroidView
 import com.immineal.hdri360.core.image.ImageF
+import com.immineal.hdri360.core.hdr.ToneMapper
 import com.immineal.hdri360.core.io.ExrReader
 import com.immineal.hdri360.core.io.Json
 import kotlinx.coroutines.Dispatchers
@@ -150,6 +152,15 @@ private fun ReviewScreen(dir: File, onExport: (File) -> String, onDeleteBundle: 
         }
         loaded = pair.first
         report = pair.second
+        // Open where the picture is legible, not at "as captured".
+        //
+        // Zero stops means the radiance numbers go to the tone curve unscaled,
+        // and those numbers are in whatever units the scene happened to have -
+        // a room whose log-average sits near 1.0 arrives three stops into the
+        // curve's shoulder, which is washed out and colourless. The JPEG preview
+        // has always been keyed to middle grey; the viewer now opens on the same
+        // exposure, and the slider moves from there.
+        pair.first?.let { stops = (Math.log(ToneMapper.autoKey(it)) / Math.log(2.0)).toFloat() }
         if (pair.first == null) status = "This capture has no viewable panorama"
     }
     LaunchedEffect(loaded) { loaded?.let { view?.show(it) } }
@@ -166,9 +177,15 @@ private fun ReviewScreen(dir: File, onExport: (File) -> String, onDeleteBundle: 
 
         Column(Modifier.fillMaxWidth().padding(16.dp)
             .verticalScroll(rememberScrollState())) {
-            Text(String.format(Locale.US, "exposure  %+.1f stops", stops),
-                fontFamily = FontFamily.Monospace, fontSize = 13.sp)
-            Slider(stops, { stops = it }, valueRange = -8f..8f, steps = 63)
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Text(String.format(Locale.US, "exposure  %+.1f stops", stops),
+                    fontFamily = FontFamily.Monospace, fontSize = 13.sp,
+                    modifier = Modifier.weight(1f))
+                // Pinching in and losing the horizon is easy, and with a sphere
+                // that has holes in it there may be nothing in view to steer by.
+                TextButton({ view?.resetView() }) { Text("Reset view") }
+            }
+            Slider(stops, { stops = it }, valueRange = -12f..12f, steps = 95)
             report?.let {
                 Spacer(Modifier.height(8.dp))
                 Text(it, fontFamily = FontFamily.Monospace, fontSize = 11.sp,

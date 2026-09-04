@@ -4,6 +4,7 @@ import android.content.Context
 import android.opengl.GLES30
 import android.opengl.GLSurfaceView
 import android.view.MotionEvent
+import android.view.ScaleGestureDetector
 import com.immineal.hdri360.core.image.ImageF
 import com.immineal.hdri360.core.io.Half
 import java.nio.ByteBuffer
@@ -26,6 +27,21 @@ class PanoramaView(context: Context) : GLSurfaceView(context) {
     private val renderer = PanoramaRenderer()
     private var lastX = 0f
     private var lastY = 0f
+    private var pointer = -1
+
+    /**
+     * Pinch to zoom, on the field of view rather than on a scale factor, so what
+     * changes is how much of the sphere is on screen.
+     */
+    private val pinch = ScaleGestureDetector(context,
+        object : ScaleGestureDetector.SimpleOnScaleGestureListener() {
+            override fun onScale(d: ScaleGestureDetector): Boolean {
+                renderer.halfFov = Math.max(MIN_FOV, Math.min(MAX_FOV,
+                    renderer.halfFov / d.scaleFactor))
+                requestRender()
+                return true
+            }
+        })
 
     init {
         setEGLContextClientVersion(3)
@@ -43,26 +59,75 @@ class PanoramaView(context: Context) : GLSurfaceView(context) {
         get() = renderer.exposureStops
         set(v) { renderer.exposureStops = v; requestRender() }
 
+    /**
+     * Drag to look, pinch to zoom.
+     *
+     * The drag follows one named pointer rather than "whichever finger event.x
+     * happens to report". Putting a second finger down and lifting the first
+     * swaps which pointer that is, and the jump between the two positions was
+     * being read as an enormous drag - which is how a pinch threw the view into
+     * the part of the sphere that was never shot, where there is nothing to see.
+     */
     override fun onTouchEvent(event: MotionEvent): Boolean {
+        pinch.onTouchEvent(event)
         when (event.actionMasked) {
-            MotionEvent.ACTION_DOWN -> { lastX = event.x; lastY = event.y }
+            MotionEvent.ACTION_DOWN, MotionEvent.ACTION_POINTER_DOWN -> {
+                pointer = event.getPointerId(event.actionIndex)
+                lastX = event.getX(event.actionIndex)
+                lastY = event.getY(event.actionIndex)
+            }
             MotionEvent.ACTION_MOVE -> {
-                val dx = event.x - lastX
-                val dy = event.y - lastY
-                lastX = event.x
-                lastY = event.y
-                renderer.yaw -= dx * DRAG_SPEED
+                if (pinch.isInProgress) {
+                    // Re-anchor so the pinch does not also read as a drag.
+                    val at = event.findPointerIndex(pointer)
+                    if (at >= 0) { lastX = event.getX(at); lastY = event.getY(at) }
+                    return true
+                }
+                val at = event.findPointerIndex(pointer)
+                if (at < 0) return true
+                val dx = event.getX(at) - lastX
+                val dy = event.getY(at) - lastY
+                lastX = event.getX(at)
+                lastY = event.getY(at)
+                // Slower when zoomed in, so the same finger travel is the same
+                // distance across the picture however close you are looking.
+                val speed = DRAG_SPEED * (renderer.halfFov / DEFAULT_FOV)
+                renderer.yaw -= dx * speed
                 // Stop short of the poles: looking straight up loses the horizon
                 // reference and the drag becomes impossible to reason about.
-                renderer.pitch = Math.max(-1.45, Math.min(1.45, renderer.pitch - dy * DRAG_SPEED))
+                renderer.pitch = Math.max(-1.45, Math.min(1.45, renderer.pitch - dy * speed))
                 requestRender()
             }
+            MotionEvent.ACTION_POINTER_UP -> {
+                // Hand the drag to a finger that is still down, at its own
+                // position, so nothing moves at the moment of handover.
+                if (event.getPointerId(event.actionIndex) == pointer) {
+                    val next = if (event.actionIndex == 0) 1 else 0
+                    if (next < event.pointerCount) {
+                        pointer = event.getPointerId(next)
+                        lastX = event.getX(next)
+                        lastY = event.getY(next)
+                    }
+                }
+            }
+            MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> pointer = -1
         }
         return true
     }
 
+    /** Back to the whole view, for when a pinch has left someone lost. */
+    fun resetView() {
+        renderer.halfFov = DEFAULT_FOV
+        renderer.yaw = 0.0
+        renderer.pitch = 0.0
+        requestRender()
+    }
+
     private companion object {
         const val DRAG_SPEED = 0.0035
+        const val DEFAULT_FOV = 0.7          // about 70 degrees across
+        const val MIN_FOV = 0.06             // about 7 degrees: a close look
+        const val MAX_FOV = 1.55             // about 155 degrees: most of a hemisphere
     }
 }
 
@@ -70,6 +135,7 @@ private class PanoramaRenderer : GLSurfaceView.Renderer {
 
     @Volatile var pending: ImageF? = null
     @Volatile var exposureStops = 0.0
+    @Volatile var halfFov = 0.7
     @Volatile var yaw = 0.0
     @Volatile var pitch = 0.0
 
@@ -79,6 +145,7 @@ private class PanoramaRenderer : GLSurfaceView.Renderer {
     private var uView = 0
     private var uExposure = 0
     private var uAspect = 0
+    private var uFov = 0
     private var quad: FloatBuffer? = null
 
     override fun onSurfaceCreated(gl: GL10?, config: EGLConfig?) {
@@ -86,6 +153,7 @@ private class PanoramaRenderer : GLSurfaceView.Renderer {
         uView = GLES30.glGetUniformLocation(program, "uView")
         uExposure = GLES30.glGetUniformLocation(program, "uExposure")
         uAspect = GLES30.glGetUniformLocation(program, "uAspect")
+        uFov = GLES30.glGetUniformLocation(program, "uFov")
         quad = ByteBuffer.allocateDirect(8 * 4).order(ByteOrder.nativeOrder()).asFloatBuffer().apply {
             put(floatArrayOf(-1f, -1f, 1f, -1f, -1f, 1f, 1f, 1f))
             position(0)
@@ -110,6 +178,7 @@ private class PanoramaRenderer : GLSurfaceView.Renderer {
         GLES30.glUniform1i(GLES30.glGetUniformLocation(program, "uPano"), 0)
         GLES30.glUniform1f(uExposure, Math.pow(2.0, exposureStops).toFloat())
         GLES30.glUniform1f(uAspect, aspect)
+        GLES30.glUniform1f(uFov, halfFov.toFloat())
         GLES30.glUniformMatrix3fv(uView, 1, false, viewMatrix(), 0)
 
         val pos = GLES30.glGetAttribLocation(program, "aPos")
@@ -209,18 +278,30 @@ uniform sampler2D uPano;
 uniform mat3 uView;
 uniform float uExposure;
 uniform float uAspect;
+uniform float uFov;
 out vec4 fragColor;
 const float PI = 3.14159265359;
 void main() {
-    float t = 0.7;                                   // about 70 degrees across
+    float t = uFov;
     vec3 dirCam = normalize(vec3(vNdc.x * t * uAspect, vNdc.y * t, 1.0));
     vec3 d = normalize(uView * dirCam);
     float lon = atan(-d.x, d.z);
     float lat = asin(clamp(d.y, -1.0, 1.0));
     vec2 uv = vec2((lon + PI) / (2.0 * PI), (PI * 0.5 - lat) / PI);
-    vec3 c = texture(uPano, uv).rgb * uExposure;
-    c = c / (c + vec3(1.0));                         // Reinhard, so nothing ever clips to white
-    fragColor = vec4(pow(max(c, vec3(0.0)), vec3(1.0 / 2.2)), 1.0);
+    vec3 r = texture(uPano, uv).rgb;
+    // Nothing was shot here. Drawn as absent rather than as black, because a
+    // black screen reads as a broken viewer and a hole in the sphere is a fact
+    // about the capture that the person needs to see.
+    if (r.r <= 0.0 && r.g <= 0.0 && r.b <= 0.0) {
+        float g = max(step(0.985, fract(uv.x * 64.0)), step(0.985, fract(uv.y * 32.0)));
+        fragColor = vec4(vec3(0.055 + 0.045 * g), 1.0);
+        return;
+    }
+    vec3 c = max(r, vec3(0.0)) * uExposure;
+    // The same filmic curve the JPEG preview is made with, so the picture on
+    // screen and the picture in the file are the same picture.
+    c = clamp((c * (2.51 * c + 0.03)) / (c * (2.43 * c + 0.59) + 0.14), 0.0, 1.0);
+    fragColor = vec4(pow(c, vec3(1.0 / 2.2)), 1.0);
 }
 """
     }
