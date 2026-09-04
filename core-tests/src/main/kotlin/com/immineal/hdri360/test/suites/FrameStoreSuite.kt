@@ -43,6 +43,7 @@ class FrameStoreSuite : TestCase {
         planSurvivesExactly(t)
         refusesWhenFull(t)
         survivesADisappearingDirectory(t)
+        twoWritersOneFrame(t)
     }
 
     // ---------------------------------------------------------------- fixtures
@@ -296,6 +297,59 @@ class FrameStoreSuite : TestCase {
         }
         t.check(!threw, "storage vanishing under the capture does not throw")
         t.check(!ok, "it reports the frame as not stored")
+        store.close()
+    }
+
+    /**
+     * Two writers, one frame.
+     *
+     * A burst that timed out and the retry that replaced it can both deliver the
+     * same direction and rung, from the camera thread and from the retry's, at
+     * once. Both went through one shared ".part" name: one writer truncated the
+     * file the other was about to rename, and the rename that then failed took
+     * the recovery branch - which deleted the good frame that had just landed,
+     * failed anyway, and left the journal pointing at nothing. That is the one
+     * shape of loss a journalled store exists to prevent.
+     *
+     * What must hold is not that both writes win. It is that one of them does,
+     * whole: the file is there after every store that claimed success, it reads
+     * back, and it is one writer's pixels rather than a splice of both.
+     */
+    private fun twoWritersOneFrame(t: TestKit) = inTemp("race") { dir ->
+        val s = session()
+        val store = FrameStore.create(dir, s)
+        val values = floatArrayOf(0.25f, 0.75f)   // both exact in half
+        fun flat(v: Float): ImageF {
+            val im = ImageF(8, 6, 1)
+            java.util.Arrays.fill(im.data, v)
+            return im
+        }
+        val trouble = java.util.Collections.synchronizedList(ArrayList<String>())
+        val file = File(dir, "t001_b0.hrf")
+        val threads = (0 until 2).map { w ->
+            Thread {
+                for (i in 0 until 60) {
+                    val ok = try {
+                        store.store(frame(s, 1, 0), flat(values[w]))
+                    } catch (e: Exception) {
+                        trouble.add("store threw $e"); false
+                    }
+                    if (!ok) trouble.add("store refused: " + store.lastError)
+                    else if (!file.isFile) trouble.add("the frame was gone after a successful store")
+                }
+            }
+        }
+        threads.forEach { it.start() }
+        threads.forEach { it.join() }
+        t.eq(0L, trouble.size.toLong(),
+            "concurrent writers of one frame all succeed: " + trouble.take(3))
+
+        val back = store.read(store.records().first())
+        var spliced = false
+        for (v in back.data) if (v != back.data[0]) spliced = true
+        t.check(!spliced, "and the frame on disk is one writer's, not a splice of both")
+        t.check(back.data[0] == values[0] || back.data[0] == values[1],
+            "with the pixels one of them actually wrote")
         store.close()
     }
 }

@@ -249,6 +249,7 @@ class FrameStore private constructor(
     private var needsSeparator = false
     private val byKey = LinkedHashMap<Long, FrameRecord>()
     private val lock = Any()
+    private val partSeq = java.util.concurrent.atomic.AtomicLong()
 
     fun records(): List<FrameRecord> = synchronized(lock) { ArrayList(byKey.values) }
 
@@ -275,7 +276,10 @@ class FrameStore private constructor(
         val name = String.format(Locale.US, "t%03d_b%d%s",
             frame.targetIndex, frame.bracketIndex, SUFFIX)
         val target = File(dir, name)
-        val part = File(dir, "$name$PART")
+        // A part name of this writer's own. The camera thread and a retry can
+        // both deliver the same direction and rung at once; through one shared
+        // name each would truncate the file the other was renaming.
+        val part = File(dir, "$name.${partSeq.incrementAndGet()}$PART")
         val needed = HEADER_BYTES + 2L * pixels.data.size
 
         // A reported zero is "cannot tell", not "full": a bogus zero must not be
@@ -297,7 +301,11 @@ class FrameStore private constructor(
             // Rename after the bytes are on the platter: a file under its final
             // name is a file the journal is allowed to point at.
             if (!part.renameTo(target)) {
-                if (!(target.delete() && part.renameTo(target)))
+                // Renaming over an existing file fails on some filesystems, so
+                // clearing the way is worth one try - but only while our own
+                // bytes are still there to put in its place. Deleting the target
+                // when they are not turns a failed write into a lost frame.
+                if (!part.isFile || !target.delete() || !part.renameTo(target))
                     throw IOException("could not put $name into place")
             }
             appendJournal(record)

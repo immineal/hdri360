@@ -392,13 +392,17 @@ class CaptureSession(
         }
 
         if (phase == CaptureUiState.Phase.FINISHED) {
-            haptics.finished()
-            CaptureLog.log("capture finished: ${snap.directionsShot} of ${snap.shot.size} " +
-                "directions, ${snap.framesTaken} frames")
+            // Publishes keep arriving after the sphere is done. Announcing the
+            // finish on each of them buzzes the "complete" pattern over and over
+            // and writes the same line into the log twice, which reads as two
+            // captures. It happens once, with the hand-off.
             val done = synchronized(lock) {
                 if (handedOff) null else { handedOff = true; dir }
             }
             if (done != null) {
+                haptics.finished()
+                CaptureLog.log("capture finished: ${snap.directionsShot} of ${snap.shot.size} " +
+                    "directions, ${snap.framesTaken} frames")
                 stop()
                 onFinished(done)
             }
