@@ -151,8 +151,37 @@ class EndToEndSuite : TestCase {
 
         t.eq(inputs.size.toLong(), result.placed.count { it }.toLong(),
             "every direction is placed by the solve")
-        t.greaterThan(result.pairs.size.toDouble(), 12.0,
-            "neighbouring directions overlap enough to solve against each other")
+        // Every direction has to be tied to the rest through matched features,
+        // not merely "some pairs were found". A pose graph in pieces still
+        // reports every frame placed and a full sphere, because the pieces that
+        // matched nothing fall back on the orientation prior - which here is
+        // exact and in the world is a degree or two out. So the sphere looked
+        // perfect in this test and came out of the phone visibly misaligned.
+        //
+        // Counting edges is not enough either: 40 pairs among 20 of the 34
+        // directions would pass a count and still leave 14 adrift. What has to
+        // hold is that the graph is connected.
+        run {
+            val n = inputs.size
+            val parent = IntArray(n) { it }
+            fun find(a: Int): Int { var x = a; while (parent[x] != x) { parent[x] = parent[parent[x]]; x = parent[x] }; return x }
+            for (p in result.pairs) {
+                val ra = find(p.a)
+                val rb = find(p.b)
+                if (ra != rb) parent[ra] = rb
+            }
+            val roots = HashSet<Int>()
+            for (i in 0 until n) roots.add(find(i))
+            val biggest = (0 until n).groupBy { find(it) }.values.maxOf { it.size }
+            t.eq(1L, roots.size.toLong(),
+                "every direction is tied to the rest through matched features, " +
+                "not through the orientation prior alone")
+            t.eq(n.toLong(), biggest.toLong(), "the pose graph is one piece, not several")
+            t.greaterThan(result.pairs.size.toDouble(), (n - 1).toDouble(),
+                "with more overlaps than the bare minimum to span them")
+            t.note("pose graph: " + result.pairs.size + " pairs over " + n +
+                    " directions in " + roots.size + " piece(s)")
+        }
         t.lessThan(result.baRmsDeg, 0.5, "the bundle adjustment closes to under half a degree")
         t.greaterThan(result.coveredFraction, 0.995,
             "and the finished sphere has no hole in it")

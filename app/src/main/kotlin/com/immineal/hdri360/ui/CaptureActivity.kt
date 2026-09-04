@@ -44,7 +44,6 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
-import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.text.font.FontFamily
@@ -360,6 +359,19 @@ private fun CaptureScreen(state: CaptureUiState, rotationDeg: Int,
                       else Math.max(viewH, viewW / aspect)
         val longPx = shortPx * aspect
 
+        // The view fills the screen and the frame is placed inside it by the
+        // TextureView's own transform, rather than by laying the view out large
+        // and turning it.
+        //
+        // Two reasons, both found the hard way. A TextureView is composited by
+        // the hardware renderer rather than drawn into the canvas it is given, so
+        // wrapping it in a rotating layer can leave the preview blank. And
+        // Modifier.size is coerced by the parent's constraints: asking for a
+        // frame wider than the screen quietly got a narrower one, while the
+        // markers were still being placed with the width that had been asked for.
+        // The picture and the guidance were then drawn to two different scales,
+        // which is what makes the dots drift away from what they are pointing at
+        // as you look further from the middle of the screen.
         AndroidView(factory = { ctx ->
             TextureView(ctx).apply {
                 surfaceTextureListener = object : TextureView.SurfaceTextureListener {
@@ -372,10 +384,17 @@ private fun CaptureScreen(state: CaptureUiState, rotationDeg: Int,
                     override fun onSurfaceTextureUpdated(st: SurfaceTexture) { }
                 }
             }
-        }, modifier = Modifier
-            .align(Alignment.Center)
-            .size(with(density) { longPx.toDp() }, with(density) { shortPx.toDp() })
-            .graphicsLayer { rotationZ = rotationDeg.toFloat() })
+        }, modifier = Modifier.fillMaxSize(), update = { view ->
+            if (viewW > 0 && viewH > 0) {
+                // The buffer arrives stretched to the view; scale it back to the
+                // frame's own shape, then turn it. The overlay is given exactly
+                // these numbers, so the two cannot disagree.
+                val m = android.graphics.Matrix()
+                m.postScale(longPx / viewW, shortPx / viewH, viewW / 2, viewH / 2)
+                m.postRotate(rotationDeg.toFloat(), viewW / 2, viewH / 2)
+                view.setTransform(m)
+            }
+        })
 
         SphereOverlay(
             targets = state.targets,
@@ -403,6 +422,26 @@ private fun CaptureScreen(state: CaptureUiState, rotationDeg: Int,
             state.warning?.let {
                 Spacer(Modifier.height(4.dp))
                 Text(it, style = MaterialTheme.typography.bodySmall, color = Color(0xFFFFC400))
+            }
+            // What to actually do. "Sweep the scene so it can be metered" is a
+            // label for someone who already knows; the sweep is an unusual thing
+            // to ask of a person and the phase it belongs to has no other clue in
+            // it. Said once, at the top, in the phase it applies to.
+            val how = when (state.phase) {
+                CaptureUiState.Phase.SCANNING ->
+                    "Turn slowly all the way round, then look up at the ceiling and " +
+                    "down at the floor. This finds the brightest and darkest of the " +
+                    "room and sets one exposure ladder for the whole sphere. It ends " +
+                    "by itself."
+                CaptureUiState.Phase.CAPTURING ->
+                    "Bring the yellow ring into the circle and hold still. The line " +
+                    "across the circle shows how level you are; near the top and " +
+                    "bottom of the sphere it stops mattering."
+                else -> null
+            }
+            how?.let {
+                Spacer(Modifier.height(6.dp))
+                Text(it, style = MaterialTheme.typography.bodySmall, color = Color(0xFFD0D0D0))
             }
         }
 

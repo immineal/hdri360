@@ -103,6 +103,21 @@ object HdriPipeline {
         @JvmField var featureWorkingWidth = 640
         @JvmField var maxFeaturesPerFrame = 500
         @JvmField var fastThreshold = 0.02
+        /**
+         * Corners to look for in each frame before accepting what the threshold
+         * gives.
+         *
+         * One threshold cannot serve a whole sphere. The bright, cluttered
+         * directions saturate the cap at 0.02 while a wall, a ceiling or a patch
+         * of sky yields a handful or none at all - and a frame with no features
+         * is tied to its neighbours by nothing, so it is placed on the
+         * orientation prior and lands wherever the phone's compass thought it
+         * was. Frames that fall short have the threshold halved until they reach
+         * this many corners or the floor is hit; frames that already have enough
+         * are left exactly as they were.
+         */
+        @JvmField var featureTargetCount = 150
+        @JvmField var fastThresholdFloor = 0.002
         @JvmField var ransacThresholdDeg = 0.4
         @JvmField var ransacIterations = 1000
         @JvmField var minPairMatches = 12
@@ -261,7 +276,13 @@ object HdriPipeline {
                 val fc = FastCornerDetector.Config()
                 fc.threshold = opt.fastThreshold
                 fc.maxFeatures = opt.maxFeaturesPerFrame
-                features[i] = FeatureSet.describe(det.image, FastCornerDetector.detect(det.image, fc))
+                var corners = FastCornerDetector.detect(det.image, fc)
+                while (corners.size < opt.featureTargetCount &&
+                       fc.threshold > opt.fastThresholdFloor) {
+                    fc.threshold = Math.max(opt.fastThresholdFloor, fc.threshold / 2)
+                    corners = FastCornerDetector.detect(det.image, fc)
+                }
+                features[i] = FeatureSet.describe(det.image, corners)
                 workingIntrinsics[i] = inputs[i].intrinsics.scaled(det.scale)
                 store.put(i, merged.radiance,
                     confidenceOf(merged, opt.confidenceSnrReference),
