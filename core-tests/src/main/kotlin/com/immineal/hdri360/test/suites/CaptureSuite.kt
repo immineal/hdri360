@@ -576,6 +576,22 @@ class CaptureSuite : TestCase {
             now += 400_000_000L
             c.onOrientation(overRolled, true, now)
             t.eq(1L, cam.burstsRequested.toLong(), "a wildly rolled frame is still refused")
+
+            // Except at the poles, where roll is heading and the phone is over the
+            // user's head with the screen facing the floor.
+            var pole = -1
+            for (i in c.plan.targets.indices)
+                if (c.plan.targets[i].pitchDeg > 85 && !c.snapshot().shot[i]) { pole = i; break }
+            t.greaterThan(pole.toDouble(), -1.0, "the plan includes a zenith frame")
+            val spun = c.plan.targets[pole].rotation
+                .mul(SO3.exp(Vec3(0.0, 0.0, Math.toRadians(70.0))))
+            val before = cam.burstsRequested
+            now += 400_000_000L
+            c.onOrientation(spun, true, now)
+            now += 400_000_000L
+            c.onOrientation(spun, true, now)
+            t.greaterThan(cam.burstsRequested.toDouble(), before.toDouble(),
+                "the zenith fires whatever the heading, because nobody can see it")
         }
 
         // --- what the tiers claim ----------------------------------------------------

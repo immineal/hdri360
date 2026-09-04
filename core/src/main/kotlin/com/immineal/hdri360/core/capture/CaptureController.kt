@@ -63,6 +63,16 @@ class CaptureController(
          * sphere unshootable by hand.
          */
         @JvmField var rollToleranceDeg = 15.0
+        /**
+         * Above this pitch, roll is not judged at all.
+         *
+         * Pointing straight up, roll *is* heading - and the zenith is shot with
+         * the screen facing the floor, where the person holding the phone has
+         * nothing to aim by. Asking them to find a heading they cannot see, at
+         * the one direction where the surrounding ring already overlaps
+         * everything, is how the top of the sphere ends up missing.
+         */
+        @JvmField var freeRollAbovePitchDeg = 75.0
         /** Shutter lockout, so one steady moment does not fire twice. */
         @JvmField var minBracketIntervalNs = 250_000_000L
         /**
@@ -368,9 +378,11 @@ class CaptureController(
             val offset = CaptureGuide.guidanceOffsetDeg(cameraToWorld, t)
             yawOffset = offset[0]
             pitchOffset = offset[1]
+            val rollTolerance = if (Math.abs(t.pitchDeg) >= config.freeRollAbovePitchDeg) 180.0
+                                else config.rollToleranceDeg
             aligned = CaptureGuide.withinTolerance(cameraToWorld, t,
                 Math.toRadians(config.alignmentToleranceDeg),
-                Math.toRadians(config.rollToleranceDeg))
+                Math.toRadians(rollTolerance))
 
             if (pendingTarget >= 0) return@synchronized
             if (!aligned || !steady) return@synchronized

@@ -418,7 +418,16 @@ class CaptureSession(
         private const val TAG = "Hdri360.Session"
         /** Marker written once a capture has been processed, so it stops offering to resume. */
         const val DONE = "processed"
-        private const val SCAN_ENOUGH = 0.55
+        /**
+         * How much of the sphere the sweep has to have pointed at.
+         *
+         * A fraction of the plan, not a count, and deliberately well under half:
+         * unmetered directions inherit the union of everything that was metered,
+         * so what the sweep has to establish is the scene's range, not every
+         * corner of it. Asking for most of the sphere before the capture even
+         * starts is asking the user to shoot it twice.
+         */
+        private const val SCAN_ENOUGH = 0.35
         private const val MIN_SCAN_MS = 3000L
         private const val MIN_FREE_BYTES = 1500L * 1024 * 1024
     }
