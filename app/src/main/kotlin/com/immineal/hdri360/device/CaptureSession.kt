@@ -93,11 +93,19 @@ class CaptureSession(
             finished = finishedCapture())
     }
 
-    /** A capture that was interrupted and still has frames worth keeping. */
+    /**
+     * A capture that was interrupted and still has frames worth keeping.
+     *
+     * A sweep that was metered and then backed out of leaves a session behind
+     * with nothing in it. Offering that as something to resume promises to carry
+     * on from where it stopped, which for an empty capture means starting over
+     * while sounding like it will not.
+     */
     fun unfinishedCapture(): File? {
         val dirs = root.listFiles() ?: return null
         return dirs.filter { it.isDirectory && File(it, FrameStore.SESSION).isFile &&
-                             !File(it, DONE).isFile }
+                             !File(it, DONE).isFile &&
+                             File(it, FrameStore.JOURNAL).length() > 0 }
             .maxByOrNull { it.lastModified() }
     }
 
