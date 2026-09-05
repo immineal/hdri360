@@ -23,6 +23,7 @@ import com.immineal.hdri360.core.pano.PhotometricAligner
 import com.immineal.hdri360.core.pano.RotationBundleAdjuster
 import com.immineal.hdri360.core.pano.RotationSolver
 import java.util.Arrays
+import java.util.Locale
 import java.util.Collections
 import java.util.Random
 
@@ -102,6 +103,18 @@ object HdriPipeline {
         @JvmField var panoramaWidth = 4096
         @JvmField var featureWorkingWidth = 640
         @JvmField var maxFeaturesPerFrame = 500
+        /**
+         * Corners per frame once the search is guided by the orientation prior.
+         *
+         * Five hundred is what an unguided contest can afford: every point is
+         * compared against every point in the other frame, so the cost is
+         * quadratic and so is the chance of a decoy winning. With the prior
+         * narrowing each search to a handful of candidates, both of those go
+         * away, and the extra points are what turn a sparse overlap into a
+         * solvable one. On a real 34 direction sphere, at 500 the pose graph came
+         * apart into 21 pieces; at 3000 it holds together in a few.
+         */
+        @JvmField var maxFeaturesGuided = 3000
         @JvmField var fastThreshold = 0.02
         /**
          * Corners to look for in each frame before accepting what the threshold
@@ -120,6 +133,52 @@ object HdriPipeline {
         @JvmField var fastThresholdFloor = 0.002
         @JvmField var ransacThresholdDeg = 0.4
         @JvmField var ransacIterations = 1000
+        /**
+         * Use the orientation prior to decide which pairs are worth trying and
+         * which matches within them are believable.
+         *
+         * Every pair is otherwise matched against every other, with nothing but
+         * the descriptors to say whether two frames even point the same way. On a
+         * real sphere that is mostly noise: of 561 pairs from 34 directions, 440
+         * produced twelve or more descriptor matches and 397 of those had three
+         * or fewer that any rotation could reconcile. Frames pointing in opposite
+         * directions were being offered as candidates, and the genuine
+         * neighbours had to win a contest against them.
+         *
+         * The phone already knows roughly where it was pointing for each frame,
+         * to a degree or two. Two frames whose axes are further apart than their
+         * own field of view cannot overlap whatever the descriptors say, and a
+         * match that disagrees with the prior by more than the prior's own error
+         * is not the same point seen twice.
+         */
+        @JvmField var usePriorForPairs = true
+        /** Slack on top of the frame's own field of view before a pair is skipped. */
+        @JvmField var priorOverlapMarginDeg = 12.0
+        /** How far a match may disagree with the prior and still be believed. */
+        @JvmField var priorMatchToleranceDeg = 12.0
+        /**
+         * How alike two descriptors must be to be believed when the search was
+         * guided, in differing bits out of 256.
+         *
+         * Stricter than the unguided bar, and it has to be. The ratio test earns
+         * its keep by comparing the best match against the runner up, and in a
+         * neighbourhood of five candidates the runner up is usually terrible - so
+         * the test passes everything and stops discriminating. Its work has to be
+         * done by an absolute standard instead, or the prior quietly decides the
+         * answer it was only supposed to be narrowing the search for.
+         */
+        @JvmField var guidedMaxDistance = 64
+        /**
+         * Let the prior pick the candidates, not just narrow the pairs.
+         *
+         * Off by default: it finds more matches on real data and it also lets the
+         * prior's own error into the answer, which the end to end test catches by
+         * planting a two degree gyro error and watching the solve fail to beat
+         * it. Narrowing which pairs are tried is safe - it only ever removes
+         * pairs that cannot overlap - and is what makes a high feature count
+         * affordable, which turns out to be the larger effect anyway.
+         */
+        @JvmField var guidedMatching = false
         @JvmField var minPairMatches = 12
         @JvmField var minPairInliers = 12
         @JvmField var baHuberDeg = 0.5
@@ -194,6 +253,53 @@ object HdriPipeline {
         @JvmField var seed = 12345L
     }
 
+    /** Corners found and pairs attempted, kept so a bad solve can be explained. */
+    class MatchStats internal constructor(
+        /** Corners described in each frame, in frame order. */
+        @JvmField val featuresPerFrame: IntArray,
+        @JvmField val pairsAttempted: Int,
+        /** Pairs whose descriptors matched at all. */
+        @JvmField val pairsWithAnyMatch: Int,
+        /** Pairs that cleared the minimum match count and reached RANSAC. */
+        @JvmField val pairsWithEnoughMatches: Int,
+        /** Pairs a rotation was found for. The rest died at one of the two gates. */
+        @JvmField val pairsSolved: Int,
+        /** Connected components of the pose graph. One means every frame is tied in. */
+        @JvmField val components: Int,
+        /** Frames in the largest connected component. */
+        @JvmField val largestComponent: Int,
+        /**
+         * How many geometrically consistent matches each attempted pair had,
+         * bucketed. A pile at zero means the descriptors are matching noise; a
+         * pile just under the acceptance bar means the bar is the problem.
+         */
+        @JvmField val inlierHistogram: IntArray
+    ) {
+        /** "0-3: 210  4-7: 88 ..." over the buckets that are not empty. */
+        fun histogramLine(): String {
+            val b = StringBuilder()
+            for (i in inlierHistogram.indices) {
+                if (inlierHistogram[i] == 0) continue
+                val lo = i * 4
+                b.append(lo).append('-').append(lo + 3).append(": ")
+                    .append(inlierHistogram[i]).append("  ")
+            }
+            return b.toString().trim()
+        }
+
+        override fun toString(): String {
+            val f = featuresPerFrame.sorted()
+            val median = if (f.isEmpty()) 0 else f[f.size / 2]
+            return String.format(Locale.US,
+                "features %d..%d median %d; %d pairs tried, %d matched, %d reached ransac, " +
+                "%d solved; graph in %d piece(s), largest %d",
+                f.firstOrNull() ?: 0, f.lastOrNull() ?: 0, median,
+                pairsAttempted, pairsWithAnyMatch, pairsWithEnoughMatches, pairsSolved,
+                components, largestComponent) +
+                "\n  inliers per attempted pair: " + histogramLine()
+        }
+    }
+
     class PairResult internal constructor(
         @JvmField val a: Int,
         @JvmField val b: Int,
@@ -210,6 +316,15 @@ object HdriPipeline {
         @JvmField val gains: DoubleArray,
         @JvmField val placed: BooleanArray,
         @JvmField val pairs: List<PairResult>,
+        /**
+         * Why the pose graph is the shape it is.
+         *
+         * A pair count on its own cannot be acted on. Whether the frames had no
+         * corners to describe, or plenty that would not match, or plenty of
+         * matches that no rotation could reconcile, are three different faults
+         * with three different fixes - and the difference is one histogram wide.
+         */
+        @JvmField val matching: MatchStats,
         @JvmField val baRmsDeg: Double,
         @JvmField val coveredFraction: Double,
         /** Confidence of the recovered horizon, or -1 if levelling was not attempted. */
@@ -268,6 +383,9 @@ object HdriPipeline {
         val restoreThreads = Parallel.threads
         try {
             Parallel.threads = mergeThreads
+            // Every frame must have a prior for the search to be guided, since a
+            // frame without one still has to win an unguided contest.
+            val guidedMatching = opt.usePriorForPairs && inputs.all { it.priorRotation != null }
             Parallel.forEach(n) { i ->
                 // Scoped so a deferred bracket becomes collectable the moment it has
                 // been merged, rather than at the end of the stage.
@@ -275,7 +393,8 @@ object HdriPipeline {
                 val det = DetectionImage.build(merged.radiance, opt.featureWorkingWidth)
                 val fc = FastCornerDetector.Config()
                 fc.threshold = opt.fastThreshold
-                fc.maxFeatures = opt.maxFeaturesPerFrame
+                fc.maxFeatures = if (guidedMatching) opt.maxFeaturesGuided
+                                 else opt.maxFeaturesPerFrame
                 var corners = FastCornerDetector.detect(det.image, fc)
                 while (corners.size < opt.featureTargetCount &&
                        fc.threshold > opt.fastThresholdFloor) {
@@ -310,6 +429,9 @@ object HdriPipeline {
             for (i in 0 until n) for (j in i + 1 until n) { pairI[k] = i; pairJ[k] = j; k++ }
         }
 
+        val inlierBuckets = IntArray(26)
+        val anyMatch = java.util.concurrent.atomic.AtomicInteger()
+        val enoughMatches = java.util.concurrent.atomic.AtomicInteger()
         val solvedPair = arrayOfNulls<PairResult>(totalPairs)
         val pairCorr = arrayOfNulls<List<RotationBundleAdjuster.Correspondence>>(totalPairs)
         val matchDone = java.util.concurrent.atomic.AtomicInteger()
@@ -319,23 +441,70 @@ object HdriPipeline {
             val j = pairJ[k]
             report(progress, "matching",
                 matchDone.incrementAndGet() / Math.max(1, totalPairs).toDouble())
-            val matches = BriefMatcher.match(features[i]!!, features[j]!!, mc)
+            if (!couldOverlap(inputs, i, j, opt)) return@forEach
+            val ri0 = inputs[i].priorRotation
+            val rj0 = inputs[j].priorRotation
+            val guided = opt.guidedMatching && ri0 != null && rj0 != null
+            val matches = if (!guided) BriefMatcher.match(features[i]!!, features[j]!!, mc)
+            else {
+                // Where the prior says each of i's points lands in j's pixels.
+                val fa = features[i]!!
+                val kj = workingIntrinsics[j]!!
+                val ki = workingIntrinsics[i]!!
+                val px = DoubleArray(fa.size())
+                val py = DoubleArray(fa.size())
+                for (q in 0 until fa.size()) {
+                    val kp = fa.keypoints[q]
+                    val world = ri0!!.mul(ki.unproject(kp.x.toDouble(), kp.y.toDouble()))
+                    val p = kj.project(rj0!!.mulTranspose(world))
+                    if (p == null) { px[q] = Double.NaN; py[q] = Double.NaN }
+                    else { px[q] = p[0]; py[q] = p[1] }
+                }
+                // The search radius is the prior's own error, in pixels at this
+                // frame's scale: anything further away is not the same point.
+                val radius = Math.tan(Math.toRadians(opt.priorMatchToleranceDeg)) * kj.fx
+                val gc = BriefMatcher.Config()
+                gc.ratio = mc.ratio
+                gc.crossCheck = mc.crossCheck
+                gc.maxDistance = opt.guidedMaxDistance
+                BriefMatcher.matchNear(fa, features[j]!!, px, py, radius, gc)
+            }
+            if (matches.isNotEmpty()) anyMatch.incrementAndGet()
             if (matches.size >= opt.minPairMatches) {
+                enoughMatches.incrementAndGet()
                 val from = ArrayList<Vec3>(matches.size)
                 val to = ArrayList<Vec3>(matches.size)
                 val pixelsFrom = ArrayList<DoubleArray>(matches.size)
                 val pixelsTo = ArrayList<DoubleArray>(matches.size)
+                val ri = inputs[i].priorRotation
+                val rj = inputs[j].priorRotation
+                val believable = if (opt.usePriorForPairs && ri != null && rj != null)
+                    Math.toRadians(opt.priorMatchToleranceDeg) else Double.MAX_VALUE
                 for (m in matches) {
                     val pa = features[i]!!.keypoints[m.a]
                     val pb = features[j]!!.keypoints[m.b]
-                    from.add(workingIntrinsics[i]!!.unproject(pa.x.toDouble(), pa.y.toDouble()))
-                    to.add(workingIntrinsics[j]!!.unproject(pb.x.toDouble(), pb.y.toDouble()))
+                    val ba = workingIntrinsics[i]!!.unproject(pa.x.toDouble(), pa.y.toDouble())
+                    val bb = workingIntrinsics[j]!!.unproject(pb.x.toDouble(), pb.y.toDouble())
+                    // The prior says where a's bearing should land in b's frame.
+                    // A match that disagrees by more than the prior's own error is
+                    // two different points, not one seen twice.
+                    if (believable < Double.MAX_VALUE) {
+                        val expected = rj!!.mulTranspose(ri!!.mul(ba))
+                        if (expected.angleTo(bb) > believable) continue
+                    }
+                    from.add(ba)
+                    to.add(bb)
                     pixelsFrom.add(doubleArrayOf(pa.x.toDouble(), pa.y.toDouble()))
                     pixelsTo.add(doubleArrayOf(pb.x.toDouble(), pb.y.toDouble()))
                 }
+                if (from.size < opt.minPairMatches) return@forEach
                 val ransac = RotationSolver.ransac(from, to,
                     Math.toRadians(opt.ransacThresholdDeg), opt.ransacIterations,
                     opt.seed + 31L * (k + 1))
+                if (ransac != null) {
+                    val b = Math.min(inlierBuckets.size - 1, ransac.inlierCount / 4)
+                    synchronized(inlierBuckets) { inlierBuckets[b]++ }
+                }
                 if (ransac != null && ransac.inlierCount >= opt.minPairInliers) {
                     solvedPair[k] = PairResult(i, j, matches.size, ransac.inlierCount,
                         ransac.rotation)
@@ -447,7 +616,9 @@ object HdriPipeline {
         report(progress, "blending", 1.0)
 
         return Result(rendered.panorama, rendered.coverage, rotations, gains, placed,
-            pairs, baRms, rendered.coveredFraction(), horizonConfidence, k1,
+            pairs, matchStats(n, features, pairs, totalPairs, anyMatch.get(),
+                enoughMatches.get(), inlierBuckets),
+            baRms, rendered.coveredFraction(), horizonConfidence, k1,
             opt.radianceScale, renderable, seamMap)
     }
 
@@ -457,6 +628,47 @@ object HdriPipeline {
      * keeps a single bad pair from dragging a whole branch out of place before
      * the bundle adjustment ever sees it.
      */
+    /** Union find over the solved pairs, so "connected" is a fact and not a hope. */
+    private fun matchStats(n: Int, features: Array<FeatureSet?>, solvedPairs: List<PairResult>,
+                           attempted: Int, anyMatch: Int, enough: Int,
+                           inlierBuckets: IntArray): MatchStats {
+        val parent = IntArray(n) { it }
+        fun find(a: Int): Int {
+            var x = a
+            while (parent[x] != x) { parent[x] = parent[parent[x]]; x = parent[x] }
+            return x
+        }
+        var solved = 0
+        for (p in solvedPairs) {
+            solved++
+            val ra = find(p.a)
+            val rb = find(p.b)
+            if (ra != rb) parent[ra] = rb
+        }
+        val sizes = HashMap<Int, Int>()
+        for (i in 0 until n) sizes[find(i)] = (sizes[find(i)] ?: 0) + 1
+        return MatchStats(IntArray(n) { features[it]?.keypoints?.size ?: 0 },
+            attempted, anyMatch, enough, solved,
+            sizes.size, sizes.values.maxOrNull() ?: 0, inlierBuckets)
+    }
+
+    /**
+     * Whether two frames can see any of the same sky, according to the priors.
+     *
+     * True whenever either prior is missing: a pair that might overlap and was
+     * never tried is a hole, and holes are worse than wasted work.
+     */
+    private fun couldOverlap(inputs: List<FrameInput>, i: Int, j: Int, opt: Options): Boolean {
+        if (!opt.usePriorForPairs) return true
+        val a = inputs[i].priorRotation ?: return true
+        val b = inputs[j].priorRotation ?: return true
+        val axis = Vec3(0.0, 0.0, 1.0)
+        val apart = Math.toDegrees(a.mul(axis).angleTo(b.mul(axis)))
+        val reach = 0.5 * (inputs[i].intrinsics.horizontalFovDeg() +
+                           inputs[i].intrinsics.verticalFovDeg())
+        return apart <= reach + opt.priorOverlapMarginDeg
+    }
+
     private fun initialiseRotations(inputs: List<FrameInput>, pairs: List<PairResult>,
                                     rotations: Array<Mat3?>, placed: BooleanArray) {
         val n = rotations.size

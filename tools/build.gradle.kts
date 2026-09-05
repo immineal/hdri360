@@ -20,3 +20,11 @@ tasks.register<JavaExec>("seamBench") {
     maxHeapSize = "4g"
     args = (project.findProperty("benchArgs") as String? ?: "").split(" ").filter { it.isNotEmpty() }
 }
+
+tasks.register<JavaExec>("probe") {
+    group = "verification"
+    description = "Runs a capture bundle pulled off the phone through the pipeline."
+    mainClass.set("com.immineal.hdri360.tools.SphereProbe")
+    classpath = sourceSets["main"].runtimeClasspath
+    maxHeapSize = "8g"
+}
