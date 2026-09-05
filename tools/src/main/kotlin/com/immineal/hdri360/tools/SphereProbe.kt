@@ -106,6 +106,17 @@ object SphereProbe {
         println("frames with no partner at all: ${alone.size} ${alone.take(20)}")
         println("degree: " + degree.joinToString(" "))
         println("features: " + res.matching.featuresPerFrame.joinToString(" "))
+
+        // A picture, because the numbers say the graph holds together and only
+        // looking says whether the seams do.
+        if (args.size > 1 && args[1] != "x") {
+            val out = File(args[1])
+            out.mkdirs()
+            RestitchTool.writePng(res.panorama, File(out, "preview.png").path)
+            RestitchTool.writeCoveragePng(res.coverage, res.panorama.width, res.panorama.height,
+                File(out, "coverage.png").path)
+            println("wrote " + File(out, "preview.png"))
+        }
     }
 
     private class Rec(val target: Int, val bracket: Int,
