@@ -157,9 +157,34 @@ All submitted 2026-09-06:
 - Financial features → none
 - Health apps → none
 
+## Where it stands
+
+Submitted 2026-09-06: store listing, all nine declarations, app category and
+contact details, and release **2 (1.0)** on the closed testing track "Alpha",
+177 countries, full rollout. Google's stated turnaround is up to seven days.
+
+Nothing is installable until that review passes - the opt-in link does not even
+appear on the Testers tab before then - so the testers cannot start their
+fourteen days early.
+
 ## What is still open
 
 New personal developer accounts cannot publish straight to production: Play
-requires a closed test with 12 testers opted in for 14 continuous days, then an
-application for production access. The account here was created 2026-09-03, so
-this applies. Everything above is done; the closed test is the gate.
+requires a closed test with **12 testers opted in for 14 continuous days**, then
+an application for production access. The account here was created 2026-09-03, so
+this applies.
+
+The email list "Closed test" exists and is selected on the track, and the change
+is **saved but deliberately not submitted**: sending it while a review is running
+cancels and restarts that review. The addresses go in together, once, when there
+are enough of them.
+
+Two things worth knowing when asking people:
+
+  - Play counts **opted-in testers, not devices**. A tester has to open the link
+    and accept; being on the list does nothing on its own. Leaving the programme
+    drops the count and the fourteen days start again.
+  - Ask more than twelve. Some never click the link.
+
+Version code 1 was uploaded and then withdrawn when the foreground service came
+out; a version code cannot be reused, so the shipped build is 2.
