@@ -36,7 +36,26 @@ class DeviceReport(
     @JvmField val rawSizes: List<SensorSize>,
     @JvmField val yuvSizes: List<SensorSize>,
     @JvmField val activeArray: SensorSize
-)
+) {
+    /**
+     * Readable, because this goes into the diagnostics report and a report that
+     * prints an object identity has told the reader nothing. It printed
+     * `DeviceReport@b5a5f2b` for every camera on the one device it was needed on.
+     */
+    override fun toString(): String {
+        val sb = StringBuilder()
+        sb.append(hardwareLevel).append(", active ").append(activeArray)
+        sb.append(if (hasRaw) ", RAW" else ", no RAW")
+        sb.append(if (hasManualSensor) ", manual sensor" else ", no manual sensor")
+        sb.append(", raw sizes ")
+        if (rawSizes.isEmpty()) sb.append("none")
+        else sb.append(rawSizes.sortedByDescending { it.pixels() }.take(3).joinToString(" "))
+        sb.append(", yuv sizes ")
+        if (yuvSizes.isEmpty()) sb.append("none")
+        else sb.append(yuvSizes.sortedByDescending { it.pixels() }.take(3).joinToString(" "))
+        return sb.toString()
+    }
+}
 
 /** One stream configuration to try, and what it would mean if it worked. */
 class StreamPlan(
@@ -73,6 +92,37 @@ class StreamPlan(
  * than tangled into the Camera2 callbacks.
  */
 object StreamLadder {
+
+    /**
+     * The frame duration to request for one rung: the longest of what the
+     * exposure needs and what the stream can actually sustain.
+     *
+     * `SENSOR_FRAME_DURATION` used to be set to the exposure time and nothing
+     * else, which for a single frame is harmless and for a bracket is a demand.
+     * Five rungs back to back at 1/30 s asks the sensor for thirty frames a
+     * second **while the gain moves from ISO 29 to ISO 7276 between them**, and a
+     * sensor that cannot reconfigure that fast within one frame period does not
+     * slow down politely. From the phone's own camera HAL, during exactly that
+     * burst:
+     *
+     *     CSIS Core context 0: LogicalChannel0LateConfigError
+     *     Rear: 61 responses over 2.03 s, FPS: 30.08     (before)
+     *     Rear: 37 responses over 18.56 s, FPS: 1.99     (during)
+     *
+     * Thirty frames a second to two. One frame of the bracket arrived, the rest
+     * were still coming eighteen seconds later, the burst outlived its own
+     * timeout, and every direction of the capture was abandoned in turn. It had
+     * been surviving on 1/15 s rungs - 66 ms per frame to reconfigure - and
+     * halving the handheld limit to 1/30 s halved that too.
+     *
+     * [minFrameDurationNs] is the device's own `getOutputMinFrameDuration` for
+     * the size being captured. Asking for less than it is asking for something
+     * the device never offered; asking for less than the exposure is something
+     * Camera2 rejects outright. So: the larger of the two, and at least 1.
+     */
+    @JvmStatic
+    fun frameDurationFor(exposureNs: Long, minFrameDurationNs: Long): Long =
+        Math.max(1L, Math.max(exposureNs, minFrameDurationNs))
 
     /** Roughly a screen. Larger previews cost bandwidth and buy nothing. */
     private const val PREVIEW_TARGET_WIDTH = 1280

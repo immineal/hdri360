@@ -8,6 +8,9 @@ import com.immineal.hdri360.test.suites.TrackingSuite
 import com.immineal.hdri360.test.suites.ProcessingSuite
 import com.immineal.hdri360.test.suites.StreamLadderSuite
 import com.immineal.hdri360.test.suites.ImageSuite
+import com.immineal.hdri360.test.suites.LensSuite
+import com.immineal.hdri360.test.suites.LibrarySuite
+import com.immineal.hdri360.test.suites.ProgressSuite
 import com.immineal.hdri360.test.suites.MergeSuite
 import com.immineal.hdri360.test.suites.MeteringSuite
 import com.immineal.hdri360.test.suites.MathSuite
@@ -60,7 +63,10 @@ object TestRunner {
         "VignetteSuite" to ::VignetteSuite,
         "PhotometrySuite" to ::PhotometrySuite,
         "CapturePlanSuite" to ::CapturePlanSuite,
+        "LensSuite" to ::LensSuite,
         "FrameStoreSuite" to ::FrameStoreSuite,
+        "LibrarySuite" to ::LibrarySuite,
+        "ProgressSuite" to ::ProgressSuite,
         "TrackingSuite" to ::TrackingSuite,
         "StreamLadderSuite" to ::StreamLadderSuite,
         "ProcessingSuite" to ::ProcessingSuite,

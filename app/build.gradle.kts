@@ -1,8 +1,25 @@
+import java.io.FileInputStream
+import java.util.Properties
+
 plugins {
     // AGP 9 has Kotlin support built in; the kotlin-android plugin is gone.
     id("com.android.application")
     id("org.jetbrains.kotlin.plugin.compose")
 }
+
+// Release signing, read from a file that is not in the repository.
+//
+// keystore.properties sits beside settings.gradle.kts, holds four lines
+// (storeFile, storePassword, keyAlias, keyPassword) and is gitignored along with
+// the .jks itself. When it is absent - which is every checkout that has not been
+// set up to sign, including CI - the release build simply comes out unsigned
+// rather than failing, because an unsigned APK is still a useful artefact and a
+// build that dies on a missing secret is not.
+val keystoreProperties = Properties().apply {
+    val f = rootProject.file("keystore.properties")
+    if (f.exists()) FileInputStream(f).use { load(it) }
+}
+val canSign = keystoreProperties.getProperty("storeFile") != null
 
 android {
     namespace = "com.immineal.hdri360"
@@ -24,9 +41,27 @@ android {
     }
     kotlin { jvmToolchain(17) }
 
+    signingConfigs {
+        if (canSign) create("release") {
+            storeFile = rootProject.file(keystoreProperties.getProperty("storeFile"))
+            storePassword = keystoreProperties.getProperty("storePassword")
+            keyAlias = keystoreProperties.getProperty("keyAlias")
+            keyPassword = keystoreProperties.getProperty("keyPassword")
+        }
+    }
+
     buildTypes {
         release {
-            isMinifyEnabled = false
+            if (canSign) signingConfig = signingConfigs.getByName("release")
+            // On, now that there is something to ship. Nothing here is reached
+            // by name - see proguard-rules.pro - so R8 has a free hand, and the
+            // line numbers are kept so a crash from a real capture is still
+            // readable.
+            isMinifyEnabled = true
+            isShrinkResources = true
+            proguardFiles(
+                getDefaultProguardFile("proguard-android-optimize.txt"),
+                "proguard-rules.pro")
         }
     }
     packaging { jniLibs { useLegacyPackaging = false } }

@@ -6,6 +6,7 @@ import com.immineal.hdri360.core.hdr.ExposureSettings
 import com.immineal.hdri360.core.image.BayerImage
 import com.immineal.hdri360.core.image.CfaPattern
 import com.immineal.hdri360.core.image.Demosaic
+import com.immineal.hdri360.core.image.ImageF
 import com.immineal.hdri360.core.io.Json
 import com.immineal.hdri360.core.math.Mat3
 import com.immineal.hdri360.core.pipeline.HdriPipeline
@@ -52,6 +53,55 @@ object SphereProbe {
 
         // The journal names every frame that was actually stored, with the
         // exposure it was taken at and the pose the phone thought it had.
+        // The same colour chain the phone now runs: the capture's one white
+        // balance, then the camera's own sensor-RGB to linear-sRGB matrix. Without
+        // these the probe measures a different picture from the one the app
+        // produces, which is the opposite of what a probe is for.
+        val header = session as Json.Obj
+        val gains = if (header.has("neutralGains")) {
+            val g = header["neutralGains"]; DoubleArray(g.size()) { g.at(it).asDouble() }
+        } else null
+        val matrix = if (header.has("colorMatrix")) {
+            val m = header["colorMatrix"]
+            if (m.size() == 9) DoubleArray(9) { m.at(it).asDouble() } else null
+        } else null
+        // Which half of the colour chain to run, so a colour fault can be
+        // bisected by looking rather than by argument: wb, matrix, both, none,
+        // or "t" for the matrix transposed - the one mistake whose signature is
+        // a plausible-looking picture in the wrong hue.
+        // A fifth argument fixes the radial distortion instead of solving it, so
+        // the residual can be asked what it thinks of each value. A solve that
+        // lands anywhere between 0.14 and 0.26 depending only on how the poses
+        // were initialised is either badly conditioned or estimating something
+        // the data does not contain, and a sweep says which.
+        val fixedK1 = args.getOrNull(4)?.toDoubleOrNull()
+
+        val mode = if (args.size > 3) args[3] else "both"
+        val useGains = mode == "both" || mode == "wb" || mode == "t"
+        val useMatrix = mode == "both" || mode == "matrix" || mode == "t"
+        val m = if (!useMatrix) null else if (mode == "t" && matrix != null)
+            DoubleArray(9) { i -> matrix[(i % 3) * 3 + i / 3] } else matrix
+        // The lens shading correction the phone applied to every frame it
+        // stitched. Without it this path works on frames whose corners are a
+        // stop darker, which is exactly where the overlap is - and the probe then
+        // measures a different sphere from the one the app produced. Captures
+        // taken before it was recorded have none, and say so.
+        val shading = if (!header.has("shadingGains") || !header.has("shadingCols")) null else {
+            val g = header["shadingGains"]
+            try {
+                com.immineal.hdri360.core.image.ShadingMap(
+                    DoubleArray(g.size()) { g.at(it).asDouble() },
+                    header["shadingCols"].asDouble().toInt(),
+                    header["shadingRows"].asDouble().toInt())
+            } catch (e: Exception) { null }
+        }
+        println("shading: " + (shading?.toString()
+            ?: "not recorded in this capture - the corners will be a stop dark"))
+
+        println("mode $mode: white balance " +
+                (if (useGains) gains?.joinToString(", ") { "%.3f".format(it) } ?: "none" else "off") +
+                "; colour matrix " + (if (m != null) "on" else "off"))
+
         val byTarget = LinkedHashMap<Int, MutableList<Rec>>()
         for (line in File(dir, "frames.jsonl").readLines()) {
             if (line.isBlank()) continue
@@ -69,29 +119,72 @@ object SphereProbe {
         for (tIdx in targets) {
             val rungs = byTarget[tIdx]!!.sortedBy { it.bracket }
             val prior = rungs.firstOrNull { it.pose != null }?.pose
-            inputs.add(HdriPipeline.FrameInput.deferred(k, prior, "t%03d".format(tIdx)) {
+            val ki = if (fixedK1 == null) k else k.withDistortion(fixedK1, 0.0, 0.0)
+            inputs.add(HdriPipeline.FrameInput.deferred(ki, prior, "t%03d".format(tIdx)) {
                 rungs.map { r ->
                     val raw = readDng(File(dir, "raw/t%03d_b%d.dng".format(r.target, r.bracket)))
                     // Demosaiced per rung and merged in RGB, exactly as the
                     // stored path on the phone does it.
                     Exposure.of(
-                        Demosaic.malvarHeCutler(mosaic(raw, white, black, subsample, cfa)),
+                        Demosaic.malvarHeCutler(
+                            // No shading here: it goes on merged radiance, as
+                            // opt.shading below, exactly as the phone now does.
+                            // Applied to sensor fractions it invented saturation
+                            // out of dim corners - see HdriPipeline.Options.shading.
+                            mosaic(raw, white, black, subsample, cfa, null)),
                         r.settings, session["baseIso"].asDouble().toInt())
                 }
             })
         }
 
         val opt = HdriPipeline.Options()
+        // One matrix, applied to the merged radiance by the pipeline - not to the
+        // rungs. Colouring a rung before it is merged moves it out of the [0,1]
+        // sensor domain the merge's saturation test lives in, and the channel with
+        // the largest coefficient silently loses its brightest samples.
+        opt.shading = shading
+        opt.colorTransform = if (!useMatrix && !useGains) null else {
+            val mm = if (useMatrix && m != null) m
+                     else doubleArrayOf(1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0)
+            val gr = if (useGains && gains != null && gains[1] > 1e-9) gains[0] / gains[1] else 1.0
+            val gb = if (useGains && gains != null && gains[1] > 1e-9) gains[2] / gains[1] else 1.0
+            doubleArrayOf(mm[0] * gr, mm[1], mm[2] * gb,
+                          mm[3] * gr, mm[4], mm[5] * gb,
+                          mm[6] * gr, mm[7], mm[8] * gb)
+        }
+        if (fixedK1 != null) opt.solveDistortion = false
         opt.panoramaWidth = if (args.size > 2) args[2].toInt() else 2048
         opt.priorWeight = 0.5
         opt.levelHorizon = false
         val started = System.currentTimeMillis()
+        // Stage timings, so the progress bar's weights can be measured rather
+        // than guessed. Same pipeline the phone runs; the absolute seconds differ
+        // but the shares are what a bar needs.
+        var stageStarted = System.nanoTime()
+        var stageName = ""
+        val stageMs = LinkedHashMap<String, Long>()
         val res = HdriPipeline.process(inputs, opt) { stage, f ->
-            if (f == 0.0) println("  $stage")
+            if (stage != stageName) {
+                if (stageName.isNotEmpty())
+                    stageMs[stageName] = (stageMs[stageName] ?: 0L) +
+                        (System.nanoTime() - stageStarted) / 1_000_000L
+                stageName = stage
+                stageStarted = System.nanoTime()
+                println("  $stage")
+            }
         }
         val secs = (System.currentTimeMillis() - started) / 1000.0
 
         println()
+        if (stageName.isNotEmpty())
+            stageMs[stageName] = (stageMs[stageName] ?: 0L) +
+                (System.nanoTime() - stageStarted) / 1_000_000L
+        val stageTotal = stageMs.values.sum().coerceAtLeast(1L)
+        println("stage shares (of " + stageTotal + " ms): " +
+            stageMs.entries.joinToString("  ") {
+                String.format(java.util.Locale.US, "%s %.3f (%d ms)",
+                    it.key, it.value / stageTotal.toDouble(), it.value)
+            })
         println(res.matching)
         println(String.format(Locale.US,
             "placed %d of %d, %d pairs, residual %.4f deg, k1 %.4f, covered %.1f%%, %.1f s",
@@ -103,6 +196,12 @@ object SphereProbe {
         val degree = IntArray(inputs.size)
         for (p in res.pairs) { degree[p.a]++; degree[p.b]++ }
         val alone = (0 until inputs.size).filter { degree[it] == 0 }
+        // Decision 2, answered: how much of each direction no exposure held. The
+        // app reports the same numbers, so a disagreement here is a real one.
+        val blown = res.saturatedFraction.withIndex().filter { it.value > 1e-4 }
+        println("directions with unmeasured highlights: ${blown.size}" +
+                if (blown.isEmpty()) "" else " " + blown.joinToString(" ") {
+                    "t%03d:%.1f%%".format(it.index, 100 * it.value) })
         println("frames with no partner at all: ${alone.size} ${alone.take(20)}")
         println("degree: " + degree.joinToString(" "))
         println("features: " + res.matching.featuresPerFrame.joinToString(" "))
@@ -113,6 +212,15 @@ object SphereProbe {
             val out = File(args[1])
             out.mkdirs()
             RestitchTool.writePng(res.panorama, File(out, "preview.png").path)
+            // The radiance as well as the picture. A tone-mapped PNG cannot be
+            // measured - its brightest pixels are wherever the curve saturated,
+            // which is a large patch of sky rather than the sun - and measuring
+            // the sphere is most of what this probe is for.
+            java.io.BufferedOutputStream(
+                java.io.FileOutputStream(File(out, "panorama.exr")), 1 shl 16).use { o ->
+                com.immineal.hdri360.core.io.ExrWriter.write(o, res.panorama,
+                    com.immineal.hdri360.core.io.ExrWriter.Compression.ZIPS)
+            }
             RestitchTool.writeCoveragePng(res.coverage, res.panorama.width, res.panorama.height,
                 File(out, "coverage.png").path)
             println("wrote " + File(out, "preview.png"))
@@ -195,7 +303,8 @@ object SphereProbe {
      * rather than every [step]th sample - so the result is the same mosaic seen
      * from further away rather than a different one.
      */
-    private fun mosaic(raw: Raw, white: Int, black: Double, step: Int, cfa: CfaPattern): BayerImage {
+    private fun mosaic(raw: Raw, white: Int, black: Double, step: Int, cfa: CfaPattern,
+                       shading: com.immineal.hdri360.core.image.ShadingMap? = null): BayerImage {
         val w = raw.width / (2 * step) * 2
         val h = raw.height / (2 * step) * 2
         val out = BayerImage(w, h, cfa)
@@ -204,8 +313,13 @@ object SphereProbe {
             val by = (y / 2) * step * 2 + (y and 1)
             for (x in 0 until w) {
                 val bx = (x / 2) * step * 2 + (x and 1)
-                val v = (raw.data[by * raw.width + bx] - black).toFloat() * scale
-                out.plane.data[y * w + x] = if (v > 0f) v else 0f
+                var v = (raw.data[by * raw.width + bx] - black).toFloat() * scale
+                // At the full-frame coordinate, not the decimated one: the map is
+                // stretched over the sensor and decimation does not move the
+                // corners.
+                if (shading != null)
+                    v *= shading.gainAt(cfa, bx, by, raw.width, raw.height).toFloat()
+                out.plane.data[y * w + x] = if (v > 0f) v.coerceAtMost(1f) else 0f
             }
         }
         return out

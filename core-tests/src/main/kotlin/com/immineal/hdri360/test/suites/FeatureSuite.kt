@@ -93,6 +93,33 @@ class FeatureSuite : TestCase {
             "descriptors still match after a 25 degree roll")
         t.note("matches surviving a 25 degree roll: $matchedUnderRoll")
 
+        // How far, exactly. This is the number the capture guide's roll tolerance
+        // has to respect: a frame rolled further than this relative to its
+        // neighbour cannot be matched to it however well it overlaps, and the
+        // plan's own overlap tolerates far more roll than the matcher does -
+        // rolling one frame of a real 34 direction plan by sixty degrees was
+        // measured to cost 0.00% of the sphere's coverage and no partners at all.
+        // So the matcher is the binding constraint, and this is where it binds.
+        run {
+            val at0 = countGeometricMatches(noise, fs, fs, 0.0)
+            val curve = StringBuilder()
+            var lastUsable = 0
+            for (deg in intArrayOf(5, 10, 15, 20, 25, 30, 40, 50, 60, 70, 80, 90)) {
+                val rad = Math.toRadians(deg.toDouble())
+                val img = rotateImage(noise, rad)
+                val kps = FastCornerDetector.detect(img, budget)
+                val got = countGeometricMatches(noise, fs, FeatureSet.describe(img, kps), rad)
+                curve.append(deg).append(":").append(got).append(" ")
+                // "Usable" is not "any": a pair needs enough inliers for a
+                // rotation solve to be trusted, not one lucky correspondence.
+                if (got >= 25) lastUsable = deg
+            }
+            t.note("matches vs relative roll (of $at0 at zero): $curve")
+            t.note("last roll angle with 25+ geometric matches: $lastUsable degrees")
+            t.greaterThan(lastUsable.toDouble(), 24.0,
+                "the matcher survives at least 25 degrees of relative roll")
+        }
+
         // --- end to end against known geometry ----------------------------------
         // Two views of the same textured environment, related by a known rotation.
         val ew = 1024

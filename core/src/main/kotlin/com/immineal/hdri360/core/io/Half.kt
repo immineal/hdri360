@@ -9,6 +9,13 @@ package com.immineal.hdri360.core.io
  */
 object Half {
 
+    /**
+     * The largest value half float can hold. Anything above it becomes infinity,
+     * which is the right answer for an IEEE conversion and the wrong one for a
+     * radiance map - see the clamp in ExrWriter.writable.
+     */
+    const val MAX_FINITE = 65504.0f
+
     /** @return the 16 bits of the half representation, in the low half of the int. */
     @JvmStatic
     fun fromFloat(value: Float): Short {

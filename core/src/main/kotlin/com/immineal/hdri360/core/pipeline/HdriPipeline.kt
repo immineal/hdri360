@@ -19,6 +19,7 @@ import com.immineal.hdri360.core.pano.FrameSet
 import com.immineal.hdri360.core.pano.FrameSource
 import com.immineal.hdri360.core.pano.HorizonEstimator
 import com.immineal.hdri360.core.pano.PanoramaRenderer
+import com.immineal.hdri360.core.pano.RotationAverage
 import com.immineal.hdri360.core.pano.PhotometricAligner
 import com.immineal.hdri360.core.pano.RotationBundleAdjuster
 import com.immineal.hdri360.core.pano.RotationSolver
@@ -234,6 +235,40 @@ object HdriPipeline {
         @JvmField var mergeConcurrency = 0
         @JvmField var merge = MergeConfig()
         /**
+         * Row-major 3x3 taking merged sensor RGB to linear Rec.709, or null to
+         * leave the radiance in the camera's own primaries.
+         *
+         * Applied to the *merged* radiance, and deliberately not to a bracket's
+         * rungs before they are merged. The merge decides which rungs to believe
+         * from the pixel value itself - at [MergeConfig.satHigh] a sample is on
+         * the rail and carries nothing - and that test is only meaningful in the
+         * domain the sensor measures in, a fraction of full well in [0,1]. A
+         * colour matrix leaves that domain: its diagonal is well above one, so a
+         * channel comfortably below saturation lands above the threshold after
+         * the transform and a perfectly good sample is thrown away. Green has the
+         * largest coefficient on every phone matrix, so green loses its brightest
+         * rungs first and comes back biased low, which is a magenta sphere.
+         *
+         * Measured on a Pixel 9a capture: a neutral patch that merges to
+         * 35.93/35.92/35.91 in sensor space came out 35.76/11.88/27.06 with the
+         * camera's own matrix applied per rung, and 35.94/35.91/35.90 with the
+         * same matrix applied here.
+         */
+        /**
+         * The camera's lens shading correction, applied to **merged** radiance.
+         *
+         * Here and not in the converter, for the same reason the colour matrix is
+         * here: the correction is multiplicative, it commutes with the exposure
+         * scaling, and radiance has no ceiling. Applied to sensor fractions and
+         * clamped into [0, 1] it invented saturation - a corner sample above
+         * `0.98 / peakGain` read as blown, which on the 9a's map is a fifth of
+         * white - and threw away every real corner highlight above that. A window
+         * was re-shot for a highlight that had never been lost.
+         */
+        @JvmField var shading: com.immineal.hdri360.core.image.ShadingMap? = null
+
+        @JvmField var colorTransform: DoubleArray? = null
+        /**
          * Where merged directions are kept while the sphere is solved.
          *
          * Null holds them in memory, which only works when the whole sphere fits -
@@ -315,6 +350,27 @@ object HdriPipeline {
         @JvmField val rotations: Array<Mat3>,
         @JvmField val gains: DoubleArray,
         @JvmField val placed: BooleanArray,
+        /**
+         * Directions the feature solve never reached, placed on the device's
+         * orientation prior alone.
+         *
+         * Kept apart from [placed] because they are not the same claim. A frame
+         * chained into the pose graph is where matched features put it; one of
+         * these is where the phone's compass thought it was, and the two differ by
+         * degrees. Naming them is what turns an unexplained soft seam into
+         * something the person can act on - shoot that direction again, or accept
+         * it.
+         */
+        @JvmField val placedOnPriorAlone: BooleanArray,
+        /**
+         * Per direction, the fraction of its pixels that no exposure held.
+         *
+         * The honest answer to "did anything clip", and the only place it can be
+         * taken: the merge knows, and the panorama does not. Per direction rather
+         * than for the sphere as a whole because "somewhere in there" is not
+         * something a person can act on and "direction 14" is.
+         */
+        @JvmField val saturatedFraction: DoubleArray,
         @JvmField val pairs: List<PairResult>,
         /**
          * Why the pose graph is the shape it is.
@@ -379,6 +435,16 @@ object HdriPipeline {
         val features = arrayOfNulls<FeatureSet>(n)
         val workingIntrinsics = arrayOfNulls<Intrinsics>(n)
         val mergeDone = java.util.concurrent.atomic.AtomicInteger()
+        /**
+         * Per direction, the fraction of pixels no exposure in its bracket held.
+         *
+         * Decision 2 says nothing may clip; this is whether it worked, and it is
+         * only knowable here. The merge flags a pixel it could not measure, and
+         * those flags are gone by the time the panorama exists - which is why the
+         * report used to count pixels above 1.0 in the finished sphere instead
+         * and called a whole, correct 21-direction capture 99.99% clipped.
+         */
+        val saturated = DoubleArray(n)
         val mergeThreads = if (opt.mergeConcurrency > 0) opt.mergeConcurrency else Parallel.threads
         val restoreThreads = Parallel.threads
         try {
@@ -390,6 +456,21 @@ object HdriPipeline {
                 // Scoped so a deferred bracket becomes collectable the moment it has
                 // been merged, rather than at the end of the stage.
                 val merged = HdrMerger.merge(inputs[i].openBracket(), opt.merge)
+                // Before anything else looks at it, so that features, the
+                // photometric solve, the composite and the file all agree on what
+                // space the radiance is in.
+                saturated[i] = saturatedFractionOf(merged)
+                // Order matters and this is the order. Saturation is read off the
+                // *sensor* first, before any correction touches the numbers; then
+                // the flat field, which is a per-pixel gain; then the colour
+                // matrix, which is a per-pixel 3x3. Both corrections are on merged
+                // radiance because both are multiplicative and neither is a
+                // property of one rung.
+                opt.shading?.let {
+                    it.rgbSamplerFor(merged.radiance.width, merged.radiance.height)
+                        .apply(merged.radiance)
+                }
+                opt.colorTransform?.let { toLinearRec709(merged.radiance, it) }
                 val det = DetectionImage.build(merged.radiance, opt.featureWorkingWidth)
                 val fc = FastCornerDetector.Config()
                 fc.threshold = opt.fastThreshold
@@ -455,8 +536,8 @@ object HdriPipeline {
                 val py = DoubleArray(fa.size())
                 for (q in 0 until fa.size()) {
                     val kp = fa.keypoints[q]
-                    val world = ri0!!.mul(ki.unproject(kp.x.toDouble(), kp.y.toDouble()))
-                    val p = kj.project(rj0!!.mulTranspose(world))
+                    val world = ri0.mul(ki.unproject(kp.x.toDouble(), kp.y.toDouble()))
+                    val p = kj.project(rj0.mulTranspose(world))
                     if (p == null) { px[q] = Double.NaN; py[q] = Double.NaN }
                     else { px[q] = p[0]; py[q] = p[1] }
                 }
@@ -534,7 +615,8 @@ object HdriPipeline {
         report(progress, "aligning", 0.0)
         val rotationsInit = arrayOfNulls<Mat3>(n)
         val placed = BooleanArray(n)
-        initialiseRotations(inputs, pairs, rotationsInit, placed)
+        val onPriorAlone = BooleanArray(n)
+        initialiseRotations(inputs, pairs, rotationsInit, placed, onPriorAlone)
         var rotations = Array(n) { rotationsInit[it]!! }
 
         // 4. Global refinement.
@@ -616,7 +698,7 @@ object HdriPipeline {
         report(progress, "blending", 1.0)
 
         return Result(rendered.panorama, rendered.coverage, rotations, gains, placed,
-            pairs, matchStats(n, features, pairs, totalPairs, anyMatch.get(),
+            onPriorAlone, saturated, pairs, matchStats(n, features, pairs, totalPairs, anyMatch.get(),
                 enoughMatches.get(), inlierBuckets),
             baRms, rendered.coveredFraction(), horizonConfidence, k1,
             opt.radianceScale, renderable, seamMap)
@@ -670,7 +752,8 @@ object HdriPipeline {
     }
 
     private fun initialiseRotations(inputs: List<FrameInput>, pairs: List<PairResult>,
-                                    rotations: Array<Mat3?>, placed: BooleanArray) {
+                                    rotations: Array<Mat3?>, placed: BooleanArray,
+                                    onPriorAlone: BooleanArray) {
         val n = rotations.size
         val sorted = ArrayList(pairs)
         sorted.sortWith { p, q -> Integer.compare(q.inliers, p.inliers) }
@@ -679,6 +762,13 @@ object HdriPipeline {
         if (sorted.isNotEmpty()) root = sorted[0].a
         rotations[root] = inputs[root].priorRotation ?: Mat3.IDENTITY
         placed[root] = true
+        // The root's pose is the gauge, and where it comes from depends on whether
+        // there is a graph to be the gauge of. With pairs to grow along, the root
+        // is an endpoint of the strongest of them and everything else is chained
+        // to it by matched features - solved, whatever its own pose was fixed to.
+        // With no pairs at all there is no graph, and the root is a direction
+        // sitting on the phone's orientation exactly like the rest.
+        if (sorted.isEmpty() && inputs[root].priorRotation != null) onPriorAlone[root] = true
 
         var grew = true
         while (grew) {
@@ -698,14 +788,61 @@ object HdriPipeline {
             }
         }
 
+        // The chained frames are in the gauge of the root's own prior, and that
+        // prior is one accelerometer reading taken while somebody held a phone at
+        // arm's length. Measured on a real 34-direction capture: the root's prior
+        // was tilted 11.0 degrees from the consensus of all thirty-four, and the
+        // tilt implied by individual frames ranged from 0 to 18.6 - so which
+        // frame won the spanning tree decided how level the sphere came out.
+        // Independently, the sun in that panorama sat 7 to 12 degrees below where
+        // the almanac puts it. Two measurements, one number.
+        //
+        // Rotated onto the consensus of every prior in the component instead. One
+        // global rotation moves where the sphere points and not its shape: every
+        // angle inside it is exactly as solved.
+        //
+        // It has to happen *here*, before the unreached frames are filled in from
+        // their own priors, and that is the part that is easy to get wrong. Those
+        // frames arrive already in the priors' frame; the chained ones arrive in
+        // the root's. Aligning afterwards moves the whole sphere and takes the
+        // prior-placed frames off the very priors they were placed on - so the
+        // component and the strays end up disagreeing by exactly the root's error,
+        // which is the fault this is meant to remove.
+        if (rotationsHavePriors(inputs)) {
+            val chained = BooleanArray(n) { rotations[it] != null }
+            val current = Array(n) { rotations[it] ?: Mat3.IDENTITY }
+            val reference = Array(n) { inputs[it].priorRotation ?: Mat3.IDENTITY }
+            val onPrior = BooleanArray(n) { chained[it] && inputs[it].priorRotation != null }
+            RotationAverage.align(current, reference, onPrior)?.let { level ->
+                for (i in 0 until n)
+                    if (chained[i]) rotations[i] = level.mul(rotations[i]!!).orthonormalized()
+            }
+        }
+
         for (i in 0 until n) {
             if (rotations[i] != null) continue
             val prior = inputs[i].priorRotation
             rotations[i] = prior ?: Mat3.IDENTITY
-            if (prior != null) placed[i] = true
+            if (prior != null) {
+                placed[i] = true
+                // Decision 9. This direction is tied to its neighbours by nothing:
+                // it lands wherever the phone's own orientation thought it was,
+                // which is right to a few degrees at best. Compositing it is still
+                // better than leaving a hole, but it is not the same kind of
+                // answer as a direction the feature solve reached, and a file that
+                // does not distinguish the two is a file in which a soft seam has
+                // no explanation. So it is recorded, and the report says which.
+                onPriorAlone[i] = true
+            }
         }
         // Put the gauge on frame 0 so results are reproducible and comparable.
         if (rotations[0] == null) rotations[0] = Mat3.IDENTITY
+    }
+
+    /** Whether there is anything to level against at all. */
+    private fun rotationsHavePriors(inputs: List<FrameInput>): Boolean {
+        for (i in inputs) if (i.priorRotation != null) return true
+        return false
     }
 
     private fun collectPriors(inputs: List<FrameInput>): Array<Mat3>? {
@@ -731,6 +868,53 @@ object HdriPipeline {
      * anything decently exposed and falls off only where the data really is
      * thin - deep shadow, or a highlight past the top of the bracket.
      */
+    /**
+     * How much of a merged direction no exposure held.
+     *
+     * [MergeResult.FLAG_SATURATED] is set where even the shortest rung of the
+     * bracket was on the rail, so the value written was a lower bound rather than
+     * a measurement. That is exactly the quantity decisions 1 to 3 are about.
+     */
+    private fun saturatedFractionOf(merge: MergeResult): Double {
+        val flags = merge.flags
+        if (flags.isEmpty()) return 0.0
+        var n = 0
+        for (f in flags) if ((f.toInt() and MergeResult.FLAG_SATURATED) != 0) n++
+        return n / flags.size.toDouble()
+    }
+
+    /**
+     * Turns merged sensor RGB into linear Rec.709 in place.
+     *
+     * Negatives are clamped away. A colour matrix maps some real sensor colours
+     * outside the Rec.709 gamut, and outside it the honest answer is a negative
+     * number - which is a fine thing to carry through a colour pipeline and a
+     * useless one in a radiance map, where it means a light that removes light.
+     * The clamp costs the hue of a handful of out-of-gamut pixels; not clamping
+     * costs every statistic taken over the sphere and every render lit by it.
+     */
+    private fun toLinearRec709(image: ImageF, m: DoubleArray) {
+        if (m.size < 9 || image.channels < 3) return
+        val d = image.data
+        val step = image.channels
+        var i = 0
+        while (i < d.size) {
+            val r = d[i].toDouble()
+            val g = d[i + 1].toDouble()
+            val b = d[i + 2].toDouble()
+            var or = m[0] * r + m[1] * g + m[2] * b
+            var og = m[3] * r + m[4] * g + m[5] * b
+            var ob = m[6] * r + m[7] * g + m[8] * b
+            if (or < 0) or = 0.0
+            if (og < 0) og = 0.0
+            if (ob < 0) ob = 0.0
+            d[i] = or.toFloat()
+            d[i + 1] = og.toFloat()
+            d[i + 2] = ob.toFloat()
+            i += step
+        }
+    }
+
     private fun confidenceOf(merge: MergeResult, referenceSnr: Double): FloatArray? {
         val w = merge.weight
         val radiance = merge.radiance

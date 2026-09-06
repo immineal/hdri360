@@ -2,7 +2,13 @@ package com.immineal.hdri360.test.suites
 
 import com.immineal.hdri360.core.Parallel
 import com.immineal.hdri360.core.camera.Intrinsics
+import com.immineal.hdri360.core.capture.CaptureTier
+import com.immineal.hdri360.core.capture.StoredSession
+import com.immineal.hdri360.core.hdr.BracketPlan
+import com.immineal.hdri360.core.hdr.DeviceExposureLimits
 import com.immineal.hdri360.core.hdr.Exposure
+import com.immineal.hdri360.core.hdr.ExposureLadder
+import com.immineal.hdri360.core.image.CfaPattern
 import com.immineal.hdri360.core.image.ImageF
 import com.immineal.hdri360.core.image.ImageOps
 import com.immineal.hdri360.core.math.Mat3
@@ -10,7 +16,9 @@ import com.immineal.hdri360.core.math.SO3
 import com.immineal.hdri360.core.math.Vec3
 import com.immineal.hdri360.core.pano.CaptureTarget
 import com.immineal.hdri360.core.pano.Equirect
+import com.immineal.hdri360.core.pano.RotationAverage
 import com.immineal.hdri360.core.pipeline.HdriPipeline
+import com.immineal.hdri360.core.pipeline.OutputWriter
 import com.immineal.hdri360.test.TestCase
 import com.immineal.hdri360.test.TestKit
 import java.util.Collections
@@ -196,6 +204,64 @@ class PipelineSuite : TestCase {
             t.lessThan(Math.toDegrees(SO3.angleBetween(truth[i], pres.rotations[i])), 1e-6,
                 "a featureless frame falls back on its orientation prior")
 
+        // --- decision 9: and says so -------------------------------------------------
+        // A direction the solve never reached is placed wherever the phone's own
+        // orientation thought it was, which is right to a few degrees at best. It
+        // is still worth compositing - the alternative is a hole - but it is not
+        // the same kind of answer as a direction tied to its neighbours by matched
+        // features, and a file that does not distinguish them is a file where a
+        // soft seam has no explanation. A hole that is named is a fact somebody
+        // can act on.
+        for (i in 0 until 3) {
+            t.check(pres.placed[i], "a frame on its prior is still composited")
+            t.check(pres.placedOnPriorAlone[i],
+                "and is marked as placed on the orientation prior alone")
+        }
+        for (i in res.placedOnPriorAlone.indices)
+            t.check(!res.placedOnPriorAlone[i],
+                "a frame the feature solve did reach is not marked as one it did not")
+
+        // --- highlights nothing held ------------------------------------------------
+        // Decision 2 says nothing may clip. Whether it worked is a fact about the
+        // merge - a pixel no exposure in its bracket held - and the report has to
+        // carry it, because the person cannot see it in a tone-mapped preview.
+        // What was there before counted pixels whose three channels all exceeded
+        // 1.0, which in a radiance map with an absolute scale is very nearly all
+        // of them: a real 21-direction sphere off the phone, whole and correct,
+        // reported 99.99% "clipped".
+        t.eq(res.rotations.size.toLong(), res.saturatedFraction.size.toLong(),
+            "one saturated fraction per direction")
+        for (f in res.saturatedFraction)
+            t.check(f >= 0.0 && f <= 1.0, "and each is a fraction")
+        for (f in pres.saturatedFraction)
+            t.near(0.0, f, 1e-9,
+                "a flat grey frame well under the rail has no unmeasured highlights")
+
+        // And the other end: a bracket that is on the rail at every rung, which is
+        // what a window with the sun in it does to a camera that has run out of
+        // shutter.
+        run {
+            val blown = ArrayList<HdriPipeline.FrameInput>()
+            for (i in 0 until 3) {
+                val white = ImageF(k.width, k.height, 3)
+                white.fill(1.0f)
+                blown.add(HdriPipeline.FrameInput(
+                    listOf(Exposure(white, 1.0 / 8000, 1.0), Exposure(white, 1.0 / 500, 1.0)),
+                    k, truth[i], "b$i"))
+            }
+            val bo = HdriPipeline.Options()
+            bo.panoramaWidth = 256
+            bo.priorWeight = 1.0
+            val bres = HdriPipeline.process(blown, bo, null)
+            for (f in bres.saturatedFraction)
+                t.greaterThan(f, 0.99,
+                    "a bracket on the rail at every rung is reported as unmeasured, not as bright")
+        }
+
+        aStrandedFrameLandsWithTheRest(t, env, ew, eh, k, truth)
+
+        theReportSaysWhatWasSolvedAndInWhatSpace(t, res, pres)
+
         // --- more cores must not change a single number ------------------------------
         // The merge, the feature pass and the pairwise matching all run across
         // cores now. Everything order-dependent - the pair list, the correspondence
@@ -305,6 +371,201 @@ class PipelineSuite : TestCase {
         // --- validation ------------------------------------------------------------------
         t.throwsException({ HdriPipeline.process(ArrayList(), opt, null) },
             "processing nothing is an error")
+    }
+
+    /**
+     * A sphere is one sphere, whether a frame was solved or merely placed.
+     *
+     * The spanning tree chains what it can in the gauge of the root frame's own
+     * prior, and then fills in whatever it could not reach from *those* frames'
+     * priors. Those two are not the same frame of reference: they differ by
+     * exactly the root's own error, so a stranded frame and the component it sits
+     * next to disagreed by however wrong one accelerometer reading happened to
+     * be. On a real capture that was 11 degrees.
+     *
+     * Fixing it by rotating the finished sphere is the trap: that moves the
+     * prior-placed frames off the very priors they were placed on and leaves the
+     * disagreement exactly where it was. The alignment has to happen between
+     * chaining and filling, which is the only point at which the component can be
+     * brought into the priors' frame while the strays have not yet been placed.
+     *
+     * So: every frame ends up near its own prior, connected or not.
+     */
+    private fun aStrandedFrameLandsWithTheRest(t: TestKit, env: ImageF, ew: Int, eh: Int,
+                                               k: Intrinsics, truth: List<Mat3>) {
+        val r = t.rng(4242)
+        // Three overlapping frames, and one looking somewhere else entirely with
+        // nothing in it to match - the ordinary shape of a real capture's graph.
+        val poses = listOf(truth[0], truth[1], truth[2],
+            CaptureTarget.lookingAt(CaptureTarget.directionFor(150.0, -40.0)).rotation)
+        // The priors: the truth plus a hand's wobble, except the first, which is
+        // the one the solve will gauge itself on and is well out.
+        val priors = poses.mapIndexed { i, p ->
+            if (i == 0) p.mul(SO3.exp(Vec3(0.0, 0.0, Math.toRadians(14.0))))
+            else p.mul(SO3.exp(Vec3(Math.toRadians(1.2 * r.nextGaussian()),
+                Math.toRadians(1.2 * r.nextGaussian()),
+                Math.toRadians(1.2 * r.nextGaussian()))))
+        }
+        // Exposed, not handed over as raw radiance. renderView returns the
+        // environment's own radiance, which spans seventeen stops; passing that
+        // to the merge as a sensor reading puts almost all of it over the
+        // saturation threshold, the merge discards it, and what comes out is a
+        // flat frame with nothing in it to match. Which is what happened.
+        val ladder = doubleArrayOf(1.0 / 2000, 1.0 / 300, 1.0 / 50)
+        val inputs = ArrayList<HdriPipeline.FrameInput>()
+        for (i in poses.indices) {
+            val radiance = if (i == 3) null else renderView(env, ew, eh, k, poses[i])
+            val bracket = ladder.map { e ->
+                val frame = ImageF(k.width, k.height, 3)
+                if (radiance == null) frame.fill(Math.min(1.0, 0.6 * e * 300).toFloat())
+                else for (j in frame.data.indices)
+                    frame.data[j] = Math.min(1.0, radiance.data[j] * e).toFloat()
+                Exposure(frame, e, 1.0)
+            }
+            inputs.add(HdriPipeline.FrameInput(bracket, k, priors[i], "s$i"))
+        }
+        val opt = HdriPipeline.Options()
+        opt.panoramaWidth = 512
+        opt.featureWorkingWidth = 240
+        opt.priorWeight = 0.5
+        opt.seed = 7
+        val res = HdriPipeline.process(inputs, opt, null)
+
+        t.check(res.placed[3], "the stranded frame is still composited")
+        t.check(res.placedOnPriorAlone[3], "and marked as placed on its prior alone")
+        t.check(!res.placedOnPriorAlone[1] || !res.placedOnPriorAlone[2],
+            "while the overlapping ones did connect to something")
+
+        // Judged against the truth, not against the priors. Frame 0's prior is
+        // deliberately fourteen degrees out, and the solve *not* following it is
+        // the desired behaviour - so "near its own prior" is the wrong question
+        // to ask of it.
+        val truthArray = poses.toTypedArray()
+        val g = RotationAverage.align(res.rotations, truthArray, BooleanArray(poses.size) { true })
+        if (g == null) { t.fail("there must be a rotation onto the truth"); return }
+
+        // How far the whole sphere sits from where it should. This is the
+        // levelling claim: gauged on frame 0's prior it would be that prior's
+        // fourteen degrees.
+        val gauge = Math.toDegrees(SO3.angleBetween(g, Mat3.IDENTITY))
+        t.lessThan(gauge, 5.0,
+            "the sphere as a whole is where it should be, not where one bad prior put it")
+
+        // And every frame is where it should be inside it, the stranded one
+        // included. Before the alignment moved to the right place in the
+        // sequence, this frame sat on its own prior while the component sat in
+        // frame 0's - and the two disagreed by exactly frame 0's error.
+        var worst = 0.0
+        var worstFrame = -1
+        for (i in poses.indices) {
+            val off = Math.toDegrees(SO3.angleBetween(g.mul(res.rotations[i]), truthArray[i]))
+            if (off > worst) { worst = off; worstFrame = i }
+        }
+        t.lessThan(worst, 4.0,
+            "every frame lands where it belongs, connected or not (worst was frame $worstFrame)")
+        val stranded = Math.toDegrees(SO3.angleBetween(g.mul(res.rotations[3]), truthArray[3]))
+        t.lessThan(stranded, 4.0,
+            "and the one nothing matched is in the same sphere as the rest of them")
+        t.note(String.format(java.util.Locale.US,
+            "stranded frame: sphere off by %.2f deg, worst frame %.2f deg, stranded %.2f deg",
+            gauge, worst, stranded))
+    }
+
+    /**
+     * The sidecar is the only thing a later reader has to go on.
+     *
+     * Two decisions land here. Directions placed on the orientation prior alone
+     * are marked (9), because a soft seam nobody can explain is worse than a hole
+     * somebody can. And the file says which colour space it is in (8), because a
+     * linear EXR in the camera's own primaries and one in Rec.709 are
+     * indistinguishable once written, and quoting the second while producing the
+     * first is the sort of mistake that is invisible until somebody builds on it.
+     */
+    private fun theReportSaysWhatWasSolvedAndInWhatSpace(
+            t: TestKit, solved: HdriPipeline.Result, onPrior: HdriPipeline.Result) {
+        val stats = OutputWriter.Stats(0.01, 900.0, 3.0, 0.92, 14.0)
+        val limits = DeviceExposureLimits(1.0 / 17554, 16.0, 29, 7276, 29, 1.7, 1.0 / 15.0)
+        val ladder = ExposureLadder.build(limits, 1.0 / 2000.0, 1.0 / 4.0, 2.0)
+
+        fun session(matrix: DoubleArray?, plan: BracketPlan) = StoredSession(
+            cameraId = "0", tier = CaptureTier.LINEAR_RAW,
+            intrinsics = Intrinsics.fromHorizontalFov(64, 48, 58.7),
+            apertureN = 1.7, focalLengthMm = 4.44, sensorOrientationDeg = 90,
+            cfa = CfaPattern.RGGB, whiteLevel = 1023,
+            blackLevel = DoubleArray(4), baseIso = 29, plan = plan,
+            note = "synthetic", neutralGains = doubleArrayOf(1.9, 1.0, 1.7),
+            colorMatrix = matrix)
+
+        val plan = BracketPlan(ladder, Array(3) { IntArray(ladder.size()) { k -> k } })
+        val identity = doubleArrayOf(1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0)
+
+        // --- decision 9 -----------------------------------------------------
+        val onPriorReport = OutputWriter.report(onPrior, session(identity, plan), stats, 256, 1.0)
+        t.eq(3L, onPriorReport["framesOnPriorAlone"].asDouble().toLong(),
+            "the report counts the directions no solve reached")
+        val poses = onPriorReport["poses"]
+        for (i in 0 until poses.size()) {
+            val pose = poses.at(i)
+            t.check(pose["placed"].asBoolean(), "each was composited")
+            t.check(pose["onPriorAlone"].asBoolean(),
+                "and each is marked, one by one, so the person knows which")
+        }
+        val solvedReport = OutputWriter.report(solved, session(identity, plan), stats, 256, 1.0)
+        t.eq(0L, solvedReport["framesOnPriorAlone"].asDouble().toLong(),
+            "a sphere that solved completely says so, rather than saying nothing")
+
+        // --- the report is a document, and its version is a promise ---------
+        // `cdPerM2PerUnit` used to mean cd/m2 per *pipeline* unit and now means
+        // per *file* unit; `clippedFraction` is gone. A reader handed an old
+        // report and a new one would take the same key to mean two different
+        // things, which is the one failure a format version exists to prevent -
+        // so the version moved with the meaning.
+        t.eq("hdri360-report-2", solvedReport["format"].asString(),
+            "the report says which version of itself it is")
+        // Pinned so that the next change to what these mean has to come past a
+        // failing test rather than through it. Not a schema check: a list of the
+        // things a later reader is entitled to find.
+        val promised = listOf(
+            "format", "width", "height", "camera", "tier", "measuresRadiance",
+            "absoluteScale", "radianceBasis", "fileUnit", "cdPerM2PerUnit",
+            "fileScaleBasis", "colorSpace", "colorSpaceBasis",
+            "framesPlaced", "framesTotal", "framesOnPriorAlone",
+            "directionsWithUnmeasuredHighlights", "worstUnmeasuredFraction",
+            "highlightsAreLowerBound", "clampedToHalfFloat",
+            "coveredFraction", "dynamicRangeStops",
+            "minRadiance", "maxRadiance", "meanRadiance",
+            "pairs", "bundleResidualDeg", "horizonConfidence", "k1",
+            "apertureF", "focalLengthMm", "baseIso", "processingSeconds",
+            "gains", "poses")
+        for (key in promised)
+            t.check(solvedReport.has(key), "the report still carries '$key'")
+
+        // --- decision 8 -----------------------------------------------------
+        t.eq("linear-rec709", solvedReport["colorSpace"].asString(),
+            "a capture whose colour matrix was applied says which space it is in")
+        val noMatrix = OutputWriter.report(solved, session(null, plan), stats, 256, 1.0)
+        t.eq("camera-rgb", noMatrix["colorSpace"].asString(),
+            "and one without a matrix admits to the space it is actually in")
+        t.check(noMatrix["colorSpaceBasis"].asString().isNotEmpty(),
+            "with a reason, because 'camera RGB' is not a space anyone can convert from")
+
+        // --- what the sphere's own highlights did ----------------------------
+        // Reported per direction, because "somewhere in the sphere" is not
+        // something a person can act on and "direction 14" is.
+        t.eq(0L, onPriorReport["directionsWithUnmeasuredHighlights"].asDouble().toLong(),
+            "a sphere of flat grey has no direction whose highlights went unmeasured")
+        t.near(0.0, onPriorReport["worstUnmeasuredFraction"].asDouble(), 1e-9,
+            "and nothing to report as the worst of them")
+        t.check(!onPriorReport.has("clippedFraction"),
+            "and the meaningless panorama-wide count is gone rather than left to mislead")
+
+        // --- decision 3, which the growing ladder cannot always avoid --------
+        t.check(!solvedReport["highlightsAreLowerBound"].asBoolean(),
+            "a capture that held its highlights does not claim otherwise")
+        val clamped = OutputWriter.report(solved, session(identity, plan.withDarkEndClamped()),
+            stats, 256, 1.0)
+        t.check(clamped["highlightsAreLowerBound"].asBoolean(),
+            "one that ran out of shutter says its top value is a lower bound")
     }
 
     private fun luminanceAt(img: ImageF, pixel: Int): Double {

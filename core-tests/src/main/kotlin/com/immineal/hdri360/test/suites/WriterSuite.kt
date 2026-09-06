@@ -16,6 +16,7 @@ class WriterSuite : TestCase {
     override fun name(): String = "writers"
 
     override fun run(t: TestKit) {
+        nothingFiniteBecomesInfinite(t)
         val r = t.rng(24680)
 
         // --- half float ----------------------------------------------------
@@ -140,5 +141,55 @@ class WriterSuite : TestCase {
         t.near(1.0 / 15, parsed["shots"].at(1)["t"].asDouble(), 1e-12, "nested objects survive")
         t.throwsException({ Json.parse("{\"a\": }") }, "malformed JSON is rejected")
         t.throwsException({ Json.parse("{\"a\": 1") }, "truncated JSON is rejected")
+    }
+
+    /**
+     * Nothing finite may become infinite on the way into the file.
+     *
+     * The output is half float, whose largest finite value is 65504, and the
+     * conversion overflowed to infinity above it - correct as an IEEE conversion
+     * and wrong as a way to write a radiance map. An offline re-stitch of a real
+     * capture put forty infinite pixels in a panorama, all of them the sun, and
+     * an infinity in an environment map is not a bright pixel: it is a renderer
+     * that produces NaN for everything the sun touches.
+     *
+     * Clamped, and counted so the report can say it happened rather than the
+     * value quietly changing. Above 65504 kilocandela is 65 million cd/m2, which
+     * is forty times a clear sky at the sun's own disc - so in practice this only
+     * ever fires on something already beyond what the capture could measure.
+     */
+    private fun nothingFiniteBecomesInfinite(t: TestKit) {
+        t.near(65504.0, Half.MAX_FINITE.toDouble(), 0.0,
+            "the largest finite half is the one the clamp is built on")
+        t.check(java.lang.Float.isInfinite(Half.toFloat(Half.fromFloat(1e30f))),
+            "the raw conversion still overflows, because that is what it is for")
+
+        val im = ImageF(4, 1, 3)
+        // A pixel beyond half's reach, an infinity, a NaN, and one ordinary value.
+        im.data[0] = 1e30f;  im.data[1] = 70000f;      im.data[2] = 65505f
+        im.data[3] = Float.POSITIVE_INFINITY
+        im.data[4] = Float.NEGATIVE_INFINITY
+        im.data[5] = Float.NaN
+        im.data[6] = 12.5f;  im.data[7] = 0.25f;       im.data[8] = 0f
+        im.data[9] = -1e30f; im.data[10] = 1000f;      im.data[11] = -3f
+
+        val bytes = java.io.ByteArrayOutputStream()
+        ExrWriter.write(bytes, im, ExrWriter.Compression.ZIPS)
+        val back = ExrReader.read(bytes.toByteArray())
+
+        for (i in back.data.indices)
+            t.check(!java.lang.Float.isInfinite(back.data[i]) && !back.data[i].isNaN(),
+                "no pixel in the file is infinite or NaN")
+
+        t.near(Half.MAX_FINITE.toDouble(), back.data[0].toDouble(), 0.0,
+            "a value beyond half's reach is written at its largest finite value")
+        t.near(Half.MAX_FINITE.toDouble(), back.data[3].toDouble(), 0.0,
+            "and so is an infinity, rather than being passed on")
+        t.near(-Half.MAX_FINITE.toDouble(), back.data[4].toDouble(), 0.0,
+            "in both directions")
+        t.near(0.0, back.data[5].toDouble(), 0.0,
+            "a NaN is written as nothing, which is what it means")
+        t.near(12.5, back.data[6].toDouble(), 0.0, "an ordinary value is untouched")
+        t.near(0.25, back.data[7].toDouble(), 0.0, "and so is a small one")
     }
 }

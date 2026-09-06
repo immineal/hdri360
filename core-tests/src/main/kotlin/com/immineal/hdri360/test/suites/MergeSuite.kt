@@ -27,6 +27,7 @@ class MergeSuite : TestCase {
     }
 
     override fun run(t: TestKit) {
+        aColourTransformGoesAfterTheMerge(t)
         val cfg = MergeConfig()
         val ladder = doubleArrayOf(1e-5, 8e-5, 6.4e-4, 5.12e-3, 4.096e-2, 0.32768)
 
@@ -207,6 +208,111 @@ class MergeSuite : TestCase {
         fun srgbEncode(linear: Double): Double {
             val v = Math.max(0.0, Math.min(1.0, linear))
             return if (v <= 0.0031308) 12.92 * v else 1.055 * Math.pow(v, 1 / 2.4) - 0.055
+        }
+    }
+
+    /**
+     * A colour transform belongs after the merge, never before it.
+     *
+     * The merge decides which rungs of a bracket to believe from the pixel value
+     * itself: at [MergeConfig.satHigh] a sample is on the rail and carries no
+     * information, so it is dropped. That test is only meaningful in the domain
+     * the sensor actually measures in - a fraction of full well, in [0,1].
+     *
+     * A colour matrix breaks that domain. Its diagonal is well above one, so a
+     * channel comfortably below saturation on the sensor lands above the
+     * threshold after the transform, and the merge throws away a sample that was
+     * perfectly good. Green has the largest coefficient on every phone matrix
+     * ever shipped, so green loses its brightest valid rungs first and comes back
+     * biased low - which is a magenta sphere.
+     *
+     * Measured on a real capture: a neutral patch that merges to 35.93 / 35.92 /
+     * 35.91 in sensor space came out 35.76 / 11.88 / 27.06 when the camera's own
+     * matrix was applied per rung beforehand. The same matrix applied to the
+     * merged radiance leaves it at 35.94 / 35.91 / 35.90.
+     */
+    private fun aColourTransformGoesAfterTheMerge(t: TestKit) {
+        val cfg = MergeConfig()
+        // The Pixel 9a's own matrix: strongly diagonal, rows summing to one, so a
+        // neutral in must be a neutral out.
+        val m = doubleArrayOf(
+            1.59375, -0.4609375, -0.1328125,
+            -0.33203125, 1.44921875, -0.1171875,
+            -0.01171875, -1.0, 2.01171875)
+
+        // A grey card as the *sensor* sees it. Three equal numbers is not what a
+        // neutral looks like in raw: green is the most sensitive channel, so a
+        // neutral reads high in green and the white balance is what evens it up.
+        // Those are the gains the Pixel 9a reported alongside the matrix above.
+        val gains = doubleArrayOf(1.5622116327285767, 1.0, 1.6853481531143188)
+        val neutral = doubleArrayOf(1.0 / gains[0], 1.0, 1.0 / gains[2])
+        val truth = 2200.0
+        // Deliberately spanning the rail: the brightest rung saturates green
+        // while red and blue are still reading, which is the ordinary state of a
+        // bracket and the case that breaks.
+        val ladder = doubleArrayOf(1.0 / 8000, 1.0 / 3000, 1.0 / 1667)
+
+        fun rung(rel: Double, colourFirst: Boolean): Exposure {
+            val img = ImageF(1, 1, 3)
+            for (c in 0 until 3)
+                img.data[c] = Math.min(1.0, truth * neutral[c] * rel).toFloat()
+            if (colourFirst) colourise(img, gains, m)
+            return Exposure(img, rel, 1.0)
+        }
+
+        // Confirm the fixture really does contain the situation being tested.
+        run {
+            val hot = ImageF(1, 1, 3)
+            for (c in 0 until 3)
+                hot.data[c] = Math.min(1.0, truth * neutral[c] * ladder[ladder.size - 1]).toFloat()
+            t.check(hot.data[1] >= cfg.satHigh, "the brightest rung really does saturate green")
+            t.check(hot.data[0] < cfg.satHigh && hot.data[2] < cfg.satHigh,
+                "while red and blue are still reading, which is what makes it interesting")
+        }
+
+        // Merged in the sensor's own domain, then coloured: grey stays grey and
+        // the radiance survives.
+        val sensor = HdrMerger.merge(ladder.map { rung(it, false) }, cfg).radiance
+        colourise(sensor, gains, m)
+        t.nearRel(sensor.data[0].toDouble(), sensor.data[1].toDouble(), 0.02,
+            "a grey card merged then coloured is still grey")
+        t.nearRel(sensor.data[0].toDouble(), sensor.data[2].toDouble(), 0.02,
+            "in all three channels")
+        t.nearRel(truth, sensor.data[1].toDouble(), 0.10,
+            "and still the radiance that went in")
+
+        // Coloured per rung and then merged, it is not. Green carries the largest
+        // coefficient, so green is the channel that loses its samples.
+        val ahead = HdrMerger.merge(ladder.map { rung(it, true) }, cfg).radiance
+        val err = Math.max(
+            Math.abs(ahead.data[1] / ahead.data[0] - 1.0),
+            Math.abs(ahead.data[1] / ahead.data[2] - 1.0))
+        t.greaterThan(err, 0.10,
+            "colouring before the merge really does break it, which is why it is not done")
+        t.lessThan(ahead.data[1] / sensor.data[1].toDouble(), 0.95,
+            "and it breaks it by losing green, which is what made the sphere magenta")
+        t.note(String.format(java.util.Locale.US,
+            "grey card: merge-then-colour %.4g/%.4g/%.4g; colour-then-merge %.4g/%.4g/%.4g",
+            sensor.data[0], sensor.data[1], sensor.data[2],
+            ahead.data[0], ahead.data[1], ahead.data[2]))
+    }
+
+    /** White balance then matrix, the way the pipeline does it. */
+    private fun colourise(image: ImageF, gains: DoubleArray, m: DoubleArray) {
+        val g = gains[1]
+        val gr = (gains[0] / g).toFloat()
+        val gb = (gains[2] / g).toFloat()
+        var i = 0
+        while (i < image.data.size) {
+            image.data[i] *= gr
+            image.data[i + 2] *= gb
+            val r = image.data[i].toDouble()
+            val gg = image.data[i + 1].toDouble()
+            val b = image.data[i + 2].toDouble()
+            image.data[i] = (m[0] * r + m[1] * gg + m[2] * b).toFloat()
+            image.data[i + 1] = (m[3] * r + m[4] * gg + m[5] * b).toFloat()
+            image.data[i + 2] = (m[6] * r + m[7] * gg + m[8] * b).toFloat()
+            i += image.channels
         }
     }
 }

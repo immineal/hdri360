@@ -8,12 +8,14 @@ import com.immineal.hdri360.core.capture.StoredSession
 import com.immineal.hdri360.core.hdr.BracketPlan
 import com.immineal.hdri360.core.hdr.DeviceExposureLimits
 import com.immineal.hdri360.core.hdr.ExposureLadder
+import com.immineal.hdri360.core.hdr.RadianceScale
 import com.immineal.hdri360.core.image.CfaPattern
 import com.immineal.hdri360.core.image.ImageF
 import com.immineal.hdri360.core.io.Half
 import com.immineal.hdri360.core.math.SO3
 import com.immineal.hdri360.core.math.Vec3
 import com.immineal.hdri360.core.pipeline.Calibration
+import com.immineal.hdri360.core.pipeline.FileScale
 import com.immineal.hdri360.core.pipeline.FrameSpool
 import com.immineal.hdri360.core.pipeline.HdriPipeline
 import com.immineal.hdri360.core.pipeline.MergedFrames
@@ -47,6 +49,251 @@ class ProcessingSuite : TestCase {
         theWrittenSphereMatchesTheRenderedOne(t)
         theJobIsSizedToFitTheMemoryItHas(t)
         theSpooledSphereMatchesTheResidentOne(t)
+        theFileIsInLinearRec709(t)
+        theFileIsInAUnitThatMeansSomething(t)
+        theReportsLuminanceIsALuminance(t)
+    }
+
+    /**
+     * A figure quoted in cd/m2 has to be a luminance.
+     *
+     * The statistics over the finished sphere - its range, its extremes, the
+     * dynamic range in stops - were taken over `(R + G + B) / 3`, which is the
+     * mean of three channels and not the luminance of anything. It did not much
+     * matter while the file was in arbitrary units. It matters now that the file
+     * is in kilocandela per square metre and the report multiplies
+     * `stats.maxRadiance` by that unit to quote `maxLuminanceCdPerM2`: for a
+     * saturated colour the two differ by a lot, and the quoted number was a
+     * confident answer to a question nobody asked.
+     *
+     * Rec.709 luma, which is what the file's own primaries define and what every
+     * reader of the file will compute.
+     */
+    private fun theReportsLuminanceIsALuminance(t: TestKit) {
+        val k = Intrinsics.fromHorizontalFov(64, 48, 60.0)
+        // One flat frame of pure saturated green, whose channel mean and whose
+        // luminance are as far apart as they get.
+        val green = ImageF(64, 48, 3)
+        for (p in 0 until 64 * 48) {
+            green.data[p * 3] = 0f
+            green.data[p * 3 + 1] = 100f
+            green.data[p * 3 + 2] = 0f
+        }
+        val frames = listOf(com.immineal.hdri360.core.pano.FrameSource(
+            green, k, SO3.exp(Vec3(0.0, 0.0, 0.0)), null, 1.0))
+        val cfg = com.immineal.hdri360.core.pipeline.OutputWriter.Config()
+        cfg.panoramaWidth = 128
+        val stats = com.immineal.hdri360.core.pipeline.OutputWriter.writeExr(
+            java.io.ByteArrayOutputStream(), frames, null, cfg)
+
+        // Rec.709 says green carries 0.7152 of the luminance, so 100 units of
+        // pure green is 71.52 - not the 33.3 that averaging three channels gives.
+        t.nearRel(71.52, stats.maxRadiance, 0.02,
+            "the brightest value is the luminance of that colour, not its channel mean")
+        t.check(stats.maxRadiance > 50.0,
+            "and emphatically not a third of it, which is what averaging gave")
+        t.note(String.format(java.util.Locale.US,
+            "pure green at 100: luminance %.2f, channel mean would be %.2f",
+            stats.maxRadiance, 100.0 / 3))
+    }
+
+    /**
+     * What the numbers in the file are, and why they were wrong.
+     *
+     * The radiance scale was computed, put in the report, and never applied to a
+     * pixel. So the file was in the pipeline's own arbitrary units - a sensor
+     * fraction over a relative exposure - and the factor from those to cd/m2 is
+     * `78 N^2 / (q * baseIso)`, which depends on the **lens**. Two spheres of the
+     * same room, one on each of a phone's back cameras, came out at 11.96 and
+     * 11.62 cd/m2 per unit while both reported an absolute scale. Three percent
+     * apart on that phone by coincidence; on a phone whose lenses differ in
+     * aperture and base ISO, far more.
+     *
+     * It also made every file about 86 times too bright to open: dropped into a
+     * renderer as a world texture at strength 1.0, an ordinary sunny garden with
+     * a mean of 143 read as 143 rather than as the 1.7 that real environment maps
+     * carry.
+     *
+     * So the file is written in kilocandela per square metre - 1.0 means 1000
+     * cd/m2 - when the capture earned an absolute scale, and normalised so its
+     * own median is 1.0 when it did not. Both are lens-independent; the first is
+     * a measurement and the second says it is not.
+     */
+    private fun theFileIsInAUnitThatMeansSomething(t: TestKit) {
+        // The two back lenses of a Pixel 9a, as it reports them.
+        val main = RadianceScale.absolute(1.7, 29)
+        val wide = RadianceScale.absolute(2.2, 50)
+        t.check(Math.abs(main.cdPerM2PerUnit - wide.cdPerM2PerUnit) > 0.1,
+            "the two lenses really do put a different number on the same light")
+
+        // The claim: the same physical luminance lands on the same file number,
+        // whichever lens shot it. This is the whole point.
+        val luminance = 1667.0                       // cd/m2, a sunny garden's mean
+        val mainUnits = luminance / main.cdPerM2PerUnit
+        val wideUnits = luminance / wide.cdPerM2PerUnit
+        val mainFile = FileScale.of(main, null).apply(mainUnits)
+        val wideFile = FileScale.of(wide, null).apply(wideUnits)
+        t.nearRel(mainFile, wideFile, 1e-9,
+            "the same light is the same number in the file, whichever lens shot it")
+        t.nearRel(1.667, mainFile, 1e-9, "and that number is the luminance in kilocandela")
+
+        // What a reader has to be told to get back to physics.
+        val fs = FileScale.of(main, null)
+        t.nearRel(FileScale.CD_PER_M2_PER_UNIT, fs.cdPerM2PerUnit, 1e-12,
+            "an absolute file says one unit is a thousand candela per square metre")
+        t.check(fs.absolute, "and that it is a measurement")
+        t.nearRel(luminance, fs.cdPerM2PerUnit * mainFile, 1e-9,
+            "so the luminance comes straight back out")
+
+        // A capture with no absolute scale cannot be converted, so it is
+        // normalised instead - and says so rather than implying units it has not
+        // got.
+        val relative = RadianceScale.relative("this camera would not take manual exposures")
+        val pano = ImageF(8, 4, 3)
+        // Values spread over two orders of magnitude, median 40.
+        val values = doubleArrayOf(4.0, 8.0, 15.0, 25.0, 35.0, 45.0, 60.0, 90.0,
+            120.0, 200.0, 300.0, 400.0, 3.0, 6.0, 12.0, 20.0,
+            30.0, 50.0, 70.0, 110.0, 150.0, 250.0, 350.0, 500.0,
+            5.0, 9.0, 18.0, 28.0, 38.0, 55.0, 80.0, 130.0)
+        for (i in 0 until 32) for (ch in 0 until 3) pano.data[i * 3 + ch] = values[i].toFloat()
+        val rfs = FileScale.of(relative, pano)
+        t.check(!rfs.absolute, "a relative capture claims no units")
+        t.near(0.0, rfs.cdPerM2PerUnit, 1e-12, "and offers no conversion")
+        t.check(rfs.basis.contains("normalised"),
+            "but says what was done to it, so nobody reads it as a measurement")
+        // The median of that set, scaled, is one - the upper of the two middle
+        // values, which is the definition the normalisation states.
+        val scaled = values.map { rfs.apply(it) }.sorted()
+        t.nearRel(1.0, scaled[16], 1e-6, "a relative file is normalised to a median of one")
+        t.check(scaled[15] < 1.0 && scaled[17] > 1.0, "with half the sphere either side of it")
+
+        // Degenerate inputs must not produce a file of infinities.
+        t.nearRel(1.0, FileScale.of(relative, null).factor, 1e-12,
+            "with nothing to measure the median from, nothing is scaled")
+        val black = ImageF(4, 2, 3)
+        t.nearRel(1.0, FileScale.of(relative, black).factor, 1e-12,
+            "and an all-black sphere is left alone rather than divided by zero")
+    }
+
+    /**
+     * Decision 8: the EXR is written in linear Rec.709, not in the camera's own
+     * RGB.
+     *
+     * What it was before: the pipeline applied the white balance gains and
+     * stopped. Gains alone put a frame in the sensor's own primaries with a grey
+     * point moved - a space with no name - and a sphere written that way reads
+     * flat and undersaturated in anything that opens it. The camera has the
+     * missing half and reports it with every frame
+     * (COLOR_CORRECTION_TRANSFORM, defined as sensor RGB to linear sRGB and
+     * applied after exactly those gains); it was read for the preview and then
+     * dropped on the floor.
+     *
+     * Where it goes is the whole of it. The transform is handed to the pipeline
+     * and applied to the *merged* radiance; a bracket read off disk is still in
+     * the sensor's own numbers, because that is the domain the merge's saturation
+     * test is defined in. See HdriPipeline.Options.colorTransform, and the
+     * hdr-merge suite for what happens when that is got wrong.
+     */
+    private fun theFileIsInLinearRec709(t: TestKit) = inTemp("rec709") { dir ->
+        // A matrix of the shape a phone reports: strongly diagonal, negative off
+        // diagonals that pull the sensor's broad, overlapping filters apart, and
+        // rows that sum to one so that neutral maps to neutral. This one is the
+        // Pixel 9a's, as it reported it.
+        val m = doubleArrayOf(
+            1.59375, -0.4609375, -0.1328125,
+            -0.33203125, 1.44921875, -0.1171875,
+            -0.01171875, -1.0, 2.01171875)
+        for (row in 0 until 3) {
+            var sum = 0.0
+            for (col in 0 until 3) sum += m[row * 3 + col]
+            t.near(1.0, sum, 1e-9, "the matrix maps a neutral to a neutral")
+        }
+        val gains = doubleArrayOf(1.5622116327285767, 1.0, 1.6853481531143188)
+
+        val base = session(2, 1, CaptureTier.LINEAR_RAW)
+        val s = StoredSession(
+            cameraId = base.cameraId, tier = base.tier, intrinsics = base.intrinsics,
+            apertureN = base.apertureN, focalLengthMm = base.focalLengthMm,
+            sensorOrientationDeg = base.sensorOrientationDeg, cfa = base.cfa,
+            whiteLevel = base.whiteLevel, blackLevel = base.blackLevel,
+            baseIso = base.baseIso, plan = base.plan, note = base.note,
+            neutralGains = gains, colorMatrix = m)
+
+        // A grey card as the sensor sees it: not three equal numbers, but whatever
+        // the gains were measured to correct.
+        val store = FrameStore.create(dir, s)
+        val px = ImageF(2, 1, 3)
+        val grey = doubleArrayOf(0.40 / gains[0], 0.40, 0.40 / gains[2])
+        val red = doubleArrayOf(0.50, 0.22, 0.10)
+        for (c in 0 until 3) {
+            px.data[c] = grey[c].toFloat()
+            px.data[3 + c] = red[c].toFloat()
+        }
+        for (target in 0 until 2)
+            store.store(CapturedFrame(1L, target, 0, s.plan.settings(target, 0),
+                SO3.exp(Vec3(0.0, target * 0.5, 0.0)), 1000L, false), px)
+        store.close()
+
+        val back = FrameStore.open(dir)!!
+        t.arrayNear(m, back.session.colorMatrix ?: DoubleArray(9), 1e-12,
+            "the matrix survives the session header, or a reopened capture loses its colour")
+
+        // A bracket off disk is in the sensor's own numbers. Nothing has coloured
+        // it, because colouring it here is what broke the merge.
+        val bracket = StoredCapture.openBracketFor(back, 0)[0].image
+        t.nearRel(grey[0], bracket.data[0].toDouble(), 1e-3,
+            "a bracket read back is still in sensor RGB, uncoloured")
+        t.nearRel(grey[2], bracket.data[2].toDouble(), 1e-3, "in every channel")
+
+        // The transform the pipeline is handed is the two halves composed, in the
+        // order the camera defines them.
+        val tf = StoredCapture.colorTransformFor(back.session)
+        if (tf == null) { t.fail("a session with gains and a matrix must yield a transform"); return@inTemp }
+        t.eq(9L, tf.size.toLong(), "it is a 3x3")
+        fun apply(v: DoubleArray) = DoubleArray(3) { r ->
+            tf[r * 3] * v[0] + tf[r * 3 + 1] * v[1] + tf[r * 3 + 2] * v[2]
+        }
+        // Composition, checked against doing it in two steps by hand.
+        fun byHand(v: DoubleArray): DoubleArray {
+            val w = doubleArrayOf(v[0] * gains[0] / gains[1], v[1], v[2] * gains[2] / gains[1])
+            return DoubleArray(3) { r -> m[r * 3] * w[0] + m[r * 3 + 1] * w[1] + m[r * 3 + 2] * w[2] }
+        }
+        for (probe in listOf(grey, red, doubleArrayOf(0.1, 0.9, 0.3))) {
+            val a = apply(probe)
+            val b = byHand(probe)
+            for (c in 0 until 3)
+                t.nearRel(b[c], a[c], 1e-12,
+                    "one matrix does exactly what the gains and the matrix did in turn")
+        }
+
+        // A grey card comes out grey, at the level the green-anchored gains left
+        // it. This is what protects the absolute scale: the cd/m2 conversion is
+        // calibrated against green, and a transform that moved a neutral would
+        // invalidate every luminance the report quotes while changing nothing a
+        // reader could see.
+        val neutral = apply(grey)
+        t.nearRel(neutral[0], neutral[1], 1e-6, "a grey card stays grey")
+        t.nearRel(neutral[0], neutral[2], 1e-6, "in all three channels")
+        t.nearRel(0.40, neutral[1], 1e-6, "at the level the white balance left it")
+
+        // And the colour actually moves. A transform that changes nothing is the
+        // bug, not the fix: a phone sensor's filters overlap far more than
+        // Rec.709's primaries, so nothing but the matrix pulls a red patch off
+        // green.
+        val warm = apply(red)
+        val gainsOnly = doubleArrayOf(red[0] * gains[0] / gains[1], red[1],
+            red[2] * gains[2] / gains[1])
+        t.greaterThan(warm[0] / warm[1], gainsOnly[0] / gainsOnly[1],
+            "a red patch is redder against green than white balance alone made it")
+
+        // A capture with no matrix is still a capture, and says so rather than
+        // inventing one.
+        t.check(StoredCapture.colorTransformFor(base) == null,
+            "a camera that reported no matrix yields no transform")
+        t.check(StoredCapture.optionsFor(base, 512).colorTransform == null,
+            "and the pipeline is told to leave the radiance in camera RGB")
+        t.check(StoredCapture.optionsFor(back.session, 512).colorTransform != null,
+            "while a capture that has one gets it")
     }
 
     /**

@@ -5,7 +5,9 @@ import com.immineal.hdri360.core.capture.CapturedFrame
 import com.immineal.hdri360.core.capture.CaptureTier
 import com.immineal.hdri360.core.capture.FrameStore
 import com.immineal.hdri360.core.capture.StoredSession
+import com.immineal.hdri360.core.hdr.BracketConfig
 import com.immineal.hdri360.core.hdr.BracketPlan
+import com.immineal.hdri360.core.hdr.BracketPlanner
 import com.immineal.hdri360.core.hdr.DeviceExposureLimits
 import com.immineal.hdri360.core.hdr.ExposureLadder
 import com.immineal.hdri360.core.hdr.ExposureSettings
@@ -41,6 +43,9 @@ class FrameStoreSuite : TestCase {
         missingAndTruncatedFrames(t)
         partialWritesNeverSurface(t)
         planSurvivesExactly(t)
+        aLadderThatGrewIsWrittenDown(t)
+        theColourMatrixSurvives(t)
+        aTrimmedBracketLeavesNothingBehind(t)
         refusesWhenFull(t)
         survivesADisappearingDirectory(t)
         twoWritersOneFrame(t)
@@ -267,6 +272,144 @@ class FrameStoreSuite : TestCase {
      * Running out of space must fail the frame, not the capture. Returning false
      * makes the controller retry the direction; throwing would lose the sphere.
      */
+    /**
+     * A ladder that grew mid-capture has to reach the disk.
+     *
+     * The plan is written before the first frame precisely so an interrupted
+     * capture resumes on the same ladder. Decision 1 makes that plan a moving
+     * thing: a direction that comes back burnt out gets a shorter rung, and its
+     * bracket is then one frame longer than the header says. A header that never
+     * heard about it is a header that would read the direction back a rung short
+     * - the one rung that was added because the direction burnt out without it.
+     */
+    private fun aLadderThatGrewIsWrittenDown(t: TestKit) = inTemp("grew") { dir ->
+        val s = session(targets = 4, rungs = 3)
+        val store = FrameStore.create(dir, s)
+
+        // Direction 1 came back on the rail, so the ladder gained a rung below
+        // its darkest and only that direction's bracket was lengthened.
+        val limits = DeviceExposureLimits(1.0 / 17554, 16.0, 29, 7276, 29, 1.7, 1.0 / 15.0)
+        val grown = BracketPlanner.extendDarker(s.plan, 1, limits, BracketConfig(),
+            s.plan.ladder.relativeExposure(s.plan.indicesPerTarget[1][0]) / 8.0)
+        if (grown == null) { t.fail("this device has shutter left to spend"); return@inTemp }
+        t.greaterThan(grown.indicesPerTarget[1].size.toDouble(),
+            s.plan.indicesPerTarget[1].size.toDouble(), "the direction's bracket really did grow")
+
+        store.planChanged(grown)
+        t.eq(grown.ladder.size().toLong(), store.session.plan.ladder.size().toLong(),
+            "the store is now on the longer ladder")
+
+        // Every rung of the grown bracket, including the new shortest.
+        for (k in grown.indicesPerTarget[1].indices)
+            t.check(store.store(CapturedFrame(99L, 1, k,
+                grown.ladder.steps[grown.indicesPerTarget[1][k]],
+                SO3.exp(Vec3(0.0, 0.3, 0.0)), 5_000_000L + k, true), pixels(k)),
+                "rung $k of the re-shot direction was stored")
+        store.close()
+
+        val back = FrameStore.open(dir) ?: run { t.fail("the session did not reopen"); return@inTemp }
+        t.eq(grown.ladder.size().toLong(), back.session.plan.ladder.size().toLong(),
+            "a capture resumed after the growth comes back on the ladder it grew to")
+        t.eq(grown.indicesPerTarget[1].size.toLong(),
+            back.session.plan.indicesPerTarget[1].size.toLong(),
+            "with the direction that burnt out still one rung longer")
+        for (i in grown.indicesPerTarget.indices)
+            t.arrayNear(grown.indicesPerTarget[i].map { it.toDouble() }.toDoubleArray(),
+                back.session.plan.indicesPerTarget[i].map { it.toDouble() }.toDoubleArray(), 0.0,
+                "and every direction pointing at the rungs it was pointing at")
+        t.check(back.shotMask()[1],
+            "the re-shot direction reads as complete, which it is only on the grown plan")
+        t.check(!back.shotMask()[0], "and one that was never shot does not")
+
+        // The header is the only account of what a capture is. Rewriting it may
+        // not leave a directory that cannot be opened at all.
+        t.eq(1L, dir.listFiles { f -> f.name == FrameStore.SESSION }!!.size.toLong(),
+            "there is exactly one session header afterwards")
+        t.eq(0L, dir.listFiles { f -> f.name.endsWith(".part") }!!.size.toLong(),
+            "and no debris from writing it")
+    }
+
+    /**
+     * Decision 8 needs the matrix to still be there when the frames are read.
+     *
+     * The camera reports it once, before the capture locks to manual, and it is
+     * gone the moment the process is. Everything downstream that turns sensor RGB
+     * into Rec.709 depends on it being in the header alongside the gains it
+     * pairs with - and a capture that lost it cannot be recovered afterwards,
+     * because there is nothing in the frames themselves that says what the
+     * sensor's primaries were.
+     */
+    private fun theColourMatrixSurvives(t: TestKit) = inTemp("colour") { dir ->
+        val base = session()
+        val m = doubleArrayOf(1.75, -0.62, -0.13, -0.28, 1.44, -0.16, -0.05, -0.55, 1.60)
+        val s = StoredSession(
+            cameraId = base.cameraId, tier = base.tier, intrinsics = base.intrinsics,
+            apertureN = base.apertureN, focalLengthMm = base.focalLengthMm,
+            sensorOrientationDeg = base.sensorOrientationDeg, cfa = base.cfa,
+            whiteLevel = base.whiteLevel, blackLevel = base.blackLevel,
+            baseIso = base.baseIso, plan = base.plan, note = base.note,
+            neutralGains = doubleArrayOf(1.9, 1.0, 1.7), colorMatrix = m)
+        FrameStore.create(dir, s).close()
+
+        val back = FrameStore.open(dir) ?: run { t.fail("the session did not reopen"); return@inTemp }
+        t.arrayNear(m, back.session.colorMatrix ?: DoubleArray(9), 0.0,
+            "the colour matrix comes back exactly as the camera reported it")
+        t.arrayNear(doubleArrayOf(1.9, 1.0, 1.7), back.session.neutralGains ?: DoubleArray(3), 0.0,
+            "alongside the gains it is only meaningful with")
+
+        // A capture recorded before there was a matrix is still a capture.
+        val older = tempDir("colour-old")
+        try {
+            FrameStore.create(older, base).close()
+            val old = FrameStore.open(older) ?: run { t.fail("the older session did not reopen"); return@inTemp }
+            t.check(old.session.colorMatrix == null,
+                "a capture with no matrix reads back with none, rather than a made-up one")
+        } finally {
+            wipe(older)
+        }
+    }
+
+    /**
+     * A direction whose bracket got shorter leaves no files behind.
+     *
+     * Growing a direction at the dark end can push it past
+     * `BracketConfig.maxPerTarget`, and the planner then trims it at the bright
+     * end - the same trade it makes everywhere, a blown highlight being
+     * unrecoverable where a noisy shadow is merely noisy. The re-shot burst
+     * therefore writes fewer positions than the previous attempt, and the file at
+     * the old last position stays on disk.
+     *
+     * Nothing reads it: the plan says how many rungs a direction has and the
+     * reader stops there. But a capture is three gigabytes of frames and the
+     * library offers to delete spheres by size, so a file nobody will ever open
+     * still costs the person the decision.
+     */
+    private fun aTrimmedBracketLeavesNothingBehind(t: TestKit) = inTemp("trim") { dir ->
+        val s = session(targets = 2, rungs = 4)
+        val store = FrameStore.create(dir, s)
+        for (k in 0 until 4)
+            t.check(store.store(frame(s, 0, k), pixels(k)), "rung $k was stored")
+        t.eq(4L, store.frameCount().toLong(), "four rungs on disk to begin with")
+
+        // The same ladder, with that direction's run one shorter - which is what a
+        // trim at the bright end produces.
+        val short = BracketPlan(s.plan.ladder,
+            arrayOf(IntArray(3) { it }, s.plan.indicesPerTarget[1]))
+        store.planChanged(short)
+
+        t.eq(3L, store.frameCount().toLong(), "the frame the plan no longer wants is gone")
+        t.check(!File(dir, "t000_b3.hrf").exists(), "and so is its file")
+        for (k in 0 until 3)
+            t.check(File(dir, "t000_b$k.hrf").exists(), "while rung $k is untouched")
+        t.check(store.shotMask()[0], "the direction still reads as completely shot")
+
+        store.close()
+        val back = FrameStore.open(dir) ?: run { t.fail("it did not reopen"); return@inTemp }
+        t.eq(3L, back.frameCount().toLong(),
+            "and a reopened capture does not resurrect it from the journal")
+        t.check(back.shotMask()[0], "still complete on the shorter plan")
+    }
+
     private fun refusesWhenFull(t: TestKit) = inTemp("full") { dir ->
         val s = session()
         val store = FrameStore.create(dir, s)

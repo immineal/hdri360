@@ -92,9 +92,21 @@ class PanoramaView(context: Context) : GLSurfaceView(context) {
                 // Slower when zoomed in, so the same finger travel is the same
                 // distance across the picture however close you are looking.
                 val speed = DRAG_SPEED * (renderer.halfFov / DEFAULT_FOV)
-                renderer.yaw -= dx * speed
-                // Stop short of the poles: looking straight up loses the horizon
-                // reference and the drag becomes impossible to reason about.
+                // Plus, not minus. Increasing yaw turns the view toward +X, which
+                // is the viewer's left, and dragging right has to bring what was
+                // on the left into view - the content follows the finger, as it
+                // does with a photograph on a table.
+                //
+                // It was minus while the ray was mirrored, and the two wrongs
+                // cancelled: the drag felt right, so nothing pointed at the
+                // mirror. Fixing one without the other would have traded a
+                // mirrored sphere for a viewer that fights the hand.
+                renderer.yaw += dx * speed
+                // Both axes, whether or not the phone is steering. It used to be
+                // yaw only while following, on the theory that a dragged pitch
+                // would fight the hand - it does not. What it does is shift the
+                // horizon, which is exactly what somebody standing in the wrong
+                // spot wants, and "Reset view" is right there to undo it.
                 renderer.pitch = Math.max(-1.45, Math.min(1.45, renderer.pitch - dy * speed))
                 requestRender()
             }
@@ -113,6 +125,31 @@ class PanoramaView(context: Context) : GLSurfaceView(context) {
             MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> pointer = -1
         }
         return true
+    }
+
+    /**
+     * Look around by turning the phone, or by dragging.
+     *
+     * The sphere anchors to the room when this is on, because the heading the
+     * capture recorded and the heading the sensor reads are the same magnetic
+     * north - stand where it was shot, turn, and the room is where the room is.
+     * Zoom and drag keep working either way; the drag becomes a heading
+     * correction, which is what indoor compass error needs.
+     */
+    var followDevice: Boolean = false
+        set(v) {
+            field = v
+            if (!v) renderer.devicePose = null
+            requestRender()
+        }
+
+    /** The screen's pose, row-major, from OrientationMath.screenToWorld. */
+    fun onDevicePose(rowMajor: DoubleArray) {
+        if (!followDevice) return
+        val f = FloatArray(9)
+        for (i in 0 until 9) f[i] = rowMajor[i].toFloat()
+        renderer.devicePose = f
+        requestRender()
     }
 
     /** Back to the whole view, for when a pinch has left someone lost. */
@@ -138,6 +175,18 @@ private class PanoramaRenderer : GLSurfaceView.Renderer {
     @Volatile var halfFov = 0.7
     @Volatile var yaw = 0.0
     @Volatile var pitch = 0.0
+
+    /**
+     * The screen's own pose, when the sphere is being looked at by turning the
+     * phone rather than by dragging.
+     *
+     * Null means the drag is the only thing steering. When it is set, the drag's
+     * yaw becomes a heading *offset* on top of it - useful because the panorama's
+     * north is only as good as the compass was during the capture, and indoors
+     * that can be tens of degrees out. Pitch then comes from the phone alone:
+     * offering two sources of pitch at once is a view that fights the hand.
+     */
+    @Volatile var devicePose: FloatArray? = null
 
     private var program = 0
     private var texture = 0
@@ -191,7 +240,43 @@ private class PanoramaRenderer : GLSurfaceView.Renderer {
     /** Column-major, as OpenGL wants it. Yaw about up, then pitch about right. */
     private fun viewMatrix(): FloatArray {
         val cy = Math.cos(yaw).toFloat(); val sy = Math.sin(yaw).toFloat()
-        val cp = Math.cos(pitch).toFloat(); val sp = Math.sin(pitch).toFloat()
+        val cpi = Math.cos(pitch).toFloat(); val spi = Math.sin(pitch).toFloat()
+        val pose = devicePose
+        if (pose != null && pose.size == 9) {
+            // Ry(yaw) * screenToWorld * Rx(pitch).
+            //
+            // The two drags do different jobs and are applied on different sides
+            // on purpose. Yaw goes on the *world* side, so dragging left and
+            // right turns the room around the viewer - it is a correction to the
+            // sphere's own heading, which indoors is frequently what needs
+            // correcting. Pitch goes on the *camera* side, so dragging up and
+            // down looks further up or down from wherever the phone happens to
+            // point: it shifts the horizon and it stays "up relative to the
+            // phone" as the phone turns. On the world side it would roll the
+            // horizon whenever you looked sideways.
+            val out = FloatArray(9)
+            // Rx(pitch) columns, in the camera frame.
+            val rx = floatArrayOf(
+                1f, 0f, 0f,
+                0f, cpi, spi,
+                0f, -spi, cpi)
+            for (c in 0 until 3) {
+                // Column c of pose * Rx(pitch): combine the pose's columns by
+                // the c-th column of Rx.
+                val a = rx[c * 3]
+                val b = rx[c * 3 + 1]
+                val d = rx[c * 3 + 2]
+                val x = pose[0] * a + pose[1] * b + pose[2] * d
+                val y = pose[3] * a + pose[4] * b + pose[5] * d
+                val z = pose[6] * a + pose[7] * b + pose[8] * d
+                // Then Ry(yaw) on the world side, column-major out.
+                out[c * 3] = cy * x + sy * z
+                out[c * 3 + 1] = y
+                out[c * 3 + 2] = -sy * x + cy * z
+            }
+            return out
+        }
+        val cp = cpi; val sp = spi
         // R = Ry(yaw) * Rx(pitch)
         return floatArrayOf(
             cy, 0f, -sy,
@@ -270,6 +355,19 @@ void main() {
          * direction = (-sin(lon) cos(lat), sin(lat), cos(lon) cos(lat)), so the
          * longitude comes back as atan(-x, z) and a viewer built on the usual
          * atan(x, z) would show the whole sphere mirrored.
+         *
+         * The other half of that, which shipped wrong: the world's +X is the
+         * viewer's *left*, because the frame is right-handed with +Y up and +Z
+         * the heading, so X = Y x Z points away from the hand you point with.
+         * Building the ray with screen-right as +X therefore mapped the right of
+         * the screen onto the left of the room, and looking around showed the
+         * mirror image of a file that was itself correct.
+         *
+         * Nothing in the suite could catch it, because every test compared the
+         * projection with its own inverse and the two agreed. What settled it was
+         * a garden: reading the finished panorama left to right is what you see
+         * turning to your right where you stood, which the equirect suite now
+         * states as a fact rather than leaving implied.
          */
         private const val FRAGMENT = """#version 300 es
 precision highp float;
@@ -283,7 +381,8 @@ out vec4 fragColor;
 const float PI = 3.14159265359;
 void main() {
     float t = uFov;
-    vec3 dirCam = normalize(vec3(vNdc.x * t * uAspect, vNdc.y * t, 1.0));
+    // Negated, because the world's +X is the viewer's left. See above.
+    vec3 dirCam = normalize(vec3(-vNdc.x * t * uAspect, vNdc.y * t, 1.0));
     vec3 d = normalize(uView * dirCam);
     float lon = atan(-d.x, d.z);
     float lat = asin(clamp(d.y, -1.0, 1.0));

@@ -25,6 +25,7 @@ class OrientationSuite : TestCase {
     override fun name(): String = "orientation"
 
     override fun run(t: TestKit) {
+        holdingThePhoneUpAsAWindow(t)
         val r = t.rng(4711)
 
         // --- rotation vector decoding ---------------------------------------
@@ -231,5 +232,59 @@ class OrientationSuite : TestCase {
         if (d > 180) d -= 360
         if (d < -180) d += 360
         return d
+    }
+
+    /**
+     * Looking at a finished sphere by turning the phone.
+     *
+     * A different rotation from the capture's. `cameraToWorld` gives the pose of
+     * the *sensor*, which is mounted a quarter turn from the way the phone is
+     * held; a viewer wants the pose of the *screen*, held up as a window with the
+     * world behind it. Two frames, one device, and mixing them gives a viewer
+     * that works in portrait and lies in landscape.
+     *
+     * The view's own frame is the panorama's: +Y up, +Z where you are looking,
+     * +X to your left because the frame is right-handed. In device terms, held as
+     * a window:
+     *
+     *   forward  = out of the back of the phone     = -Z of the device
+     *   up       = up the screen                    = +Y of the device
+     *   left     = up x forward = (+Y) x (-Z)       = -X of the device
+     *
+     * which is a half turn about the device's own up axis, determinant +1 - a
+     * rotation and not a reflection. Getting that wrong is how a viewer comes out
+     * mirrored, which this app has already shipped once.
+     */
+    private fun holdingThePhoneUpAsAWindow(t: TestKit) {
+        val forward = Vec3(0.0, 0.0, 1.0)
+        val up = Vec3(0.0, 1.0, 0.0)
+
+        // Upright, back of the phone facing the reference heading. Android's
+        // world frame is east, north, up; the identity device rotation is a phone
+        // lying face up with its top pointing north, so standing it up to face
+        // north is a quarter turn about east.
+        val standUp = Quat.fromMat3(SO3.exp(Vec3(Math.PI / 2, 0.0, 0.0)))
+        val view = OrientationMath.screenToWorld(standUp)
+        t.near(1.0, view.det(), 1e-9, "the view pose is a rotation, not a reflection")
+        val looking = view.mul(forward)
+        t.greaterThan(looking.dot(forward), 0.99,
+            "a phone stood up with its back to the heading looks along the heading")
+        t.greaterThan(view.mul(up).dot(up), 0.99, "and its up is up")
+
+        // Turned to the person's right, the view turns with it, and the sphere
+        // therefore stays where the room is. That anchoring is the whole point:
+        // the panorama's heading and the device's heading are the same frame.
+        val right = forward.cross(up)                  // -X, the viewer's right
+        val turned = Quat.fromMat3(
+            SO3.exp(Vec3(0.0, 0.0, -Math.PI / 2)).mul(SO3.exp(Vec3(Math.PI / 2, 0.0, 0.0))))
+        val afterTurn = OrientationMath.screenToWorld(turned).mul(forward)
+        t.greaterThan(afterTurn.dot(right), 0.9,
+            "turning the phone to the right looks to the right of the room")
+        t.lessThan(Math.abs(afterTurn.dot(up)), 0.15, "without tipping up or down")
+
+        // Tipped back to look at the ceiling.
+        val tipped = Quat.fromMat3(SO3.exp(Vec3(Math.PI, 0.0, 0.0)))
+        t.greaterThan(OrientationMath.screenToWorld(tipped).mul(forward).dot(up), 0.9,
+            "laying the phone face up looks at the ceiling")
     }
 }

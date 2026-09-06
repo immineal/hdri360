@@ -32,6 +32,21 @@ class DeviceExposureLimits(
     fun maxRelativeExposure(): Double = maxExposureTimeSec * maxIso / baseIso.toDouble()
 
     /**
+     * The most exposure a hand can gather: the longest holdable shutter at full
+     * gain.
+     *
+     * Distinct from [maxRelativeExposure], which is what the sensor allows on a
+     * tripod. [realize] deliberately falls back to a longer shutter once ISO is
+     * exhausted, and for a tripod that is right - but a ladder that clamps its
+     * bright end to the sensor's limit will plan frames nobody can take. In a
+     * dim room it planned a one second exposure to be shot handheld as part of a
+     * four rung burst, which outlasted the controller's own patience and killed
+     * the capture on every direction.
+     */
+    fun maxHandheldRelativeExposure(): Double =
+        maxHandheldTimeSec * maxIso / baseIso.toDouble()
+
+    /**
      * Nearest achievable settings for a requested relative exposure.
      *
      * Policy, in order: spend shutter time at base ISO for the cleanest signal;

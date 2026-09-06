@@ -1,0 +1,72 @@
+<?xml version="1.0" encoding="UTF-8" standalone="no"?>
+<!--
+  360 HDRI, the mark as the app now uses it.
+
+  The document is 108 x 108 units on purpose: that is exactly the Android
+  adaptive icon canvas, so anything you move in here transfers to the app
+  verbatim. Edit a handle, save, and the `d` attribute can be copied straight
+  into app/src/main/res/drawable/ic_launcher_foreground.xml with no arithmetic
+  in between.
+
+  Two things worth knowing before you drag anything:
+
+  - Only the middle 72 units are guaranteed to be visible. A launcher crops the
+    canvas to whatever shape it likes - circle, squircle, rounded square - so
+    the ring at radius 30 about (54, 54) is deliberately well inside. Push a
+    curve past radius 34 and some phones will clip it.
+  - The stroke widths are the reason the mark survives at 48dp. 2.9 units reads
+    down to about 96 pixels; your original 0.26 disappeared entirely. If you
+    thin them, look at it small before you keep it.
+
+  The curves themselves are yours, from logoidea.svg, scaled once by
+  30/54.762459 about your circle's centre. The digits are separate paths rather
+  than one, so a handle can be moved without disturbing its neighbours.
+-->
+<svg
+   xmlns="http://www.w3.org/2000/svg"
+   xmlns:svg="http://www.w3.org/2000/svg"
+   xmlns:inkscape="http://www.inkscape.org/namespaces/inkscape"
+   xmlns:sodipodi="http://sodipodi.sourceforge.net/DTD/sodipodi-0.dtd"
+   width="108"
+   height="108"
+   viewBox="0 0 108 108"
+   version="1.1"
+   sodipodi:docname="logo.svg">
+
+  <sodipodi:namedview
+     pagecolor="#101014"
+     bordercolor="#666666"
+     inkscape:document-units="px"
+     inkscape:showpageshadow="0"
+     inkscape:pagecheckerboard="0" />
+
+  <!-- Hide this layer to see the mark as a launcher will mask it. -->
+  <g inkscape:label="ground" inkscape:groupmode="layer" id="layer-ground">
+    <rect id="ground" x="0" y="0" width="108" height="108" fill="#101014" />
+    <!-- The safe zone: nothing outside this circle is promised to be drawn. -->
+    <circle id="safe-zone" cx="54" cy="54" r="36" fill="none"
+            stroke="#FF8A80" stroke-width="0.3" stroke-dasharray="1.5,1.5"
+            opacity="0.5" />
+  </g>
+
+  <g inkscape:label="mark" inkscape:groupmode="layer" id="layer-mark">
+    <!-- The sphere. Lighter than the digits: it is what they sit in. -->
+    <circle
+       id="sphere"
+       cx="54" cy="54" r="30"
+       fill="none" stroke="#ECECEC" stroke-width="2.8" />
+
+    <g id="digits" fill="none" stroke="#FFC400" stroke-width="2.9"
+       stroke-linecap="round" stroke-linejoin="round">
+      <path
+         id="three"
+         d="m 29.7658,44.5405 c 10.0850,-17.8616 19.8951,-7.9627 9.7297,9.1892 10.3205,19.7481 -2.6835,26.9921 -9.7297,7.3874" />
+      <path
+         id="six"
+         d="m 63.2793,30.3063 c -7.2258,-3.6548 -18.8393,-2.5948 -17.2973,0.5405 13.2835,27.0086 -9.2376,50.1045 8.1081,49.9099 17.3457,-0.1946 12.1966,-24.8649 -3.9640,-24.8649" />
+      <path
+         id="zero"
+         d="m 71.2072,35.5315 c -3.5657,-2.0711 -5.3497,-2.0239 -7.5676,1.0811 -7.0924,9.9293 3.2042,16.1579 4.8649,26.4865 1.6147,10.0429 5.0000,11.9470 9.5495,2.1622 5.9425,-12.7807 -0.4539,-23.3367 -6.8468,-29.7297 z" />
+    </g>
+  </g>
+</svg>

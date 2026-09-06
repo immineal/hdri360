@@ -1,5 +1,6 @@
 package com.immineal.hdri360.test.suites
 
+import com.immineal.hdri360.core.hdr.ExposureSettings
 import com.immineal.hdri360.core.hdr.MeterConfig
 import com.immineal.hdri360.core.hdr.SceneMeter
 import com.immineal.hdri360.core.hdr.SceneStats
@@ -35,7 +36,46 @@ class MeteringSuite : TestCase {
         return r
     }
 
+
+    /**
+     * A long exposure has to print as a long exposure.
+     *
+     * The format was `1/%.0f` of the shutter, unconditionally, which is right up
+     * to about half a second and nonsense past it: two seconds prints as `1/0s`
+     * and so does sixteen. It reached the log of a real capture -
+     * `1/3s ISO7276 | 1/0s ISO7276 | 1/0s ISO7276` - during the evening spent
+     * working out why bursts were timing out, where a diagnostic that rounds the
+     * offending number to zero is worse than none. Two different exposures, three
+     * stops apart, printed identically.
+     */
+    private fun anExposureNeverPrintsItselfAsALie(t: TestKit) {
+        // The fraction form, where it belongs.
+        t.eq("1/30s ISO100 f/1.7", ExposureSettings(1.0 / 30.0, 100, 1.7).toString(),
+            "an ordinary handheld shutter reads as a fraction")
+        t.eq("1/1695s ISO29 f/1.7", ExposureSettings(1.0 / 1695.0, 29, 1.7).toString(),
+            "and so does a very short one")
+
+        // Past half a second the fraction stops carrying information.
+        for (secs in doubleArrayOf(0.6, 1.0, 1.5, 2.0, 4.0, 16.0)) {
+            val said = ExposureSettings(secs, 7276, 1.7).toString()
+            t.check(!said.contains("1/0s"),
+                "a $secs second exposure does not print as 1/0s: " + said)
+            t.check(said.contains("s ISO7276"), "and still says what it was: " + said)
+        }
+        t.eq("2.0s ISO7276 f/1.7", ExposureSettings(2.0, 7276, 1.7).toString(),
+            "two seconds says two seconds")
+        t.eq("16.0s ISO7276 f/1.7", ExposureSettings(16.0, 7276, 1.7).toString(),
+            "and sixteen says sixteen")
+
+        // The two that used to collide are now distinguishable, which is the
+        // whole point of writing them down.
+        t.check(ExposureSettings(2.0, 7276, 1.7).toString() !=
+                ExposureSettings(16.0, 7276, 1.7).toString(),
+            "three stops apart no longer print the same")
+    }
+
     override fun run(t: TestKit) {
+        anExposureNeverPrintsItselfAsALie(t)
         val cfg = MeterConfig()
 
         // --- an exposure that sees everything -----------------------------
@@ -166,5 +206,77 @@ class MeteringSuite : TestCase {
             t.lessThan(Math.abs(Math.log(after / alone) / Math.log(2.0)), 2.0,
                 "sweeping past a window moves the viewfinder by under two stops")
         }
+
+        countingWhatReachedTheTop(t)
+    }
+
+    /**
+     * The same question as [SceneMeter.measure] asks about highlights, put to a
+     * frame far too big to sort.
+     *
+     * A capture asks this of every bracket's shortest rung, on the camera thread,
+     * of twelve megapixels, between two exposures of a burst - and answers it by
+     * adding a shorter rung and shooting that direction again. Sorting twelve
+     * million floats three times to learn a count is not a thing that can happen
+     * there, so the count is taken directly; what has to hold is that it says the
+     * same thing about a frame as the metering path does.
+     */
+    private fun countingWhatReachedTheTop(t: TestKit) {
+        val cfg = MeterConfig()
+
+        // Across a range of exposures from far under to far over, the cheap count
+        // and the sorted measurement must reach the same verdict.
+        val sc = scene(1.0, 1000.0, 4001)
+        var agreed = 0
+        var sawBoth = 0
+        var everClipped = false
+        var everClear = false
+        for (i in 0 until 24) {
+            val rel = 1e-4 * Math.pow(2.0, i / 2.0)
+            val frame = expose(sc, rel)
+            val measured = SceneMeter.measure(frame, rel, cfg)
+            val counted = SceneMeter.clippedFraction(frame, cfg)
+            t.near(measured.clippedFraction, counted, 1e-12,
+                "the count is the fraction measure() counts")
+            if (SceneMeter.highlightsClipped(counted, cfg) == measured.highlightsClipped) agreed++
+            sawBoth++
+            everClipped = everClipped or measured.highlightsClipped
+            everClear = everClear or !measured.highlightsClipped
+        }
+        t.eq(sawBoth.toLong(), agreed.toLong(),
+            "and reaches the same verdict at every exposure from under to over")
+        t.check(everClipped && everClear, "with both verdicts actually exercised")
+
+        // A handful of stuck pixels is not a blown highlight. Every sensor has
+        // some, no shutter speed removes them, and treating them as clipping is
+        // what sends an exposure controller down through its whole range.
+        val speckled = ImageF(1000, 1, 1)
+        java.util.Arrays.fill(speckled.data, 0.3f)
+        speckled.data[0] = 1.0f
+        val speckle = SceneMeter.clippedFraction(speckled, cfg)
+        t.near(0.001, speckle, 1e-9, "one pixel in a thousand is on the rail")
+        t.check(!SceneMeter.highlightsClipped(0.0009, cfg), "a speckle is not a blown highlight")
+        t.check(SceneMeter.highlightsClipped(0.05, cfg), "five percent of the frame is")
+
+        // A colour frame is judged on its luminance, as measure() judges it, and a
+        // Bayer mosaic on the plane itself - the frames a capture actually
+        // delivers are one or the other.
+        val colour = ImageF(4, 4, 3)
+        java.util.Arrays.fill(colour.data, 1.0f)
+        t.near(1.0, SceneMeter.clippedFraction(colour, cfg), 1e-12,
+            "a white colour frame is entirely clipped")
+        val green = ImageF(4, 4, 3)
+        for (i in 0 until 16) green.data[i * 3 + 1] = 1.0f
+        t.near(0.0, SceneMeter.clippedFraction(green, cfg), 1e-12,
+            "green alone at the rail is not a clipped luminance")
+
+        // The step away from a rail is sized from how much of the frame is on it,
+        // and is the one the sweep uses - one policy, not two.
+        t.greaterThan(SceneMeter.clippedStepDown(0.9), SceneMeter.clippedStepDown(0.1),
+            "a frame mostly on the rail steps further than one barely on it")
+        val badly = SceneStats(1.0, 100.0, 10.0, 0.9, 0.0, true, false)
+        t.near(1.0 / SceneMeter.clippedStepDown(0.9),
+            SceneMeter.suggestRelativeExposure(badly, 1.0, cfg), 1e-12,
+            "and it is exactly the step the sweep takes")
     }
 }

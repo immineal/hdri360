@@ -82,15 +82,73 @@ object SceneMeter {
         return target / anchor
     }
 
+    /**
+     * How much of a frame reached the top of the scale.
+     *
+     * One counting pass and no allocation, because this is asked of every
+     * bracket's shortest rung on the camera thread, of a twelve megapixel frame,
+     * while the next exposure of the burst is waiting. [measure] answers the same
+     * question by sorting twelve million floats three times, which is the right
+     * trade for an eight by eight metering thumbnail and the wrong one here.
+     *
+     * Luminance for a colour frame and the plane itself for a Bayer mosaic,
+     * which is what [measure] does with the same pixels.
+     */
+    @JvmStatic
+    fun clippedFraction(frame: ImageF, cfg: MeterConfig): Double {
+        val n = frame.width * frame.height
+        if (n <= 0) return 0.0
+        val c = frame.channels
+        val d = frame.data
+        val threshold = cfg.saturationThreshold.toFloat()
+        var clipped = 0
+        for (i in 0 until n) {
+            val b = i * c
+            val v = if (c >= 3) ImageOps.LUMA_R * d[b] + ImageOps.LUMA_G * d[b + 1] +
+                                ImageOps.LUMA_B * d[b + 2]
+                    else d[b]
+            if (v >= threshold) clipped++
+        }
+        return clipped / n.toDouble()
+    }
+
+    /**
+     * Whether that count is a blown highlight rather than the handful of stuck
+     * pixels every sensor has.
+     *
+     * Two thresholds, for the reason [measure] gives: a bare count also catches
+     * the dead pixels no shutter speed removes, so the fraction must additionally
+     * be big enough to put the high quantile itself on the rail - which is what
+     * "at least one minus [MeterConfig.highPercentile] of the frame" means.
+     */
+    @JvmStatic
+    fun highlightsClipped(clippedFraction: Double, cfg: MeterConfig): Boolean =
+        clippedFraction > cfg.clipTolerance && clippedFraction >= 1.0 - cfg.highPercentile
+
+    /**
+     * How far down to step away from a frame that came back on the rail.
+     *
+     * A clipped frame carries no gradient at the top - it says only that the
+     * scene is brighter than the sensor could read - so the step cannot be
+     * solved for and is sized from how much of the frame is saturated instead.
+     *
+     * One policy, used both by the sweep walking its probe down and by a capture
+     * adding a shorter rung to a direction that burnt out.
+     */
+    @JvmStatic
+    fun clippedStepDown(clippedFraction: Double): Double = when {
+        clippedFraction > 0.20 -> 8.0
+        clippedFraction > 0.05 -> 4.0
+        else -> 2.0
+    }
+
     /** Next relative exposure to probe with. */
     @JvmStatic
     fun suggestRelativeExposure(s: SceneStats, current: Double, cfg: MeterConfig): Double {
         if (s.highlightsClipped) {
             // No usable signal at the top: step down by an amount sized from how
             // much of the frame is on the rail.
-            if (s.clippedFraction > 0.20) return current / 8.0
-            if (s.clippedFraction > 0.05) return current / 4.0
-            return current / 2.0
+            return current / clippedStepDown(s.clippedFraction)
         }
         val hv = if (s.highValue.isNaN()) 0.0 else s.highValue
         if (hv < 1e-9) return current * cfg.aeMaxStep

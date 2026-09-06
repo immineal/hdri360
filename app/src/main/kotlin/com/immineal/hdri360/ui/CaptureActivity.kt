@@ -13,6 +13,16 @@ import androidx.activity.compose.BackHandler
 import androidx.activity.compose.setContent
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.background
+import androidx.compose.foundation.BorderStroke
+import androidx.compose.foundation.Image
+import androidx.compose.foundation.border
+import androidx.compose.foundation.clickable
+import androidx.compose.foundation.layout.width
+import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.ui.draw.clip
+import androidx.compose.ui.graphics.asImageBitmap
+import androidx.compose.ui.layout.ContentScale
+import com.immineal.hdri360.core.capture.SphereLibrary
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.size
@@ -43,7 +53,10 @@ import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
+import androidx.compose.material3.AlertDialog
 import androidx.compose.ui.Alignment
+import androidx.compose.ui.semantics.contentDescription
+import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalContext
@@ -54,6 +67,9 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.compose.ui.viewinterop.AndroidView
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
+import com.immineal.hdri360.core.capture.Lens
+import com.immineal.hdri360.core.capture.LensChooser
+import com.immineal.hdri360.core.pipeline.StageProgress
 import com.immineal.hdri360.device.CaptureSession
 import com.immineal.hdri360.device.CaptureUiState
 import com.immineal.hdri360.device.Diagnostics
@@ -61,6 +77,7 @@ import com.immineal.hdri360.device.ProcessingService
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 import java.io.File
+import java.util.Locale
 
 /**
  * The capture screen.
@@ -103,22 +120,87 @@ class CaptureActivity : ComponentActivity() {
                             == PackageManager.PERMISSION_GRANTED)
                     }
                     val ask = rememberLauncherForPermission { granted = it }
+
+                    // Processing runs as a foreground service and its whole
+                    // visible presence is one notification. From Android 13 that
+                    // notification needs permission, which this app declared and
+                    // never asked for - so on a current phone somebody handed a
+                    // sphere over for processing and then had nothing at all to
+                    // look at while it ran.
+                    //
+                    // Asked here rather than at startup, because here is where it
+                    // is about to be used and the reason is self-evident. Denial
+                    // does not stop the work: the service runs either way and the
+                    // screen inside the app still shows progress.
+                    var afterNotifyAsk by remember { mutableStateOf<(() -> Unit)?>(null) }
+                    val askNotify = androidx.activity.compose.rememberLauncherForActivityResult(
+                        ActivityResultContracts.RequestPermission()) { _ ->
+                        afterNotifyAsk?.invoke()
+                        afterNotifyAsk = null
+                    }
                     val state by session.state.collectAsStateWithLifecycle()
                     val processing by ProcessingService.state.collectAsStateWithLifecycle()
+
+                    // Shown before the first capture and whenever the question
+                    // mark is tapped. Over everything else rather than as a
+                    // screen of its own, so it can be reached from the middle of
+                    // a capture - which is exactly when somebody wonders what the
+                    // ring is for.
+                    var intro by remember { mutableStateOf(!IntroSeen.has(this@CaptureActivity)) }
+                    if (intro) {
+                        IntroSketch(onDone = {
+                            IntroSeen.record(this@CaptureActivity); intro = false
+                        })
+                        return@Surface
+                    }
 
                     val ready = pending
                     when {
                         !granted -> PermissionScreen { ask() }
-                        processing.active || processing.finished ->
-                            ProcessingScreen(processing, { dir -> openReview(dir) }) {
+                        processing.active || processing.finished -> {
+                            // Back leaves a finished job behind rather than the
+                            // app. Coming out of the viewer used to land here -
+                            // on a full progress bar for work already done - and
+                            // going back again closed the app, which is two
+                            // surprises in a row for one gesture.
+                            //
+                            // While a job is still running, Back keeps its
+                            // ordinary meaning: the service and its notification
+                            // carry on, and there is nothing to acknowledge yet.
+                            if (processing.finished) {
+                                BackHandler {
+                                    ProcessingService.acknowledge(); pending = null
+                                }
+                            }
+                            ProcessingScreen(processing, { dir ->
+                                // Seen, so it is no longer news. Without this the
+                                // finished screen sits behind the viewer waiting
+                                // to be backed into.
+                                ProcessingService.acknowledge()
+                                pending = null
+                                openReview(dir)
+                            }) {
                                 ProcessingService.acknowledge(); pending = null
                             }
+                        }
                         ready != null -> ReadyScreen(ready) { width ->
                             pending = null
-                            ProcessingService.start(this@CaptureActivity, ready, width)
+                            val begin = {
+                                ProcessingService.start(this@CaptureActivity, ready, width)
+                            }
+                            val needsAsking = Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU &&
+                                checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS) !=
+                                    PackageManager.PERMISSION_GRANTED
+                            if (needsAsking) {
+                                afterNotifyAsk = begin
+                                askNotify.launch(Manifest.permission.POST_NOTIFICATIONS)
+                            } else {
+                                begin()
+                            }
                         }
                         state.phase == CaptureUiState.Phase.IDLE && wanted == null ->
-                            StartScreen(state, ::openReview) { lens, resume ->
+                            StartScreen(state, ::openReview, ::openLibrary, { intro = true },
+                                ::openAbout, session::discard) { lens, resume ->
                                 wanted = Pair(lens, resume)
                             }
                         else -> {
@@ -164,6 +246,14 @@ class CaptureActivity : ComponentActivity() {
             .putExtra(ReviewActivity.EXTRA_DIR, dir.absolutePath))
     }
 
+    private fun openLibrary() {
+        startActivity(Intent(this, LibraryActivity::class.java))
+    }
+
+    private fun openAbout() {
+        startActivity(Intent(this, AboutActivity::class.java))
+    }
+
     /** How far the sensor's frame is turned from the way the phone is being held. */
     private fun sensorRotation(state: CaptureUiState): Int {
         val sensor = state.sensorOrientationDeg
@@ -203,91 +293,217 @@ private fun PermissionScreen(onAsk: () -> Unit) {
 private fun StartScreen(
     state: CaptureUiState,
     onOpen: (File) -> Unit,
+    onLibrary: () -> Unit,
+    onHelp: () -> Unit,
+    onAbout: () -> Unit,
+    onDiscard: (File) -> Unit,
     onStart: (String, File?) -> Unit
 ) {
-    var lens by remember { mutableStateOf(state.chosenLens) }
-    Column(Modifier.fillMaxSize().safeDrawingPadding().padding(24.dp)
-        .verticalScroll(rememberScrollState())) {
-        Text("360 HDRI Camera", style = MaterialTheme.typography.headlineSmall)
-        Spacer(Modifier.height(6.dp))
-        Text("A full sphere in linear radiance, bracketed automatically.",
-            style = MaterialTheme.typography.bodyMedium, color = Color(0xFFB0B0B0))
-        Spacer(Modifier.height(20.dp))
+    // The person's own choice if they made one, and otherwise whatever the app
+    // currently says the default is. It used to be `remember { state.chosenLens }`,
+    // which captures the value at the *first* composition - and the first
+    // composition happens before the camera list has been read, so the screen
+    // highlighted whichever lens sorted first and never corrected itself. Caught
+    // on a screenshot: the untested ultrawide sat there marked as chosen while
+    // the log said the app had chosen the main lens.
+    var picked by remember { mutableStateOf<String?>(null) }
+    val lens = picked ?: state.chosenLens
+    val context = LocalContext.current
+
+    // The person's own spheres, off the main thread. `list()` walks every capture
+    // directory to total what each one costs, which is not something to do on the
+    // thread that draws.
+    var recent by remember { mutableStateOf<List<SphereLibrary.Entry>>(emptyList()) }
+    LaunchedEffect(state.finished?.path, state.resumable?.path) {
+        val root = state.sessionDir?.parentFile ?: state.finished?.parentFile
+            ?: state.resumable?.parentFile
+        recent = if (root == null) emptyList() else withContext(Dispatchers.IO) {
+            runCatching { SphereLibrary(root).list().take(3) }.getOrDefault(emptyList())
+        }
+    }
+    Column(Modifier.fillMaxSize().safeDrawingPadding()
+        .verticalScroll(rememberScrollState())
+        .padding(horizontal = 22.dp, vertical = 18.dp)) {
+
+        // Name, then two ways out of it, on one line. Everything that used to be
+        // stacked underneath - a tagline, a link on its own row - was text nobody
+        // needs twice.
+        Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+            Text("360 HDRI", style = MaterialTheme.typography.headlineMedium,
+                modifier = Modifier.weight(1f))
+            TextButton(onHelp, modifier = Modifier.semantics {
+                contentDescription = "How this works, in four steps"
+            }) { Text("How", style = MaterialTheme.typography.labelLarge) }
+            TextButton(onAbout) {
+                Text("About", style = MaterialTheme.typography.labelLarge,
+                    color = Color(0xFF9A9A9A))
+            }
+        }
 
         if (state.lenses.isEmpty()) {
+            Spacer(Modifier.height(24.dp))
             Text("No usable camera was found on this device.", color = Color(0xFFFF8A80))
             return@Column
         }
 
+        Spacer(Modifier.height(22.dp))
         val choices = state.lenses.filter { !it.frontFacing }
-        Text("Lens", style = MaterialTheme.typography.labelLarge)
-        Spacer(Modifier.height(8.dp))
-        if (choices.size <= 1) {
-            // One camera is not a choice. A button that looks pressable and does
-            // nothing when pressed is worse than a line of text, because it makes
-            // the person wonder what they did wrong.
-            Text(choices.firstOrNull()?.toString() ?: "no back camera",
-                style = MaterialTheme.typography.bodyMedium)
-            Spacer(Modifier.height(4.dp))
-            Text("This phone reports one back camera to apps. Its other lenses sit " +
-                 "behind it and are not offered yet.",
-                style = MaterialTheme.typography.bodySmall, color = Color(0xFF9A9A9A))
-        } else for (option in choices) {
-            val selected = option.cameraId == lens
-            OutlinedButton(
-                onClick = { lens = option.cameraId },
-                modifier = Modifier.fillMaxWidth().padding(vertical = 3.dp),
-                colors = if (selected)
-                    ButtonDefaults.outlinedButtonColors(containerColor = Color(0x2239C36B))
-                else ButtonDefaults.outlinedButtonColors()
-            ) {
-                Text(option.toString(), modifier = Modifier.fillMaxWidth())
-            }
+        for (option in choices) {
+            LensRow(option, selected = option.id == lens || choices.size == 1,
+                pickable = choices.size > 1) { picked = option.id }
+            Spacer(Modifier.height(10.dp))
         }
 
-        state.resumable?.let { dir ->
-            Spacer(Modifier.height(20.dp))
-            Card(Modifier.fillMaxWidth()) {
-                Column(Modifier.padding(14.dp)) {
-                    Text("An unfinished capture is waiting",
-                        style = MaterialTheme.typography.titleSmall)
-                    Spacer(Modifier.height(4.dp))
-                    Text("It will carry on from where it stopped, on the same exposure " +
-                        "ladder, so both halves land on one radiance scale.",
-                        style = MaterialTheme.typography.bodySmall)
-                    Spacer(Modifier.height(10.dp))
-                    Button({ lens?.let { onStart(it, dir) } }) { Text("Resume it") }
-                }
-            }
+        // The thing you came for, unmistakable, and above the cards rather than
+        // below them: a start screen should not need reading. Generous, because
+        // it is pressed with one hand while holding a phone up.
+        Spacer(Modifier.height(18.dp))
+        Button({ lens?.let { onStart(it, null) } }, Modifier.fillMaxWidth().height(64.dp)) {
+            Text("Start a new sphere", style = MaterialTheme.typography.titleMedium)
+        }
+        Spacer(Modifier.height(10.dp))
+        // A destination, not a footnote: the library is where every sphere this
+        // app has ever made lives, and it was a small grey word at the bottom.
+        OutlinedButton(onLibrary, Modifier.fillMaxWidth().height(52.dp)) {
+            Text("All spheres", style = MaterialTheme.typography.titleSmall)
         }
 
-        state.finished?.let { dir ->
-            Spacer(Modifier.height(20.dp))
-            Card(Modifier.fillMaxWidth()) {
-                Column(Modifier.padding(14.dp)) {
-                    Text("The last sphere is ready",
-                        style = MaterialTheme.typography.titleSmall)
-                    Spacer(Modifier.height(4.dp))
-                    Text("Look around it, move the exposure through the whole range, " +
-                        "and export the EXR from there.",
-                        style = MaterialTheme.typography.bodySmall)
-                    Spacer(Modifier.height(10.dp))
-                    Button({ onOpen(dir) }) { Text("Open it") }
-                }
-            }
-        }
-
-        Spacer(Modifier.height(24.dp))
-        Button({ lens?.let { onStart(it, null) } }, Modifier.fillMaxWidth()) {
-            Text("Start a new sphere")
-        }
         if (state.phase == CaptureUiState.Phase.FAILED) {
-            Spacer(Modifier.height(16.dp))
+            Spacer(Modifier.height(12.dp))
             Text(state.message, color = Color(0xFFFF8A80),
                 style = MaterialTheme.typography.bodySmall)
         }
+
+        state.resumable?.let { dir ->
+            Spacer(Modifier.height(18.dp))
+            var discarding by remember(dir) { mutableStateOf(false) }
+            Card(Modifier.fillMaxWidth()) {
+                Row(Modifier.padding(start = 14.dp, end = 6.dp, top = 6.dp, bottom = 6.dp),
+                    verticalAlignment = Alignment.CenterVertically) {
+                    Column(Modifier.weight(1f)) {
+                        Text("Unfinished capture", style = MaterialTheme.typography.titleSmall)
+                        Text("carries on where it stopped",
+                            style = MaterialTheme.typography.bodySmall,
+                            color = Color(0xFF9A9A9A))
+                    }
+                    TextButton({ lens?.let { onStart(it, dir) } }) { Text("Resume") }
+                    // Without this the only ways past an unfinished capture were
+                    // to finish it or to leave it there for ever.
+                    TextButton({ discarding = true }) {
+                        Text("Discard", color = Color(0xFF9A9A9A))
+                    }
+                }
+            }
+            if (discarding) {
+                AlertDialog(
+                    onDismissRequest = { discarding = false },
+                    title = { Text("Discard this capture?") },
+                    text = {
+                        Text("The frames already taken are deleted and the sphere is " +
+                             "never made. Nothing else is touched.")
+                    },
+                    confirmButton = {
+                        TextButton({ discarding = false; onDiscard(dir) }) { Text("Discard") }
+                    },
+                    dismissButton = {
+                        TextButton({ discarding = false }) { Text("Keep it") }
+                    })
+            }
+        }
+
+        // The screen's lower half, filled with the person's own pictures rather
+        // than with words about them. Three, newest first, each one a tap away -
+        // which is also the honest answer to "what has this app done for me": it
+        // shows you.
+        if (recent.isNotEmpty()) {
+            Spacer(Modifier.height(18.dp))
+            for (e in recent) {
+                SphereCard(e, context) { onOpen(e.dir) }
+                Spacer(Modifier.height(8.dp))
+            }
+        }
+
+        // The one door nobody needs on the way in, at the foot, unexplained.
         Spacer(Modifier.height(28.dp))
         DiagnosticsRow()
+        Spacer(Modifier.height(12.dp))
+    }
+}
+
+/**
+ * One finished sphere: its own picture, what it is called, and when.
+ *
+ * A thumbnail says more per pixel than a sentence about what a viewer is for,
+ * and the date is the thing that tells two spheres of the same room apart.
+ */
+@Composable
+private fun SphereCard(e: SphereLibrary.Entry, context: android.content.Context,
+                       onOpen: () -> Unit) {
+    val bmp = remember(e.dir.path) { Thumbnails.decode(e.thumbnail) }
+    Card(Modifier.fillMaxWidth().clickable(onClick = onOpen)) {
+        Row(Modifier.padding(10.dp), verticalAlignment = Alignment.CenterVertically) {
+            Box(Modifier.size(104.dp, 58.dp).clip(RoundedCornerShape(5.dp))
+                .background(Color(0xFF202020)), contentAlignment = Alignment.Center) {
+                if (bmp != null) {
+                    Image(bmp.asImageBitmap(), "Preview of " + (e.name ?: "this sphere"),
+                        Modifier.fillMaxSize(), contentScale = ContentScale.Crop)
+                } else {
+                    Text("no preview", fontSize = 9.sp, color = Color(0xFF808080))
+                }
+            }
+            Spacer(Modifier.width(12.dp))
+            val d = java.util.Date(e.capturedAtMillis)
+            val when_ = android.text.format.DateFormat.getMediumDateFormat(context).format(d) +
+                ", " + android.text.format.DateFormat.getTimeFormat(context).format(d)
+            Column(Modifier.weight(1f)) {
+                // An unnamed sphere is titled by its date, so repeating the date
+                // underneath would be the row saying nothing twice.
+                Text(e.name ?: when_, style = MaterialTheme.typography.titleSmall)
+                if (e.name != null) {
+                    Text(when_, style = MaterialTheme.typography.bodySmall,
+                        color = Color(0xFF9A9A9A))
+                }
+            }
+            Text("Open", style = MaterialTheme.typography.labelLarge,
+                color = Color(0xFFFFC400), modifier = Modifier.padding(end = 8.dp))
+        }
+    }
+}
+
+/**
+ * One lens, as facts rather than as a sentence.
+ *
+ * The field of view is the number somebody chooses by, so it leads; the count of
+ * directions is what it costs them, so it follows. "Ultrawide, 104 degrees, 21
+ * directions, RAW, untested on this phone" is all of that too, and it is a line
+ * of prose in a place where three words would do.
+ */
+@Composable
+private fun LensRow(lens: Lens, selected: Boolean, pickable: Boolean, onPick: () -> Unit) {
+    val edge = if (selected) Color(0xFF39C36B) else Color(0xFF3A3A3A)
+    Row(Modifier.fillMaxWidth()
+        .clip(RoundedCornerShape(10.dp))
+        .background(if (selected) Color(0x1839C36B) else Color(0xFF161616))
+        .border(BorderStroke(if (selected) 2.dp else 1.dp, edge), RoundedCornerShape(10.dp))
+        .let { if (pickable) it.clickable(onClick = onPick) else it }
+        .padding(horizontal = 14.dp, vertical = 11.dp),
+        verticalAlignment = Alignment.CenterVertically) {
+        Text(String.format(Locale.US, "%.0f°", lens.horizontalFovDeg),
+            style = MaterialTheme.typography.titleLarge,
+            color = if (selected) Color(0xFFECECEC) else Color(0xFFB0B0B0),
+            modifier = Modifier.width(72.dp))
+        Column(Modifier.weight(1f)) {
+            Text(LensChooser.directionsFor(lens).toString() + " directions",
+                style = MaterialTheme.typography.bodyMedium)
+            Text(if (lens.measuresRadiance) "RAW · a radiance measurement"
+                 else "no RAW · relative values",
+                style = MaterialTheme.typography.bodySmall, color = Color(0xFF9A9A9A))
+        }
+        // No verdict here. "untested" beside the count of directions read as a
+        // property of the lens, and on most phones most things are untested -
+        // which makes it noise in the one place somebody is choosing. What is
+        // actually known about the physical stream is in the log, in About, and
+        // in the fact that the app does not start on it.
     }
 }
 
@@ -306,10 +522,14 @@ private fun DiagnosticsRow() {
     val context = LocalContext.current
     var status by remember { mutableStateOf<String?>(null) }
     var busy by remember { mutableStateOf(false) }
-    Column(Modifier.fillMaxWidth()) {
-        OutlinedButton(
+    // A text link and not a button with a paragraph under it. What the report
+    // contains is worth saying once, in About, where somebody who wants to send
+    // one will read it; on the way in it was two lines of reassurance about a
+    // thing almost nobody presses.
+    Column(Modifier.fillMaxWidth(), horizontalAlignment = Alignment.CenterHorizontally) {
+        TextButton(
             onClick = {
-                if (busy) return@OutlinedButton
+                if (busy) return@TextButton
                 busy = true
                 status = null
                 val main = android.os.Handler(android.os.Looper.getMainLooper())
@@ -337,14 +557,13 @@ private fun DiagnosticsRow() {
                     }
                 }, "hdri-diagnostics").start()
             },
-            modifier = Modifier.fillMaxWidth()
         ) {
-            Text(if (busy) "Collecting..." else "Save a diagnostics report")
+            Text(if (busy) "Collecting a diagnostics report..." else "Diagnostics report",
+                style = MaterialTheme.typography.labelLarge, color = Color(0xFF808080))
         }
-        Spacer(Modifier.height(6.dp))
-        Text(status ?: "The log, the device and what each capture did. No photographs, " +
-            "and nothing is sent anywhere unless you send it.",
-            style = MaterialTheme.typography.bodySmall, color = Color(0xFF9A9A9A))
+        status?.let {
+            Text(it, style = MaterialTheme.typography.bodySmall, color = Color(0xFF9A9A9A))
+        }
     }
 }
 
@@ -451,16 +670,18 @@ private fun CaptureScreen(state: CaptureUiState, rotationDeg: Int,
             rotationDeg = rotationDeg,
             frameWidthPx = longPx,
             frameHeightPx = shortPx,
-            rollErrorDeg = rollOf(state))
+            rollErrorDeg = rollOf(state),
+            extraRungs = snap?.extraRungs,
+            burstRungs = snap?.burstRungs ?: 0,
+            burstReceived = snap?.burstReceived ?: 0)
 
         Column(Modifier.align(Alignment.TopCenter).fillMaxWidth()
             .background(Color(0xAA000000)).safeDrawingPadding().padding(12.dp)) {
             Text(state.message, style = MaterialTheme.typography.titleSmall)
-            if (state.tierNote.isNotEmpty()) {
-                Spacer(Modifier.height(2.dp))
-                Text(state.tierNote, style = MaterialTheme.typography.bodySmall,
-                    color = Color(0xFFB0B0B0))
-            }
+            // The tier note is gone from here. It is a fact about the lens, it
+            // does not change while a capture runs, and the lens picker already
+            // says it on the way in - so on this screen it was a line of standing
+            // text competing with the one line that changes.
             state.warning?.let {
                 Spacer(Modifier.height(4.dp))
                 Text(it, style = MaterialTheme.typography.bodySmall, color = Color(0xFFFFC400))
@@ -468,8 +689,24 @@ private fun CaptureScreen(state: CaptureUiState, rotationDeg: Int,
             // What to actually do. "Sweep the scene so it can be metered" is a
             // label for someone who already knows; the sweep is an unusual thing
             // to ask of a person and the phase it belongs to has no other clue in
-            // it. Said once, at the top, in the phase it applies to.
-            val how = when (state.phase) {
+            // it.
+            //
+            // Shown until it has been acted on, not for the whole phase. An
+            // instruction that stays after the person has demonstrably understood
+            // it is not an instruction any more, it is four lines of the screen
+            // spent on nothing - and it was covering the part of the sphere they
+            // were being asked to look at.
+            //
+            // The one exception is the sweep waiting for the bright end: that is
+            // not an instruction but a live reason why the sweep has not ended,
+            // and it stays while it is true.
+            val started = when (state.phase) {
+                CaptureUiState.Phase.SCANNING -> (snap?.scanCoverage ?: 0.0) > 0.10
+                CaptureUiState.Phase.CAPTURING ->
+                    (snap?.directionsShot ?: 0) + (snap?.abandoned?.count { it } ?: 0) > 0
+                else -> true
+            }
+            val how = if (started && !state.waitingForHighlights) null else when (state.phase) {
                 CaptureUiState.Phase.SCANNING -> if (state.waitingForHighlights)
                     "Still looking for the brightest part of the room - a window, a " +
                     "lamp, the sky. Point at it for a moment. Until it has been read " +
@@ -501,9 +738,25 @@ private fun CaptureScreen(state: CaptureUiState, rotationDeg: Int,
         Column(Modifier.align(Alignment.BottomCenter).fillMaxWidth()
             .background(Color(0xAA000000)).safeDrawingPadding().padding(14.dp)) {
             if (snap != null) {
+                // One bar, one journey. It used to show the sweep's coverage and
+                // then start again from nothing when the capture began, so it
+                // filled to a hundred percent and reset in front of the person
+                // holding the phone.
+                //
+                // The two shares are measured, from a real 34 direction capture:
+                // the sweep ran 38.1 s (12:42:05.955 to 12:42:44.091) and the
+                // capture 238.4 s (12:42:51.985 to 12:46:50.380). A sweep ended
+                // early simply jumps the bar forward to its full share, which is
+                // honest - that part is over.
+                val bar = remember {
+                    StageProgress(listOf(
+                        StageProgress.Stage("sweep", 38.1),
+                        StageProgress.Stage("capture", 238.4)))
+                }
                 val progress = if (state.phase == CaptureUiState.Phase.SCANNING)
-                    snap.scanCoverage.toFloat() else snap.progress.toFloat()
-                LinearProgressIndicator({ progress.coerceIn(0f, 1f) },
+                    bar.overall("sweep", snap.scanCoverage)
+                else bar.overall("capture", snap.progress)
+                LinearProgressIndicator({ progress.toFloat().coerceIn(0f, 1f) },
                     Modifier.fillMaxWidth().height(4.dp))
                 Spacer(Modifier.height(8.dp))
                 Text(

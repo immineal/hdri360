@@ -75,17 +75,28 @@ class ExposureLadder private constructor(
             if (!(evStep > 0)) throw IllegalArgumentException("EV step must be positive")
             var lo = Math.min(relLow, relHigh)
             var hi = Math.max(relLow, relHigh)
+            // The bright end stops where the hand does, not where the sensor
+            // does. realize() falls back to a longer shutter once ISO runs out -
+            // right on a tripod, and on a hand it plans frames nobody can take:
+            // in a dim room this clamp's absence produced a ladder ending in 1/5
+            // of a second and a whole second, shot as one handheld burst, which
+            // outlasted the controller's twelve second patience and killed the
+            // capture on every direction with "the camera refused the burst".
+            //
+            // A room darker than a handheld capture can reach is a fact to
+            // report, which is exactly what clampedHigh has always meant.
+            val reach = lim.maxHandheldRelativeExposure()
             val clampedLow = lo < lim.minRelativeExposure() * (1 - 1e-9)
-            val clampedHigh = hi > lim.maxRelativeExposure() * (1 + 1e-9)
+            val clampedHigh = hi > reach * (1 + 1e-9)
             lo = Math.max(lo, lim.minRelativeExposure())
-            hi = Math.min(hi, lim.maxRelativeExposure())
+            hi = Math.min(hi, reach)
             if (hi < lo) hi = lo
 
             // Widen until there are enough rungs to satisfy the minimum bracket length,
             // preferring to add brighter exposures (shadow SNR) over darker ones.
             var rungs = rungCount(lo, hi, evStep)
             while (rungs < minRungs) {
-                val newHi = Math.min(lim.maxRelativeExposure(), hi * Math.pow(2.0, evStep))
+                val newHi = Math.min(reach, hi * Math.pow(2.0, evStep))
                 var newLo = lo
                 if (newHi <= hi * (1 + 1e-12)) {
                     newLo = Math.max(lim.minRelativeExposure(), lo / Math.pow(2.0, evStep))

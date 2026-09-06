@@ -6,6 +6,7 @@ import com.immineal.hdri360.core.hdr.ExposureLadder
 import com.immineal.hdri360.core.hdr.ExposureSettings
 import com.immineal.hdri360.core.image.CfaPattern
 import com.immineal.hdri360.core.image.ImageF
+import com.immineal.hdri360.core.image.ShadingMap
 import com.immineal.hdri360.core.io.Half
 import com.immineal.hdri360.core.io.Json
 import com.immineal.hdri360.core.math.Mat3
@@ -51,8 +52,43 @@ class StoredSession(
      * to be one gain for the whole sphere, measured once, or every direction
      * lands on a different colour scale.
      */
-    @JvmField val neutralGains: DoubleArray? = null
+    @JvmField val neutralGains: DoubleArray? = null,
+    /**
+     * Row-major 3x3 taking the sensor's own RGB to linear sRGB - which is to say
+     * to linear Rec.709, the two share primaries and a white point and differ
+     * only in the transfer function a linear file does not have.
+     *
+     * The camera's COLOR_CORRECTION_TRANSFORM, reported once before the capture
+     * locks to manual. Recorded here because it cannot be recovered later: there
+     * is nothing in a frame of sensor values that says what the sensor's
+     * primaries were, and without it a linear EXR is in a space with no name.
+     * Null for a camera that reported none, and for captures made before this was
+     * carried through.
+     */
+    @JvmField val colorMatrix: DoubleArray? = null,
+    /**
+     * The camera's lens shading correction, as applied to every frame here.
+     *
+     * Recorded because it cannot be recovered: the DNG bundle is raw, the map is
+     * a factory measurement the camera reports at capture time and nowhere else,
+     * and without it the frames on disk cannot be reproduced off the phone. A
+     * desktop re-stitch then works on frames whose corners are a stop darker
+     * than the ones the phone stitched, which on a real capture cost seven
+     * solved pairs and split the pose graph into four pieces.
+     */
+    @JvmField val shadingMap: ShadingMap? = null
 ) {
+
+    /**
+     * The same capture on a plan that grew while it was being shot.
+     *
+     * A direction that came back burnt out gets a shorter rung, and what is read
+     * back afterwards has to be the plan the frames were actually shot on - not
+     * the one that was guessed from the sweep.
+     */
+    fun withPlan(plan: BracketPlan): StoredSession = StoredSession(
+        cameraId, tier, intrinsics, apertureN, focalLengthMm, sensorOrientationDeg,
+        cfa, whiteLevel, blackLevel, baseIso, plan, note, neutralGains, colorMatrix, shadingMap)
 
     fun toJson(): Json.Obj {
         val steps = Json.Arr()
@@ -91,6 +127,12 @@ class StoredSession(
             .put("ladderClampedHigh", plan.ladder.clampedHigh)
             .put("indicesPerTarget", perTarget)
             .also { o -> neutralGains?.let { o.put("neutralGains", it) } }
+            .also { o -> colorMatrix?.let { o.put("colorMatrix", it) } }
+            .also { o -> shadingMap?.let { m ->
+                o.put("shadingCols", m.columns.toLong())
+                o.put("shadingRows", m.rows.toLong())
+                o.put("shadingGains", m.gains)
+            } }
     }
 
     companion object {
@@ -136,6 +178,20 @@ class StoredSession(
                 neutralGains = if (o.has("neutralGains")) {
                     val g = o["neutralGains"]
                     DoubleArray(g.size()) { g.at(it).asDouble() }
+                } else null,
+                colorMatrix = if (o.has("colorMatrix")) {
+                    val m = o["colorMatrix"]
+                    if (m.size() == 9) DoubleArray(9) { m.at(it).asDouble() } else null
+                } else null,
+                shadingMap = if (o.has("shadingGains") && o.has("shadingCols")) {
+                    val g = o["shadingGains"]
+                    val cols = o["shadingCols"].asDouble().toInt()
+                    val rows = o["shadingRows"].asDouble().toInt()
+                    // A malformed map is no map. It is a correction, not the
+                    // capture, and refusing to open a session over one would lose
+                    // the frames as well.
+                    try { ShadingMap(DoubleArray(g.size()) { g.at(it).asDouble() }, cols, rows) }
+                    catch (e: Exception) { null }
                 } else null)
         }
     }
@@ -223,8 +279,20 @@ class FrameRecord(
  */
 class FrameStore private constructor(
     @JvmField val dir: File,
-    @JvmField val session: StoredSession
+    session: StoredSession
 ) : FrameSink, Closeable {
+
+    /**
+     * What this capture is, as last written to disk.
+     *
+     * Not fixed for the length of a capture. A direction whose shortest rung came
+     * back on the rail gets a shorter one and the plan grows under it, and the
+     * frames on disk then outnumber the plan that was written before the first
+     * of them. See [planChanged].
+     */
+    @Volatile
+    var session: StoredSession = session
+        private set
 
     /** Refuse to write a frame that would take free space below this. */
     @JvmField var minFreeBytes: Long = 64L * 1024 * 1024
@@ -317,6 +385,67 @@ class FrameStore private constructor(
         synchronized(lock) { byKey[key(frame.targetIndex, frame.bracketIndex)] = record }
         lastError = null
         return true
+    }
+
+    /**
+     * Writes down a plan that grew mid-capture.
+     *
+     * The same way the first one was written: into a part file, forced to disk,
+     * then renamed over the old one - so a process killed during the write leaves
+     * either the whole old plan or the whole new one, and a session directory is
+     * never briefly unreadable. Failing to write it is not failing the capture:
+     * the cost is that a resumed run comes back on the plan before this one,
+     * which is a rung short in one direction rather than a capture lost.
+     */
+    override fun planChanged(plan: BracketPlan) {
+        val next = session.withPlan(plan)
+        val part = File(dir, "$SESSION.${partSeq.incrementAndGet()}$PART")
+        try {
+            FileOutputStream(part).use {
+                it.write(next.toJson().toString().toByteArray(StandardCharsets.UTF_8))
+                it.flush()
+                try { it.fd.sync() } catch (e: IOException) { /* the rename orders it */ }
+            }
+            val header = File(dir, SESSION)
+            if (!part.renameTo(header)) {
+                if (!part.isFile || !header.delete() || !part.renameTo(header))
+                    throw IOException("could not record the revised plan")
+            }
+        } catch (e: Exception) {
+            lastError = e.message ?: e.javaClass.simpleName
+            part.delete()
+            return
+        }
+        session = next
+        dropFramesTheNewPlanDoesNotWant(plan)
+    }
+
+    /**
+     * Removes frames a revised plan no longer has a place for.
+     *
+     * Growing a direction at the dark end can push it past the longest bracket
+     * the planner allows, and it is then trimmed at the bright end - so the
+     * re-shot burst writes fewer positions than the attempt before it and the
+     * file at the old last position is left over.
+     *
+     * Nothing would ever read it: the plan says how many rungs a direction has
+     * and the reader stops there. But a capture is gigabytes of frames and the
+     * library offers to delete spheres by what they cost, so a file nobody will
+     * open still costs the person the decision.
+     */
+    private fun dropFramesTheNewPlanDoesNotWant(plan: BracketPlan) {
+        val runs = plan.indicesPerTarget
+        val doomed = ArrayList<FrameRecord>()
+        synchronized(lock) {
+            for (r in byKey.values) {
+                val wanted = if (r.targetIndex in runs.indices) runs[r.targetIndex].size else 0
+                if (r.bracketIndex >= wanted) doomed.add(r)
+            }
+            for (r in doomed) byKey.remove(key(r.targetIndex, r.bracketIndex))
+        }
+        // Outside the lock: a delete is a filesystem call and the camera thread
+        // may be storing the next frame.
+        for (r in doomed) File(dir, r.file).delete()
     }
 
     fun read(record: FrameRecord): ImageF = readPlane(File(dir, record.file))

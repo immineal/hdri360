@@ -10,6 +10,7 @@ import android.content.pm.ServiceInfo
 import android.graphics.Bitmap
 import android.os.Build
 import android.os.IBinder
+import android.os.PowerManager
 import android.os.SystemClock
 import android.util.Log
 import com.immineal.hdri360.core.Parallel
@@ -17,11 +18,15 @@ import com.immineal.hdri360.core.capture.FrameStore
 import com.immineal.hdri360.core.hdr.ToneMapper
 import com.immineal.hdri360.core.io.ExrWriter
 import com.immineal.hdri360.core.pipeline.Calibration
+import com.immineal.hdri360.core.pipeline.FileScale
 import com.immineal.hdri360.core.pipeline.FrameSpool
 import com.immineal.hdri360.core.pipeline.HdriPipeline
+import com.immineal.hdri360.core.pipeline.StageProgress
+import com.immineal.hdri360.core.pipeline.TimeRemaining
 import com.immineal.hdri360.core.pipeline.OutputWriter
 import com.immineal.hdri360.core.pipeline.ResolutionOption
 import com.immineal.hdri360.core.pipeline.StoredCapture
+import com.immineal.hdri360.core.pipeline.WorkCorrection
 import com.immineal.hdri360.core.pipeline.WorkEstimator
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
@@ -56,6 +61,9 @@ class ProcessingService : Service() {
 
     private val running = AtomicBoolean(false)
 
+    /** When the job began, so the countdown can watch the clock as well as the estimate. */
+    @Volatile private var jobStartedMs = 0L
+
     override fun onBind(intent: Intent?): IBinder? = null
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
@@ -71,7 +79,27 @@ class ProcessingService : Service() {
 
     private fun run(dir: File, width: Int) {
         val started = SystemClock.elapsedRealtime()
+        jobStartedMs = started
         var spool: FrameSpool? = null
+        // A foreground service is not a running CPU.
+        //
+        // The notification keeps this process alive and unkillable; it does not
+        // stop the device suspending once the screen goes off, and stitching a
+        // sphere is minutes of solid arithmetic. Without this, somebody who hands
+        // a capture over and puts the phone in a pocket comes back to a job that
+        // barely moved - the one time it is most natural to put the phone away.
+        //
+        // Bounded rather than open-ended, and released in the finally below
+        // whatever happens: a wake lock leaked by a crashed job is a flat battery
+        // with no way for the user to see why.
+        val wake = try {
+            (getSystemService(Context.POWER_SERVICE) as? PowerManager)
+                ?.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "hdri360:processing")
+                ?.apply { setReferenceCounted(false); acquire(WAKE_LIMIT_MS) }
+        } catch (e: Exception) {
+            CaptureLog.warn("no wake lock, processing may stall with the screen off", e)
+            null
+        }
         try {
             val store = FrameStore.open(dir)
                 ?: throw IllegalStateException("that capture is not readable any more")
@@ -121,16 +149,58 @@ class ProcessingService : Service() {
                 "${Parallel.threads} threads, prior weight ${opt.priorWeight}")
 
             val estimate = estimateFor(store, width)
+            // One bar, one journey.
+            //
+            // The pipeline reports a fraction that runs 0 to 1 *within* each
+            // stage, and this used to pass each one straight through as the
+            // overall figure - so the bar filled and reset four times over eight
+            // minutes, with the time remaining resetting alongside it. Reported
+            // as "the progress bar doesn't work very well", which was generous.
+            //
+            // Every weight below is measured, none invented. The split between
+            // solving and writing comes from the same calibrated estimator the
+            // size picker quotes its minutes from, so it moves with the output
+            // size instead of being a constant that is wrong at 8K and wrong the
+            // other way at 2K. The shares within the solve were measured by
+            // running a real 34 direction bundle through this same pipeline with
+            // the stages timed:
+            //
+            //   merging 0.690 (9406 ms)   matching 0.096 (1306 ms)
+            //   aligning 0.019 (261 ms)   blending 0.195 (2654 ms)
+            //
+            // "features" gets nothing because it is not a stage: the features are
+            // extracted inside the merging loop and the pipeline only marks the
+            // moment it finished, so the merging share already contains it.
+            val solveShare = estimate?.let {
+                if (it.seconds > 0) (it.mergeSeconds + it.alignSeconds) / it.seconds else 0.7
+            } ?: 0.7
+            val writeShare = 1.0 - solveShare
+            val bar = StageProgress(listOf(
+                StageProgress.Stage("merging", 0.690 * solveShare),
+                StageProgress.Stage("features", 0.0),
+                StageProgress.Stage("matching", 0.096 * solveShare),
+                StageProgress.Stage("aligning", 0.019 * solveShare),
+                StageProgress.Stage("blending", 0.195 * solveShare),
+                StageProgress.Stage(WRITING, writeShare)))
+            CaptureLog.log(String.format(Locale.US,
+                "progress: solving is %.0f%% of the bar, writing %.0f%%, from an estimate of " +
+                "%.0f s (merge %.0f, align %.0f, render %.0f, write %.0f)",
+                solveShare * 100, writeShare * 100, estimate?.seconds ?: 0.0,
+                estimate?.mergeSeconds ?: 0.0, estimate?.alignSeconds ?: 0.0,
+                estimate?.renderSeconds ?: 0.0, estimate?.writeSeconds ?: 0.0))
+
+            correctionFile = File(filesDir, "work-correction.txt")
             publish(State(true, "Starting", 0.0, remaining(estimate?.seconds ?: 0.0, 0.0)))
 
             val result = HdriPipeline.process(inputs, opt) { stage, fraction ->
-                val f = SOLVE_SHARE * fraction
+                val f = bar.overall(stage, fraction)
                 publish(State(true, stage, f, remaining(estimate?.seconds ?: 0.0, f)))
                 notify(stage, f)
             }
 
-            publish(State(true, "Rendering at ${width}x${width / 2}", SOLVE_SHARE,
-                remaining(estimate?.seconds ?: 0.0, SOLVE_SHARE)))
+            val atRender = bar.overall(WRITING, 0.0)
+            publish(State(true, "Rendering at ${width}x${width / 2}", atRender,
+                remaining(estimate?.seconds ?: 0.0, atRender)))
 
             val exr = File(dir, "panorama.exr")
             val tmp = File(dir, "panorama.exr.part")
@@ -140,7 +210,7 @@ class ProcessingService : Service() {
             cfg.seamFeather = opt.seamFeather
             val stats = BufferedOutputStream(FileOutputStream(tmp), 1 shl 16).use { out ->
                 OutputWriter.writeExr(out, result, cfg) { done, total ->
-                    val f = SOLVE_SHARE + (1 - SOLVE_SHARE) * (done / total.toDouble())
+                    val f = bar.overall(WRITING, done / total.toDouble())
                     publish(State(true, "Writing the sphere", f,
                         remaining(estimate?.seconds ?: 0.0, f)))
                     notify("Writing the sphere", f)
@@ -151,6 +221,9 @@ class ProcessingService : Service() {
 
             writePreview(dir, result)
             val elapsed = (SystemClock.elapsedRealtime() - started) / 1000.0
+            // What it was going to cost against what it cost, so the next quote
+            // is closer. This is the only place both numbers exist.
+            estimate?.let { learnFrom(it.seconds, elapsed) }
             CaptureLog.log(String.format(Locale.US,
                 "solved %d of %d directions, %d pairs, %.3f deg residual, k1 %.4f, " +
                 "horizon %.2f, %.1f stops in %.1f s",
@@ -180,6 +253,8 @@ class ProcessingService : Service() {
             // Scratch, whatever happened. Leaving it behind fills the phone, and
             // the frames it was built from are still on disk to try again from.
             try { spool?.close() } catch (e: Exception) { CaptureLog.warn("spool: " + e) }
+            try { if (wake?.isHeld == true) wake.release() }
+            catch (e: Exception) { CaptureLog.warn("wake lock: " + e) }
             running.set(false)
             stopForegroundCompat()
             stopSelf()
@@ -191,7 +266,12 @@ class ProcessingService : Service() {
             // The pipeline already rendered the sphere at this size while solving
             // it; rendering it again would be a second full pass over every frame
             // for a picture that is already in hand.
-            val small = result.panorama
+            // In the file's units, not the pipeline's. The viewer's exposure
+            // slider reads absolute values off this, so a viewer.exr on a
+            // different scale from the panorama.exr would put a number under the
+            // person's thumb that is not in the file they are about to export.
+            val small = FileScale.of(result.radianceScale, result.panorama)
+                .scaled(result.panorama)
             // The viewer needs linear radiance, not a picture: its exposure slider
             // is only meaningful over values the tone mapper has not yet decided.
             FileOutputStream(File(dir, "viewer.exr")).use {
@@ -230,8 +310,11 @@ class ProcessingService : Service() {
     }
 
     private fun remaining(total: Double, fraction: Double): String {
-        if (total <= 0) return ""
-        val left = total * (1 - fraction)
+        // Watching the job, not only the estimate it started with: see
+        // TimeRemaining. A wrong estimate used to be wrong for the whole job.
+        val left = TimeRemaining.seconds(total,
+            (SystemClock.elapsedRealtime() - jobStartedMs) / 1000.0, fraction)
+        if (left <= 0 && fraction < 1.0 && total <= 0) return ""
         return when {
             left < 20 -> "nearly there"
             left < 90 -> "about ${Math.round(left)} seconds left"
@@ -311,6 +394,18 @@ class ProcessingService : Service() {
     companion object {
         private const val TAG = "Hdri360.Processing"
         private const val CHANNEL = "processing"
+        /**
+         * The longest this will hold the CPU awake: two hours.
+         *
+         * A timeout rather than an open-ended lock, because the failure modes are
+         * not symmetric. A job that outlives it finishes slowly on a phone the
+         * person is holding anyway; a lock leaked past a job that died takes the
+         * battery with it and shows nothing to explain itself. The largest real
+         * capture measured here - 137 frames at full resolution - is well inside
+         * it.
+         */
+        private const val WAKE_LIMIT_MS = 2L * 60 * 60 * 1000
+
         private const val NOTIFICATION_ID = 1
         private const val DONE_NOTIFICATION_ID = 2
         /** How long the finished notice lingers before Android clears it. */
@@ -327,7 +422,14 @@ class ProcessingService : Service() {
         const val PREVIEW_WIDTH = 2048
 
         /** How much of the wall clock is solve-and-merge rather than render-and-write. */
-        private const val SOLVE_SHARE = 0.7
+        /**
+         * The stage name the render and the write share.
+         *
+         * One stage rather than two, because they are one pass: the writer
+         * renders each scanline and writes it, and its progress callback counts
+         * scanlines.
+         */
+        private const val WRITING = "writing"
 
         /**
          * Share of the heap the merged sphere may occupy. The rest is for the
@@ -432,13 +534,68 @@ class ProcessingService : Service() {
         }
 
         @Volatile private var cached: Calibration? = null
+        @Volatile private var learned: WorkCorrection? = null
 
+        /**
+         * The startup benchmark, corrected by what real jobs on this phone have
+         * actually cost.
+         *
+         * `WorkEstimator.calibrate` times a merge of a 192x144 image once, which
+         * tells a fast phone from a slow one and predicts a three million pixel
+         * frame badly. Measured here: 64 seconds predicted for a job that took
+         * 20. Those minutes are quoted to somebody *before* they choose a size,
+         * and the progress bar divides by them, so being three times out is felt
+         * twice.
+         *
+         * Corrected in this one place so that everything downstream - the size
+         * picker, the bar, the time remaining - moves together.
+         */
         private fun calibration(): Calibration {
-            cached?.let { return it }
-            val c = WorkEstimator.calibrate()
-            cached = c
+            val c = cached ?: WorkEstimator.calibrate().also { cached = it }
+            val f = correction().factor
+            if (f == 1.0) return c
+            return Calibration(c.mergeNsPerSample * f, c.alignNsPerPixel * f,
+                c.renderNsPerSample * f,
+                c.basis + String.format(Locale.US, ", scaled %.2fx by past runs here", f),
+                c.decodeNsPerPixel * f)
+        }
+
+        private fun correction(): WorkCorrection {
+            learned?.let { return it }
+            val c = try {
+                val f = correctionFile?.takeIf { it.isFile }?.readText()?.trim()?.toDoubleOrNull()
+                if (f == null) WorkCorrection.unlearned() else WorkCorrection.of(f)
+            } catch (e: Exception) {
+                WorkCorrection.unlearned()
+            }
+            learned = c
             return c
         }
+
+        /**
+         * Remembers how wrong the estimate was, so the next one is closer.
+         *
+         * [predicted] is the **corrected** figure that was quoted; the raw
+         * benchmark estimate is recovered by dividing the factor back out, which
+         * is what [WorkCorrection.after] is defined against.
+         */
+        private fun learnFrom(predicted: Double, actual: Double) {
+            val before = correction()
+            val raw = if (before.factor > 0) predicted / before.factor else predicted
+            val after = before.after(raw, actual)
+            if (after.factor == before.factor) return
+            learned = after
+            try {
+                correctionFile?.writeText(String.format(Locale.US, "%.6f", after.factor))
+            } catch (e: Exception) {
+                CaptureLog.warn("could not remember the work estimate correction", e)
+            }
+            CaptureLog.log(String.format(Locale.US,
+                "estimate was %.0f s and it took %.0f s; %s next time",
+                predicted, actual, after.toString()))
+        }
+
+        @Volatile private var correctionFile: File? = null
 
         private fun estimateFor(store: FrameStore, width: Int) =
             try {

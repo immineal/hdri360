@@ -17,14 +17,19 @@ import android.hardware.camera2.CaptureResult
 import android.hardware.camera2.TotalCaptureResult
 import android.hardware.camera2.params.RggbChannelVector
 import android.media.Image
+import android.hardware.camera2.params.OutputConfiguration
+import android.hardware.camera2.params.SessionConfiguration
 import android.media.ImageReader
+import android.os.Build
 import android.os.Handler
+import android.os.SystemClock
 import android.os.HandlerThread
 import android.util.Log
 import android.view.Surface
 import com.immineal.hdri360.core.capture.CameraProfile
 import com.immineal.hdri360.core.capture.CameraSource
 import com.immineal.hdri360.core.capture.CapturedFrame
+import com.immineal.hdri360.core.capture.Lens
 import com.immineal.hdri360.core.capture.CaptureTier
 import com.immineal.hdri360.core.capture.PixelFormat
 import com.immineal.hdri360.core.capture.StreamLadder
@@ -73,6 +78,30 @@ class Camera2Source private constructor(
     @JvmField val subsample: Int,
     override val profile: CameraProfile
 ) : CameraSource {
+
+    /**
+     * The shortest frame the capture stream is actually offered at, in
+     * nanoseconds, or 0 when the device would not say.
+     *
+     * Read once from `getOutputMinFrameDuration` for the exact format and size
+     * being captured. Requesting anything shorter is requesting something the
+     * device never advertised, and on a bracket that changes gain every frame it
+     * is what makes the sensor miss its configuration deadline - see
+     * [StreamLadder.frameDurationFor], which has the measurement.
+     */
+    /** When the current burst was handed to the camera, for measuring latency. */
+    @Volatile private var burstSubmittedMs = 0L
+
+    /** The last slow frame reported, so one bad burst is one line and not five. */
+    @Volatile private var lastSlowReportMs = 0L
+
+    private val minFrameDurationNs: Long = try {
+        characteristics.get(CameraCharacteristics.SCALER_STREAM_CONFIGURATION_MAP)
+            ?.getOutputMinFrameDuration(CameraProbe.formatOf(plan),
+                android.util.Size(plan.capture.width, plan.capture.height)) ?: 0L
+    } catch (e: Exception) {
+        0L
+    }
 
     /** Where the device is pointing, asked at the moment a frame is paired. */
     @JvmField @Volatile var poseProvider: () -> Mat3? = { null }
@@ -186,6 +215,7 @@ class Camera2Source private constructor(
                 requests.add(b.build())
             }
             s.stopRepeating()
+            burstSubmittedMs = SystemClock.elapsedRealtime()
             s.captureBurst(requests, burstCallback, handler)
             true
         } catch (e: Exception) {
@@ -251,6 +281,8 @@ class Camera2Source private constructor(
     @Volatile private var previewLastReport: String? = null
     /** The colour matrix the camera chose, frozen alongside the white balance. */
     @Volatile private var lockedColorTransform: android.hardware.camera2.params.ColorSpaceTransform? = null
+    /** The lens shading correction of the same converged frame the gains came from. */
+    @Volatile private var lockedShading: com.immineal.hdri360.core.image.ShadingMap? = null
 
     /**
      * What the viewfinder actually got, once per change.
@@ -289,9 +321,41 @@ class Camera2Source private constructor(
                 awb != CameraMetadata.CONTROL_AWB_STATE_LOCKED) return
             val gains = result.get(CaptureResult.COLOR_CORRECTION_GAINS) ?: return
             lockedColorTransform = result.get(CaptureResult.COLOR_CORRECTION_TRANSFORM)
+            lockedShading = FrameConverters.shadingOf(result)
             lockedWhiteBalance = gains
             handler.post { applyPreview() }
         }
+    }
+
+    /**
+     * The sensor RGB to linear sRGB matrix this capture is fixed to, row-major.
+     *
+     * Read off the same converged auto frame as the gains and locked with them,
+     * because the pair is what defines the colour: the gains move the grey point
+     * and this pulls the sensor's overlapping filters out to Rec.709 primaries.
+     * Applying one without the other is what left the output green.
+     */
+    /**
+     * The lens shading correction every frame of this capture was flattened
+     * with, for the session header.
+     *
+     * Recorded because it cannot be recovered afterwards: the DNG bundle is raw
+     * and the map is only ever reported alongside a capture result. A bundle
+     * without it can be re-processed but not reproduced - the corners come out a
+     * stop darker than the frames the phone actually stitched, which on a real
+     * capture cost seven solved pairs and split the pose graph into four pieces.
+     */
+    fun shadingMap(): com.immineal.hdri360.core.image.ShadingMap? = lockedShading
+
+    fun colorTransform(): DoubleArray? {
+        val m = lockedColorTransform ?: return null
+        val out = DoubleArray(9)
+        for (row in 0 until 3)
+            for (col in 0 until 3) {
+                val r = m.getElement(col, row)
+                out[row * 3 + col] = r.numerator.toDouble() / r.denominator.toDouble()
+            }
+        return out
     }
 
     /** The per-channel gains this capture is fixed to, greens averaged. */
@@ -311,6 +375,16 @@ class Camera2Source private constructor(
         b.set(CaptureRequest.CONTROL_MODE, CameraMetadata.CONTROL_MODE_AUTO)
         b.set(CaptureRequest.CONTROL_AE_MODE, CameraMetadata.CONTROL_AE_MODE_ON)
         b.set(CaptureRequest.CONTROL_AWB_MODE, CameraMetadata.CONTROL_AWB_MODE_AUTO)
+        // The one request whose result is actually mined for calibration, so it
+        // has to ask for all of it. The shading map is read off the converged
+        // probe frame together with the gains and the colour matrix, and asking
+        // for it only on the still path - which is where it used to be set -
+        // meant the probe frame never carried one: every capture on the phone
+        // recorded "shading: none reported" and shipped a bundle the desktop
+        // path could not reproduce, which is the whole reason the map is
+        // recorded at all.
+        b.set(CaptureRequest.STATISTICS_LENS_SHADING_MAP_MODE,
+            CameraMetadata.STATISTICS_LENS_SHADING_MAP_MODE_ON)
     }
 
     /**
@@ -366,6 +440,27 @@ class Camera2Source private constructor(
                 lockedColorTransform = result.get(CaptureResult.COLOR_CORRECTION_TRANSFORM)
                 lockedWhiteBalance = result.get(CaptureResult.COLOR_CORRECTION_GAINS)
             }
+            // A rung that took its time says so, and a rung that did not says
+            // nothing. Written this way round after an evening in which a whole
+            // sphere failed because frames were arriving eight seconds apart
+            // while the log said only that a direction had timed out: what was
+            // needed was the latency of the frame itself, and what is not needed
+            // is that line a hundred and thirty-six times per capture.
+            //
+            // Requesting an exposure and receiving it are also different things,
+            // so when it is slow the line says both.
+            val since = if (burstSubmittedMs > 0) SystemClock.elapsedRealtime() - burstSubmittedMs
+                        else -1L
+            if (since > SLOW_FRAME_MS && since > lastSlowReportMs + SLOW_REPORT_GAP_MS) {
+                lastSlowReportMs = since
+                CaptureLog.log(String.format(java.util.Locale.US,
+                    "slow frame: rung %s back at +%d ms, asked %.1f ms ISO%d, got %.1f ms ISO%d",
+                    (request.tag ?: "?").toString(), since,
+                    (request.get(CaptureRequest.SENSOR_EXPOSURE_TIME) ?: 0L) / 1e6,
+                    request.get(CaptureRequest.SENSOR_SENSITIVITY) ?: 0,
+                    (result.get(CaptureResult.SENSOR_EXPOSURE_TIME) ?: 0L) / 1e6,
+                    result.get(CaptureResult.SENSOR_SENSITIVITY) ?: 0))
+            }
             val ts = result.get(CaptureResult.SENSOR_TIMESTAMP)
             if (ts == null) {
                 // Without a timestamp there is no way to say which pixels this
@@ -381,13 +476,19 @@ class Camera2Source private constructor(
                                      failure: CaptureFailure) {
             // The frame is not coming. Settling it is what stops the controller
             // waiting forever, which is the failure the predecessor never left.
-            Log.w(TAG, "a bracket frame failed, reason ${failure.reason}")
+            //
+            // Into the app's own log and not only logcat. When a capture dies on
+            // somebody's phone this file is the whole of the evidence, and an
+            // evening was spent guessing at frames that never arrived while the
+            // reason for it went to a buffer nobody kept.
+            CaptureLog.log("a bracket frame failed, reason ${failure.reason}" +
+                (if (failure.wasImageCaptured()) " (the image was captured)" else ""))
             settle(false)
         }
 
         override fun onCaptureBufferLost(s: CameraCaptureSession, request: CaptureRequest,
                                          target: Surface, frameNumber: Long) {
-            Log.w(TAG, "a bracket frame's buffer was dropped")
+            CaptureLog.log("a bracket frame's buffer was dropped")
             settle(false)
         }
     }
@@ -441,7 +542,7 @@ class Camera2Source private constructor(
                 if (luma != null) {
                     val rel = settings.relativeExposure(profile.exposureLimits.baseIso)
                     logMetering(luma, settings)
-                    work.execute { synchronized(lock) { listener }?.onPreviewFrame(luma, rel) }
+                    post { synchronized(lock) { listener }?.onPreviewFrame(luma, rel) }
                 }
                 return
             }
@@ -456,11 +557,48 @@ class Camera2Source private constructor(
                 try { bundleWriter?.invoke(frame, image, result) }
                 catch (e: Exception) { Log.w(TAG, "the DNG for this frame was not written", e) }
 
-            val pixels = convert(image, result)
+            // The camera thread does the one thing that has to happen here - get
+            // the pixels out of the buffer so the image can be closed and the
+            // camera can fill the next one - and nothing else.
+            //
+            // Everything after this used to happen here too, and it was eight
+            // seconds a frame: the next frame of the burst arrives on this
+            // thread, so a burst of four took thirty-two seconds, outlived its
+            // timeout, and no capture could finish. It is 200 ms now, which is
+            // 200 ms this thread still would not be listening for.
+            val t0 = SystemClock.elapsedRealtime()
+            // Without the shading correction. It is recorded in the session and
+            // applied to merged radiance at processing time, where saturation has
+            // already been read off the sensor and there is no ceiling to clamp
+            // against - see HdriPipeline.Options.shading. Applied here it invented
+            // blown highlights out of dim corners.
+            val raw = if (plan.format == PixelFormat.RAW_SENSOR)
+                FrameConverters.rawFrameOf(image, characteristics, result,
+                    applyShading = false) else null
+            val copyMs = SystemClock.elapsedRealtime() - t0
+            val yuv = if (raw == null) FrameConverters.rgb(image, subsample) else null
             image.close()
-            work.execute {
-                synchronized(lock) { listener }?.onFrameCaptured(frame, pixels)
-                settle(true)
+            if (copyMs > SLOW_COPY_MS)
+                CaptureLog.log("copying t${frame.targetIndex} b${frame.bracketIndex} out of " +
+                    "the camera buffer took $copyMs ms")
+            post {
+                val convertStart = SystemClock.elapsedRealtime()
+                val pixels = try {
+                    raw?.convert(subsample) ?: yuv
+                } catch (e: Exception) {
+                    Log.w(TAG, "a captured frame could not be converted", e)
+                    null
+                }
+                val convertMs = SystemClock.elapsedRealtime() - convertStart
+                if (convertMs > SLOW_CONVERT_MS)
+                    CaptureLog.log("converting t${frame.targetIndex} b${frame.bracketIndex} " +
+                        "took $convertMs ms")
+                if (pixels == null) {
+                    settle(false)
+                } else {
+                    synchronized(lock) { listener }?.onFrameCaptured(frame, pixels)
+                    settle(true)
+                }
             }
         } catch (e: Exception) {
             try { image.close() } catch (ignored: Exception) { }
@@ -503,12 +641,6 @@ class Camera2Source private constructor(
             plane.width, plane.height, sum / plane.data.size, max, settings))
     }
 
-    private fun convert(image: Image, result: TotalCaptureResult): ImageF =
-        if (plan.format == PixelFormat.RAW_SENSOR)
-            FrameConverters.rawPlane(image, characteristics, result, subsample)
-        else
-            FrameConverters.rgb(image, subsample)
-
     /**
      * Records one frame of the burst as accounted for, whether it arrived or not,
      * and finishes the burst when none are outstanding.
@@ -533,14 +665,64 @@ class Camera2Source private constructor(
             }
         }
         if (!finished) return
+        // A burst that came back short says so here, where the count is still in
+        // hand. The controller sees only how many arrived; this says how many of
+        // them were paired pixels-to-metadata and how many were settled without,
+        // which is the difference between a camera that failed a frame and one
+        // that never produced it.
+        if (received < expected)
+            CaptureLog.log("burst on direction ${target + 1} came back " +
+                "$received of $expected")
         applyPreview()
         // Raised after the last image, never after the last metadata.
-        work.execute {
-            synchronized(lock) { listener }?.onBurstFinished(id, target, expected, received)
+        //
+        // Handed over through post(), which drops the work if this source has
+        // been closed. The camera keeps delivering for a moment after close() -
+        // a burst in flight does not stop because the app stopped waiting for it
+        // - and the executor is already shut down by then, so this threw
+        // RejectedExecutionException straight into a Camera2 callback and took
+        // the camera's own thread down with it. Seen on a real capture, in the
+        // app's own crash log:
+        //
+        //   CRASH on hdri-camera
+        //   java.util.concurrent.RejectedExecutionException: Task ... rejected
+        //   from ThreadPoolExecutor[Terminated, pool size = 0, ...]
+        //
+        // At shutdown, so mostly harmless - but a crash in the log is a thing
+        // that has to be read and dismissed every time somebody goes looking for
+        // a real one, and the frames still arriving were being thrown away by an
+        // exception rather than by a decision.
+        post { synchronized(lock) { listener }?.onBurstFinished(id, target, expected, received) }
+    }
+
+    /**
+     * Runs something on the worker, unless this source has been closed.
+     *
+     * Checked and submitted under the lock, because close() sets the flag and
+     * shuts the executor down in that order and a submission that slips between
+     * them is exactly the crash this exists to stop.
+     */
+    private fun post(body: () -> Unit) {
+        synchronized(lock) {
+            if (closed) return
+            try {
+                work.execute(body)
+            } catch (e: java.util.concurrent.RejectedExecutionException) {
+                // Closed underneath us anyway. Nothing is waiting for this.
+            }
         }
     }
 
     private fun discardPendingLocked() {
+        // What was left unpaired says which half of the camera went missing, and
+        // that is the difference between a diagnosis and a guess. Pixels with no
+        // metadata is a stream that delivered and a result that did not; metadata
+        // with no pixels is the opposite; neither is a frame that simply never
+        // came. All three look identical from the controller, which sees only a
+        // count that came up short.
+        if (pendingImages.isNotEmpty() || pendingResults.isNotEmpty())
+            CaptureLog.log("discarding ${pendingImages.size} image(s) and " +
+                "${pendingResults.size} result(s) that never paired")
         for (i in pendingImages.values) try { i.close() } catch (e: Exception) { }
         pendingImages.clear()
         pendingResults.clear()
@@ -548,7 +730,7 @@ class Camera2Source private constructor(
 
     private fun report(message: String, fatal: Boolean) {
         val l = synchronized(lock) { listener } ?: return
-        work.execute { l.onCameraError(message, fatal) }
+        post { l.onCameraError(message, fatal) }
     }
 
     // ----------------------------------------------------------------- requests
@@ -606,7 +788,8 @@ class Camera2Source private constructor(
             b.set(CaptureRequest.SENSOR_EXPOSURE_TIME,
                 clampNs(settings.exposureTimeNs()))
             b.set(CaptureRequest.SENSOR_SENSITIVITY, clampIso(settings.iso))
-            b.set(CaptureRequest.SENSOR_FRAME_DURATION, Math.max(settings.exposureTimeNs(), 1L))
+            b.set(CaptureRequest.SENSOR_FRAME_DURATION,
+                StreamLadder.frameDurationFor(settings.exposureTimeNs(), minFrameDurationNs))
             lockedWhiteBalance?.let {
                 b.set(CaptureRequest.COLOR_CORRECTION_MODE,
                     CameraMetadata.COLOR_CORRECTION_MODE_TRANSFORM_MATRIX)
@@ -663,6 +846,27 @@ class Camera2Source private constructor(
         private const val MAX_PENDING = 16
 
         /**
+         * A burst frame that takes longer than this to come back is worth a line
+         * in the log. Two seconds: a whole four rung bracket lands in about one,
+         * measured, so anything past two is the beginning of a fault and not a
+         * slow moment.
+         */
+        private const val SLOW_FRAME_MS = 2_000L
+        /** And one bad burst is one line, not one per rung. */
+        private const val SLOW_REPORT_GAP_MS = 1_000L
+        /**
+         * A frame converts in about 200 ms on a Pixel 9a. Past a second, the
+         * camera thread is being held long enough to matter.
+         */
+        private const val SLOW_CONVERT_MS = 1_000L
+        /**
+         * Getting a frame out of the camera's buffer is a memcpy and measures
+         * around 30 ms; past 300 the buffer itself is the problem, which is a
+         * different fault from the arithmetic being slow.
+         */
+        private const val SLOW_COPY_MS = 300L
+
+        /**
          * Opens a camera and walks down the stream ladder until one configuration
          * is accepted, reporting which rung it landed on.
          *
@@ -670,8 +874,19 @@ class Camera2Source private constructor(
          * profile is only knowable at that point, because it depends on which
          * plan the device agreed to.
          */
+        /**
+         * [lensId] is a [Lens] id, which is not always a camera id.
+         *
+         * A lens behind a logical camera is `<logical>:<physical>`, and reaching
+         * it means opening the parent and naming the physical id on every output
+         * configuration - a physical camera generally cannot be opened on its
+         * own. What describes it, though, is its *own* characteristics: the 9a's
+         * ultrawide is 4208x3120 at 1.84 mm behind a 4000x3000 parent at 4.53 mm,
+         * and describing it by the parent would put every reprojection, every
+         * radiance scale and every demosaic on the wrong sensor.
+         */
         @JvmStatic
-        fun open(context: Context, cameraId: String, previewTexture: SurfaceTexture?,
+        fun open(context: Context, lensId: String, previewTexture: SurfaceTexture?,
                  onReady: (Camera2Source) -> Unit, onFailed: (String) -> Unit) {
             if (context.checkSelfPermission(Manifest.permission.CAMERA)
                 != PackageManager.PERMISSION_GRANTED) {
@@ -680,22 +895,28 @@ class Camera2Source private constructor(
             }
             val manager = context.getSystemService(Context.CAMERA_SERVICE) as? CameraManager
             if (manager == null) { onFailed("This device has no camera service"); return }
-            val characteristics = try {
-                manager.getCameraCharacteristics(cameraId)
+            val lens = try {
+                CameraProbe.lensFor(manager, lensId)
             } catch (e: Exception) {
-                onFailed("Could not read camera $cameraId: ${e.message}"); return
+                onFailed("Could not read the cameras: ${e.message}"); return
+            }
+            if (lens == null) { onFailed("This phone has no lens $lensId"); return }
+            val characteristics = try {
+                CameraProbe.characteristicsFor(manager, lens)
+            } catch (e: Exception) {
+                onFailed("Could not read lens $lensId: ${e.message}"); return
             }
             val plans = StreamLadder.plansFor(CameraProbe.reportFor(characteristics))
-            if (plans.isEmpty()) { onFailed("Camera $cameraId offers no usable output"); return }
+            if (plans.isEmpty()) { onFailed("Lens $lensId offers no usable output"); return }
 
             val thread = HandlerThread("hdri-camera").apply { start() }
             val handler = Handler(thread.looper)
             try {
-                manager.openCamera(cameraId, object : CameraDevice.StateCallback() {
+                manager.openCamera(lens.openId, object : CameraDevice.StateCallback() {
                     private var handed = false
 
                     override fun onOpened(camera: CameraDevice) {
-                        Configurator(context, manager, characteristics, camera, thread, handler,
+                        Configurator(context, manager, lens, characteristics, camera, thread, handler,
                             previewTexture, plans,
                             { source -> if (!handed) { handed = true; onReady(source) } },
                             { why ->
@@ -745,6 +966,7 @@ class Camera2Source private constructor(
     private class Configurator(
         private val context: Context,
         private val manager: CameraManager,
+        private val lens: Lens,
         private val characteristics: CameraCharacteristics,
         private val device: CameraDevice,
         private val thread: HandlerThread,
@@ -784,13 +1006,15 @@ class Camera2Source private constructor(
                     surfaces.add(meteringReader.surface)
                 }
 
-                val profile = CameraProbe.profileFor(device.id, characteristics, plan, subsample,
+                // Named by the lens. A stored session that recorded "0" for a
+                // capture shot on the ultrawide behind it could not be resumed on
+                // the right lens, and its report would name the wrong optics.
+                val profile = CameraProbe.profileFor(lens.id, characteristics, plan, subsample,
                     CameraProbe.describe(plan, subsample))
                 val readerForClose = captureReader
                 val meteringForClose = meteringReader
 
-                @Suppress("DEPRECATION")   // SessionConfiguration is API 28; minSdk is 26
-                device.createCaptureSession(surfaces, object : CameraCaptureSession.StateCallback() {
+                val callback = object : CameraCaptureSession.StateCallback() {
                     override fun onConfigured(s: CameraCaptureSession) {
                         val source = Camera2Source(context, manager, characteristics, device,
                             thread, handler, previewSurface, previewTexture, plan, subsample, profile)
@@ -806,7 +1030,7 @@ class Camera2Source private constructor(
                                         val luma = FrameConverters.luma(im, source.meteringSubsample())
                                         val rel = source.previewSettings
                                             .relativeExposure(profile.exposureLimits.baseIso)
-                                        source.work.execute {
+                                        source.post {
                                             synchronized(source.lock) { source.listener }
                                                 ?.onPreviewFrame(luma, rel)
                                         }
@@ -819,7 +1043,13 @@ class Camera2Source private constructor(
                             }
                         }, handler)
                         source.applyPreview()
-                        CaptureLog.log("configured: $plan, working at 1/$subsample")
+                        CaptureLog.log("configured: $plan, working at 1/$subsample" +
+                            (source.minFrameDurationNs.let {
+                                if (it > 0) String.format(java.util.Locale.US,
+                                    ", stream floor %.1f ms (%.1f fps)",
+                                    it / 1e6, 1e9 / it)
+                                else ", the device would not say its frame floor"
+                            }))
                         onReady(source)
                     }
 
@@ -832,7 +1062,30 @@ class Camera2Source private constructor(
                         previewSurface.release()
                         tryNext()
                     }
-                }, handler)
+                }
+
+                // A lens behind a logical camera is reached by naming its physical
+                // id on every output, preview included. Binding only the captures
+                // would leave the person aiming a 70 degree viewfinder at a plan
+                // drawn for 104 - which is not a smaller mistake than shooting the
+                // wrong lens, it is the same mistake made harder to see.
+                //
+                // If the device refuses a physical binding on one of these
+                // surfaces the configuration fails, the ladder tries its next rung
+                // and the refusals are reported. That is the honest outcome: some
+                // phones will not stream a physical camera to a preview.
+                if (lens.isPhysical && Build.VERSION.SDK_INT >= 28) {
+                    val pid = lens.physicalId
+                    val configs = surfaces.map { surface ->
+                        OutputConfiguration(surface).apply { setPhysicalCameraId(pid) }
+                    }
+                    device.createCaptureSession(SessionConfiguration(
+                        SessionConfiguration.SESSION_REGULAR, configs,
+                        java.util.concurrent.Executor { r -> handler.post(r) }, callback))
+                } else {
+                    @Suppress("DEPRECATION")   // SessionConfiguration is API 28; minSdk is 26
+                    device.createCaptureSession(surfaces, callback, handler)
+                }
             } catch (e: CameraAccessException) {
                 onFailed("Lost access to the camera while configuring it: ${e.message}")
             } catch (e: Exception) {

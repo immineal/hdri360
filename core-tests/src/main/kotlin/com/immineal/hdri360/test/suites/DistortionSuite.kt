@@ -27,6 +27,7 @@ class DistortionSuite : TestCase {
     override fun name(): String = "distortion"
 
     override fun run(t: TestKit) {
+        aK1AtItsLimitIsNotAMeasurement(t)
         val r = t.rng(4242424)
         val k1True = -0.09
 
@@ -342,4 +343,87 @@ class DistortionSuite : TestCase {
 
     private fun randomVec(r: Random): Vec3 =
         Vec3(r.nextGaussian(), r.nextGaussian(), r.nextGaussian()).normalized()
+
+    /**
+     * A coefficient that reaches its own bound is a fit artefact, not a lens.
+     *
+     * The bound exists because phone lenses sit well inside it - the comment on
+     * `k1Limit` says exactly that, and then the solver kept the value anyway. On
+     * a real 34-direction capture it did: the sphere the phone produced was
+     * rendered with **k1 = 0.4000**, the clamp to the digit, and that number
+     * bends the geometry of every frame in it.
+     *
+     * It got past the two existing gates honestly. The improvement gate compares
+     * the fit with and without distortion and the fit *was* better; the signal
+     * gate asks whether the correspondences had the radial spread to measure k1
+     * at all, and with a large enough k1 the claimed signal clears any threshold.
+     * Neither asks the question that matters: whether the optimiser stopped
+     * because it found a minimum or because it ran out of room.
+     *
+     * Measured alongside: fixing k1 by hand and re-solving gave residuals of
+     * 1.05, 1.10, 1.05, 1.04, 1.05, 0.72, 0.89, 0.84 degrees for k1 from 0 to
+     * 0.4. Not a curve with a minimum - noise, because changing k1 changes which
+     * pairs survive RANSAC and the residual is then over a different set of
+     * measurements. On that data k1 is not identifiable, and the honest value is
+     * none.
+     */
+    private fun aK1AtItsLimitIsNotAMeasurement(t: TestKit) {
+        val r = t.rng(20260905)
+        val k = Intrinsics.fromHorizontalFov(320, 240, 70.0)
+        // Two views of the same points, related by a real rotation, with no
+        // distortion in them at all - but observed through a model that will be
+        // asked to find some.
+        val rot = SO3.exp(Vec3(Math.toRadians(3.0), Math.toRadians(18.0), Math.toRadians(1.5)))
+        val obs = ArrayList<RotationBundleAdjuster.Correspondence>()
+        var made = 0
+        for (i in 0 until 400) {
+            val u = 8.0 + (k.width - 16.0) * r.nextDouble()
+            val v = 8.0 + (k.height - 16.0) * r.nextDouble()
+            val a = k.unproject(u, v)
+            val bDir = rot.mulTranspose(a)
+            val q = k.project(bDir) ?: continue
+            if (q[0] < 0 || q[1] < 0 || q[0] > k.width - 1 || q[1] > k.height - 1) continue
+            val pa = doubleArrayOf(u, v)
+            obs.add(RotationBundleAdjuster.Correspondence(0, 1,
+                a, k.unproject(q[0], q[1]), 1.0, pa, q))
+            made++
+        }
+        t.greaterThan(made.toDouble(), 100.0, "the pair overlaps enough to say something about k1")
+        val opt = RotationBundleAdjuster.Options()
+        opt.solveDistortion = true
+        opt.distortionIntrinsics = arrayOf(k, k)
+        opt.fixFirst = true
+        val clean = RotationBundleAdjuster.solve(
+            arrayOf(Mat3.IDENTITY, rot), obs, null, opt)
+        t.near(0.0, clean.k1, 1e-6,
+            "distortion-free data reports no distortion, which the existing gates already do")
+
+        // The shape of the real failure: a fit that genuinely improves and lands
+        // on the bound. Built by distorting the data further than the model is
+        // allowed to go, so the optimiser stops because it ran out of room rather
+        // than because it found a minimum - exactly what happened on the phone,
+        // where the improvement gate passed and k1 came back at 0.4000 to the
+        // digit.
+        val trueK1 = 0.8
+        val bent = Intrinsics(k.width, k.height, k.fx, k.fy, k.cx, k.cy, trueK1, 0.0, 0.0)
+        val bentObs = ArrayList<RotationBundleAdjuster.Correspondence>()
+        for (o in obs) {
+            val pa = o.pixelA ?: continue
+            val pb = o.pixelB ?: continue
+            // Where a lens with that much distortion would actually put the two
+            // points, read back through the model the stitcher believes in.
+            val qa = bent.project(k.unproject(pa[0], pa[1])) ?: continue
+            val qb = bent.project(k.unproject(pb[0], pb[1])) ?: continue
+            bentObs.add(RotationBundleAdjuster.Correspondence(0, 1,
+                k.unproject(qa[0], qa[1]), k.unproject(qb[0], qb[1]), 1.0, qa, qb))
+        }
+        t.greaterThan(bentObs.size.toDouble(), 80.0, "enough of it survives the bending")
+
+        val out = RotationBundleAdjuster.solve(
+            arrayOf(Mat3.IDENTITY, rot), bentObs, null, opt)
+        t.lessThan(Math.abs(out.k1), opt.k1Limit,
+            "a coefficient that reached its own bound is refused rather than reported as a lens")
+        t.note(String.format(java.util.Locale.US,
+            "true k1 %.2f, beyond the %.2f limit: reported %.4f", trueK1, opt.k1Limit, out.k1))
+    }
 }

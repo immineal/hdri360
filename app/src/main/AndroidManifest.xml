@@ -5,6 +5,10 @@
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_DATA_SYNC" />
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+    <!-- Stitching a sphere is minutes of solid arithmetic, and a foreground
+         service does not by itself stop the device suspending when the screen
+         goes off - which is exactly when somebody pockets the phone. -->
+    <uses-permission android:name="android.permission.WAKE_LOCK" />
     <!-- The zenith is shot with the screen facing the floor; the only feedback
          a person can use up there is one they can feel. -->
     <uses-permission android:name="android.permission.VIBRATE" />
@@ -13,8 +17,18 @@
     <uses-feature android:name="android.hardware.camera.level.full" android:required="false" />
     <uses-feature android:name="android.hardware.sensor.gyroscope" android:required="false" />
 
+    <!-- allowBackup is off deliberately. A capture is gigabytes of raw frames in
+         the app's own storage, far past what Auto Backup will carry, so what
+         would actually be backed up is the small metadata beside it - session
+         headers, names, the intro flag. Restored onto a new phone that has none
+         of the frames, that is a library full of rows pointing at captures which
+         are not there. Better to restore nothing than the index of something
+         missing. -->
     <application
         android:label="@string/app_name"
+        android:icon="@mipmap/ic_launcher"
+        android:roundIcon="@mipmap/ic_launcher_round"
+        android:allowBackup="false"
         android:largeHeap="true"
         android:hardwareAccelerated="true"
         android:theme="@style/Theme.Hdri360">
@@ -31,6 +45,14 @@
         </activity>
         <activity
             android:name=".ui.ReviewActivity"
+            android:exported="false"
+            android:configChanges="orientation|screenSize|keyboardHidden" />
+        <activity
+            android:name=".ui.AboutActivity"
+            android:exported="false"
+            android:configChanges="orientation|screenSize|keyboardHidden" />
+        <activity
+            android:name=".ui.LibraryActivity"
             android:exported="false"
             android:configChanges="orientation|screenSize|keyboardHidden" />
 

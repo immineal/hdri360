@@ -48,7 +48,17 @@ fun SphereOverlay(
     frameWidthPx: Float = 0f,
     frameHeightPx: Float = 0f,
     /** Degrees the phone is rolled from the target's pose, or null when unknown. */
-    rollErrorDeg: Double? = null
+    rollErrorDeg: Double? = null,
+    /**
+     * Per direction, how many shorter rungs it needed. Marked on the dot rather
+     * than announced: a line of text on a capture screen is read once and then
+     * ignored, and a mark is still there when the person looks back at that part
+     * of the sphere and wonders why it took two goes.
+     */
+    extraRungs: IntArray? = null,
+    /** Frames in the bracket being taken right now, and how many have landed. */
+    burstRungs: Int = 0,
+    burstReceived: Int = 0
 ) {
     Canvas(modifier = modifier) {
         if (pose == null || intrinsics == null || targets.isEmpty()) return@Canvas
@@ -68,7 +78,8 @@ fun SphereOverlay(
             if (p != null) {
                 val at = map.toView(p[0], p[1])
                 if (at != null) {
-                    drawTarget(at, done, gaveUp, isCurrent, aligned && isCurrent, steady)
+                    val extra = if (extraRungs != null && i < extraRungs.size) extraRungs[i] else 0
+                    drawTarget(at, done, gaveUp, isCurrent, aligned && isCurrent, steady, extra)
                     continue
                 }
             }
@@ -85,6 +96,26 @@ fun SphereOverlay(
             radius = radius,
             center = centre,
             style = Stroke(width = if (ready) 6f else 3f))
+
+        // A bracket in flight, drawn as it lands. This is the only thing on the
+        // screen that says "keep holding": a burst is a fifth of a second on an
+        // easy direction and two and a half seconds on one being shot again, and
+        // for all of it the person has to stay still with nothing to go on.
+        // Frames rather than time, so it tracks the storage actually finishing
+        // rather than a guess at how long it should take.
+        if (burstRungs > 0) {
+            val done = burstReceived.coerceIn(0, burstRungs) / burstRungs.toFloat()
+            val ring = radius * 1.45f
+            drawCircle(OK.copy(alpha = 0.20f), ring, centre, style = Stroke(width = 5f))
+            drawArc(
+                color = OK,
+                startAngle = -90f,
+                sweepAngle = 360f * done,
+                useCenter = false,
+                topLeft = Offset(centre.x - ring, centre.y - ring),
+                size = Size(ring * 2, ring * 2),
+                style = Stroke(width = 5f))
+        }
 
         // How far the phone is rolled from the pose the plan wants. Drawn rather
         // than worded, because "turn it left" depends on which way round you think
@@ -113,8 +144,15 @@ private val IDLE = Color(0x88FFFFFF)
 private val MISSED = Color(0xFFFF6E5A)
 
 private fun DrawScope.drawTarget(at: Offset, done: Boolean, gaveUp: Boolean, current: Boolean,
-                                 aligned: Boolean, steady: Boolean) {
+                                 aligned: Boolean, steady: Boolean, extraRungs: Int = 0) {
     val r = size.minDimension * (if (current) 0.035f else 0.018f)
+    // A direction that burnt out and had to be shot again carries a second ring,
+    // one per extra rung it needed. Drawn outside the dot so it reads as
+    // something that happened to that direction rather than as a different kind
+    // of direction, and drawn at all because the capture visibly took longer
+    // there and nothing else on screen says why.
+    for (k in 1..Math.min(extraRungs, 3))
+        drawCircle(DONE.copy(alpha = 0.30f), r + r * 0.45f * k, at, style = Stroke(width = 1.5f))
     when {
         // Shown, and shown as a hole rather than quietly counted as finished: a
         // direction that could not be shot is a gap in the sphere, and the user is

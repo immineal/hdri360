@@ -174,12 +174,24 @@ object RotationBundleAdjuster {
 
         // Keep the coefficient only if it earned its place against an otherwise
         // identically-fitted model, *and* if the data could have measured it at
-        // all. The two gates catch different failures: the first rejects a k1 that
-        // does not help, the second a k1 that helps for the wrong reason.
+        // all, *and* if the optimiser stopped because it found a minimum rather
+        // than because it ran out of room. The three gates catch different
+        // failures: the first rejects a k1 that does not help, the second a k1
+        // that helps for the wrong reason, the third a k1 that is not an answer.
+        //
+        // The third had to be added after the fact. A real 34-direction capture
+        // shipped a sphere rendered with k1 = 0.4000 - the bound to the digit -
+        // and it got past both existing gates honestly: the fit was better, and a
+        // coefficient that large clears any signal threshold by being large. The
+        // comment on [Options.k1Limit] already says a runaway k1 is always a fit
+        // artefact; this is that sentence enforced. What such a k1 is absorbing is
+        // pose or graph error, and bending every frame's geometry to hide it is
+        // worse than leaving the residual where it can be seen.
         val improved = reference.rmsErrorRad - withK1.rmsErrorRad
         if (improved <= reference.rmsErrorRad * opt.distortionMinGain) return reference
         val signalRad = Math.abs(withK1.k1) * distortionLeverage(obs, baseIntrinsics)
         if (signalRad < Math.toRadians(opt.distortionMinSignalDeg)) return reference
+        if (Math.abs(withK1.k1) >= opt.k1Limit * (1 - 1e-6)) return reference
         return withK1
     }
 

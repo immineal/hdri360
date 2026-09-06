@@ -1,0 +1,45 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+    The themed variant. A launcher tints this by the wallpaper and throws the
+    colour away, so it is the same drawing in one ink - the amber digits would
+    otherwise be indistinguishable from the ring around them. The digits keep
+    full strength and the sphere is dropped back, so the mark still reads as
+    "360 inside something" rather than as four strokes of equal weight.
+-->
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="108dp"
+    android:height="108dp"
+    android:viewportWidth="108"
+    android:viewportHeight="108"
+    android:tint="#FFFFFF">
+
+    <path
+        android:strokeColor="#FFFFFF"
+        android:strokeAlpha="0.55"
+        android:strokeWidth="2.8"
+        android:pathData="M 24,54 a 30,30 0 1,0 60,0 a 30,30 0 1,0 -60,0 Z" />
+    <path
+        android:strokeColor="#FFFFFF"
+        android:strokeWidth="3.1"
+        android:strokeLineCap="round"
+        android:strokeLineJoin="round"
+        android:pathData="m 29.7658,44.5405 c 10.0850,-17.8616 19.8951,-7.9627 9.7297,9.1892
+                          10.3205,19.7481 -2.6835,26.9921 -9.7297,7.3874" />
+    <path
+        android:strokeColor="#FFFFFF"
+        android:strokeWidth="3.1"
+        android:strokeLineCap="round"
+        android:strokeLineJoin="round"
+        android:pathData="m 63.2793,30.3063 c -7.2258,-3.6548 -18.8393,-2.5948 -17.2973,0.5405
+                          13.2835,27.0086 -9.2376,50.1045 8.1081,49.9099
+                          17.3457,-0.1946 12.1966,-24.8649 -3.9640,-24.8649" />
+    <path
+        android:strokeColor="#FFFFFF"
+        android:strokeWidth="3.1"
+        android:strokeLineCap="round"
+        android:strokeLineJoin="round"
+        android:pathData="m 71.2072,35.5315 c -3.5657,-2.0711 -5.3497,-2.0239 -7.5676,1.0811
+                          -7.0924,9.9293 3.2042,16.1579 4.8649,26.4865
+                          1.6147,10.0429 5.0000,11.9470 9.5495,2.1622
+                          5.9425,-12.7807 -0.4539,-23.3367 -6.8468,-29.7297 z" />
+</vector>

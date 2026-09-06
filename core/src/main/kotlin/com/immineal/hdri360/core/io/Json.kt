@@ -83,7 +83,7 @@ object Json {
         fun add(v: Double): Arr { items.add(Num(v)); return this }
         fun add(v: String): Arr { items.add(Str(v)); return this }
 
-        override fun at(i: Int): Value = items[i]
+        override fun at(index: Int): Value = items[index]
         override fun size(): Int = items.size
 
         override fun toString(): String {

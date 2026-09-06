@@ -18,6 +18,14 @@ import com.immineal.hdri360.core.pano.CaptureTarget
  * the whole sphere, then guide the user through the directions and fire each
  * bracket when the phone is pointed and still.
  *
+ * The ladder is planned before the capture and is not finished there. A sweep
+ * that saw a direction saturate learned only that the direction is brighter than
+ * the sensor could read, so the rung meant to hold its highlights can still come
+ * back on the rail; when it does, a shorter rung is added and that direction is
+ * shot again at once, while the person is still pointing at it. Directions that
+ * did not clip are left alone - they do not need the new rung, and giving it to
+ * them would spend a frame everywhere to fix a fault in one.
+ *
  * Deliberately free of any platform type. The camera arrives as a
  * [CameraSource], storage as a [FrameSink], and time as an argument, which is
  * what lets the whole thing - including a camera that disconnects mid-burst, a
@@ -71,12 +79,35 @@ class CaptureController(
          * How far the phone may be rolled about that axis and still fire.
          *
          * Wider than the aim tolerance on purpose: rolling a frame turns its
-         * footprint about its own centre, which at the plan's overlap costs
-         * nothing, while mis-aiming it moves the footprint off the part of the
-         * sphere the plan assigned it. Judging both by one number is what makes a
-         * sphere unshootable by hand.
+         * footprint about its own centre, while mis-aiming it moves the footprint
+         * off the part of the sphere the plan assigned it. Judging both by one
+         * number is what makes a sphere unshootable by hand.
+         *
+         * The number itself was a guess at 15 degrees, and on a real 34 direction
+         * capture it was the binding constraint. Every direction was aimed within
+         * 0.8 degrees of its 7 degree budget - nine times better than needed -
+         * while the roll error on the plus and minus 55 degree rings reached 9.3
+         * degrees of 15. The two slowest directions of that ring took 16.6 and
+         * 15.8 seconds against a 5 second median, and they were exactly the two
+         * with the largest roll error.
+         *
+         * Roll grows with pitch for a reason that has nothing to do with a
+         * steadier wrist near the horizon. Gravity pins pitch and roll against
+         * itself and leaves the rotation *about* gravity - the heading - as the
+         * badly determined one, and a heading error of d lands in roll as
+         * d*sin(pitch): 31% of it at 18 degrees, 82% at 55. Dividing the measured
+         * roll error by sin(pitch) gave the same 2 to 10 degrees at every ring,
+         * which is one heading uncertainty showing up in different places.
+         *
+         * So 30, derived rather than picked. Two neighbours may be off in
+         * opposite directions, so a per frame budget of 30 is up to 60 degrees of
+         * relative roll, and at 60 the capture-plan suite measures no coverage
+         * lost at all and every frame still holding four partners at a quarter
+         * overlap; the feature suite has the descriptors still matching out to 90
+         * degrees of relative roll. 30 is also more than three times the worst
+         * roll error a hand has actually produced here.
          */
-        @JvmField var rollToleranceDeg = 15.0
+        @JvmField var rollToleranceDeg = 30.0
         /**
          * Above this pitch, roll is not judged at all.
          *
@@ -85,6 +116,11 @@ class CaptureController(
          * nothing to aim by. Asking them to find a heading they cannot see, at
          * the one direction where the surrounding ring already overlaps
          * everything, is how the top of the sphere ends up missing.
+         *
+         * Kept as a step rather than folded into the tolerance above, because at
+         * the poles it is not a matter of degree: the measured roll errors there
+         * were 51 and 77 degrees, which is what "roll is heading" looks like when
+         * heading is what nobody can see.
          */
         @JvmField var freeRollAbovePitchDeg = 75.0
         /** Shutter lockout, so one steady moment does not fire twice. */
@@ -108,8 +144,43 @@ class CaptureController(
          * because shooting it again costs more than waiting for it.
          */
         @JvmField var burstTimeoutNs = 12_000_000_000L
+        /**
+         * How long to wait for a burst before the camera has *ever* delivered a
+         * frame: four seconds.
+         *
+         * A whole five rung bracket takes 0.07 to 0.10 seconds on the phone this
+         * was measured on, timestamp to timestamp, and does not grow through a
+         * capture. So four seconds is a fortyfold margin on a camera that works,
+         * and three attempts at it is twelve seconds rather than thirty-six -
+         * which is thirty-six seconds of somebody standing in a room holding a
+         * phone still to be told a lens delivers nothing.
+         *
+         * Only before the first frame. Once the camera has produced anything at
+         * all it is known to work, and a burst that is merely slow gets the full
+         * [burstTimeoutNs] and the benefit of the doubt.
+         */
+        @JvmField var firstFrameTimeoutNs = 4_000_000_000L
         /** Give up on a direction after this many failed bursts and move on. */
         @JvmField var maxBurstAttempts = 3
+        /**
+         * How many writes may fail back to back before the capture stops.
+         *
+         * Three, which is a whole bracket on the shortest ladder this plans: a
+         * burst delivered in full and not one frame of it on disk. Fewer would
+         * end a capture over a single unlucky write; more spends the person's
+         * time proving something already proved.
+         */
+        @JvmField var storeFailuresBeforeGivingUp = 3
+        /**
+         * How many times one direction may have a shorter rung added before the
+         * capture takes what it can get.
+         *
+         * A backstop rather than a policy. The real bound is the camera's fastest
+         * shutter, which every added rung moves a whole EV step closer to; this
+         * exists so that a device whose stated limits do not describe it can
+         * never put a capture into a loop the person cannot get out of.
+         */
+        @JvmField var maxDarkerRungsPerDirection = 4
         /** Exposure the scan starts at, before metering has anything to say. */
         @JvmField var initialScanExposure = 1.0 / 120.0
         /**
@@ -183,13 +254,53 @@ class CaptureController(
          * of every sweep was spent guessing.
          */
         @JvmField val metered: BooleanArray,
+        /**
+         * Per direction, how many shorter rungs it needed before it stopped
+         * burning out.
+         *
+         * For the overlay to mark, rather than for a line of text to announce.
+         * A capture screen's text is read once and then ignored; a mark on the
+         * direction it happened to is still there when the person looks back at
+         * that part of the sphere and wonders why it took two goes.
+         */
+        @JvmField val extraRungs: IntArray,
+        /**
+         * Frames in the bracket being taken right now, or 0 when none is.
+         *
+         * The capture screen showed nothing while a burst was in flight, and a
+         * burst is a fifth of a second on a good direction and two and a half on
+         * one being shot again - all of it spent holding a phone still with
+         * nothing to say why. Given as a count rather than a flag because "how
+         * much longer" is the question, and a flag cannot answer it.
+         */
+        @JvmField val burstRungs: Int,
+        @JvmField val burstReceived: Int,
         @JvmField val scene: SceneStats?,
         @JvmField val message: String?
     ) {
         val directionsShot: Int get() = shot.count { it }
+
+        /**
+         * How far through the sphere, counted in directions.
+         *
+         * Not in frames. Decision 1 makes the frame count grow: a direction that
+         * comes back burnt out adds a frame to the plan, so a fraction with
+         * frames in the denominator *falls* at the moment the app decides to do
+         * more work. On screen that is indistinguishable from a stall, at exactly
+         * the point where the capture has started taking longer - which is when
+         * somebody is most likely to decide it has hung.
+         *
+         * Directions do not grow. There are as many at the end as at the start,
+         * each is settled once, and settled is what the person is counting: how
+         * many more times must I stop, aim and hold still.
+         */
         val progress: Double
-            get() = if (framesPlanned > 0) framesTaken / framesPlanned.toDouble()
-                    else CaptureGuide.progress(shot)
+            get() {
+                if (shot.isEmpty()) return 1.0
+                var settled = 0
+                for (i in shot.indices) if (shot[i] || abandoned[i]) settled++
+                return settled / shot.size.toDouble()
+            }
     }
 
     fun interface Observer { fun onChanged(snapshot: Snapshot) }
@@ -220,8 +331,29 @@ class CaptureController(
      */
     private var shortestClippedRelative = Double.POSITIVE_INFINITY
     private val attempts = IntArray(targetCount)
+    /**
+     * The shortest exposure each direction has actually been shot at, and how
+     * much of that frame came back on the rail.
+     *
+     * Measured from the frames themselves, not from the plan: what the ladder
+     * asked for and what the sensor did are two different things, and whether a
+     * direction burnt out is a fact about its pixels. This is what decision 1
+     * turns on - a sweep can only bound a clipped reading from below, so the
+     * measurement that settles the top of the range is the capture itself.
+     */
+    private val darkestShotRelative = DoubleArray(targetCount) { Double.POSITIVE_INFINITY }
+    private val clipAtDarkestShot = DoubleArray(targetCount)
+    private val darkerRungsAdded = IntArray(targetCount)
+    /**
+     * Frames of each direction that are on disk.
+     *
+     * Per direction rather than a running total, because a re-shot direction
+     * writes over its own files: counting every stored frame made a direction
+     * that was shot twice look like two directions' worth of progress, and with
+     * a ladder that grows a re-shoot is ordinary rather than exceptional.
+     */
+    private val storedPerTarget = IntArray(targetCount)
     private var bracketPlan: BracketPlan? = null
-    private var framesTaken = 0
     private var framesPlanned = 0
 
     private var pose: Mat3? = null
@@ -283,9 +415,9 @@ class CaptureController(
             java.util.Arrays.fill(abandoned, false)
             bracketPlan = plannedBrackets
             framesPlanned = plannedBrackets.totalShots()
-            framesTaken = 0
+            java.util.Arrays.fill(storedPerTarget, 0)
             for (i in 0 until targetCount)
-                if (shot[i]) framesTaken += plannedBrackets.indicesPerTarget[i].size
+                if (shot[i]) storedPerTarget[i] = plannedBrackets.indicesPerTarget[i].size
             state = if (settled.all { it }) State.FINISHED else State.CAPTURING
             message = "resumed with ${shot.count { it }} of $targetCount directions already shot"
         }
@@ -387,7 +519,7 @@ class CaptureController(
             ladder = BracketPlanner.plan(filled, source.profile.exposureLimits, config.bracket)
             bracketPlan = ladder
             framesPlanned = ladder.totalShots()
-            framesTaken = 0
+            java.util.Arrays.fill(storedPerTarget, 0)
             state = State.CAPTURING
             message = String.format(java.util.Locale.US,
                 "%.0f EV of scene: %d frames over %d directions",
@@ -534,7 +666,7 @@ class CaptureController(
         fire?.let { (target, settings) ->
             val id = synchronized(lock) { pendingBurst }
             if (!source.captureBracket(id, target, settings)) {
-                synchronized(lock) { abandonBurstLocked("the camera refused the burst") }
+                synchronized(lock) { releaseBurstLocked(nowNs) }
             } else {
                 synchronized(lock) { lastBracketNs = burstStartedNs }
             }
@@ -543,23 +675,62 @@ class CaptureController(
     }
 
     override fun onFrameCaptured(frame: CapturedFrame, pixels: ImageF) {
-        var stored = false
+        val relative = frame.settings.relativeExposure(source.profile.exposureLimits.baseIso)
+        val t = frame.targetIndex
+        val measure: Boolean
         synchronized(lock) {
+            // Counted before the burst is matched, and never reset: a straggler
+            // from a burst already given up on still proves the camera delivers,
+            // which is the only question this flag answers.
+            aFrameHasArrived = true
             // Matched on the burst, not the direction: a retry of the same
             // direction is a different burst, and a straggler from the abandoned
             // one must not be counted toward it.
             if (frame.burstId != pendingBurst) return
+            if (t < 0 || t >= targetCount) return
+            // Only the shortest exposure a direction is shot at is measured. That
+            // is the rung which has to hold the highlights; the longer rungs of a
+            // bracket are meant to saturate, and reading them would cost a pass
+            // over twelve megapixels each to learn nothing. In an ordinary burst,
+            // which arrives darkest first, this is one frame in four.
+            measure = relative <= darkestShotRelative[t]
         }
-        stored = try {
+        val stored = try {
             sink.store(frame, pixels)
         } catch (e: Exception) {
             false
         }
+        // Outside the lock. It is a counting pass over a whole frame, and nothing
+        // else may wait on the camera thread for it.
+        val clipped = if (measure) SceneMeter.clippedFraction(pixels, config.meter) else 0.0
         synchronized(lock) {
             if (frame.burstId != pendingBurst) return
+            // Re-checked, because frames are not promised in order: a darker one
+            // arriving second must not be overwritten by a brighter one.
+            if (measure && relative <= darkestShotRelative[t]) {
+                darkestShotRelative[t] = relative
+                clipAtDarkestShot[t] = clipped
+            }
             if (stored) {
+                storeFailuresInARow = 0
                 pendingReceived++
-                framesTaken++
+                // Frames on disk, which is not frames delivered: a re-shot
+                // direction writes over its own files.
+                if (pendingReceived > storedPerTarget[t]) storedPerTarget[t] = pendingReceived
+            } else if (++storeFailuresInARow >= config.storeFailuresBeforeGivingUp) {
+                // A whole burst delivered and not one frame of it written. The
+                // camera is working perfectly; it is the disk that is not, and no
+                // amount of standing still will change that. Without this the
+                // capture worked through the entire sphere blaming one direction
+                // after another - "direction 5 kept failing; moving on", thirty-two
+                // times - and finished by announcing nothing had been captured.
+                state = State.FAILED
+                message = "Frames cannot be written to storage. Check the free " +
+                    "space on this phone and try again."
+                pendingTarget = -1
+                pendingBurst = 0L
+                pendingRungs = 0
+                pendingReceived = 0
             } else {
                 message = "could not write a frame to storage"
             }
@@ -568,13 +739,19 @@ class CaptureController(
     }
 
     override fun onBurstFinished(burstId: Long, targetIndex: Int, requested: Int, received: Int) {
+        var revised: BracketPlan? = null
         synchronized(lock) {
             if (burstId != pendingBurst) return
             // A direction counts as shot only when its frames actually landed. The
             // predecessor marked it done on the burst's metadata, so a short burst
             // left a hole that nothing later would fill.
             if (pendingReceived >= requested && requested > 0) {
-                settleLocked(targetIndex, true)
+                val before = bracketPlan
+                // Decision 1: a direction that came back burnt out is not finished
+                // with. It gets a shorter rung and is shot again now, rather than
+                // being discovered days later as a white hole in the sphere.
+                if (!extendForClippingLocked(targetIndex)) settleLocked(targetIndex, true)
+                if (bracketPlan !== before) revised = bracketPlan
             } else {
                 attempts[targetIndex]++
                 message = if (attempts[targetIndex] >= config.maxBurstAttempts)
@@ -592,6 +769,9 @@ class CaptureController(
                 message = finishedMessageLocked()
             }
         }
+        // Told outside the lock and before the next burst can fire, because the
+        // frames about to be written are the ones this plan describes.
+        revised?.let { sink.planChanged(it) }
         publish()
     }
 
@@ -613,15 +793,53 @@ class CaptureController(
      * pending target only on completion, and a failed burst never completed, so
      * one dropped frame wedged the capture with no way out but restarting it.
      */
+    /**
+     * Whether this camera has ever handed over a single frame.
+     *
+     * Not a statistic. It separates "this direction is hard to hold" from "this
+     * lens does not work", and those need opposite responses: the first is worth
+     * retrying and moving past, the second is worth stopping for at once.
+     */
+    private var aFrameHasArrived = false
+
+    /**
+     * Writes that failed back to back, cleared by the first that succeeds.
+     *
+     * One failed write is a thing that happens and the retry is what this
+     * controller is for. A burst's worth in a row is a disk that is full or a
+     * directory that has gone, and that is a different fault with a different
+     * answer.
+     */
+    private var storeFailuresInARow = 0
+
     private fun expireBurstLocked(nowNs: Long) {
         if (pendingTarget < 0) return
-        if (nowNs - burstStartedNs < config.burstTimeoutNs) return
+        val patience = if (aFrameHasArrived) config.burstTimeoutNs
+                       else Math.min(config.firstFrameTimeoutNs, config.burstTimeoutNs)
+        if (nowNs - burstStartedNs < patience) return
         val t = pendingTarget
         if (pendingReceived >= pendingRungs && pendingRungs > 0) {
             settleLocked(t, true)
         } else {
             attempts[t]++
             if (attempts[t] >= config.maxBurstAttempts) {
+                if (!aFrameHasArrived) {
+                    // Three bursts handed over, well past a minute of somebody
+                    // standing in a room holding a phone still, and not one frame
+                    // back. Nothing they do differently will change that, and
+                    // working through the remaining twenty directions only spends
+                    // more of their evening to abandon each in turn - which is
+                    // exactly what this app did on a physical ultrawide, twice.
+                    // Stop, and say the one thing that is actually true.
+                    state = State.FAILED
+                    message = "No frames are arriving from this lens. " +
+                        "Pick another one and try again."
+                    pendingTarget = -1
+                    pendingBurst = 0L
+                    pendingRungs = 0
+                    pendingReceived = 0
+                    return
+                }
                 settleLocked(t, false)
                 message = "direction ${t + 1} timed out repeatedly; moving on"
             } else {
@@ -634,6 +852,36 @@ class CaptureController(
         pendingReceived = 0
     }
 
+    /**
+     * Hands a burst back because the camera would not take it.
+     *
+     * A refusal means the camera is busy - almost always still finishing the
+     * burst before this one - which is a fact about timing, not about the
+     * direction being aimed at. So it costs the direction nothing, and it waits
+     * the ordinary bracket interval before trying again.
+     *
+     * Both halves matter, and their absence killed a whole capture in a dim
+     * room. A long burst outlasted its own timeout, the controller expired it
+     * and re-fired, the camera still had the first one in hand and said no, and
+     * that refusal was charged as a failed attempt. Refusals arrive at whatever
+     * rate the orientation sensor ticks, so three of them landed inside forty
+     * milliseconds and the direction was given up for good - then the next, and
+     * the next. Twenty-one directions abandoned, two frames out of eighty-four
+     * written, and the message on screen said only "the camera refused the
+     * burst".
+     */
+    private fun releaseBurstLocked(nowNs: Long) {
+        if (pendingTarget < 0) return
+        message = "waiting for the camera to catch up"
+        pendingTarget = -1
+        pendingBurst = 0L
+        pendingRungs = 0
+        pendingReceived = 0
+        // Not at sensor rate. Without this the retry is immediate and refuses
+        // again, and the log fills faster than it can be read.
+        lastBracketNs = nowNs
+    }
+
     private fun abandonBurstLocked(why: String) {
         if (pendingTarget < 0) return
         attempts[pendingTarget]++
@@ -644,6 +892,55 @@ class CaptureController(
         pendingBurst = 0L
         pendingRungs = 0
         pendingReceived = 0
+    }
+
+    /**
+     * Adds a shorter rung when a direction came back burnt out, and leaves the
+     * direction unsettled so the guide offers it again at once.
+     *
+     * This is decision 1. The ladder was planned from a sweep, and a sweep can
+     * only bound a clipped reading from below - so the rung meant to hold a
+     * direction's highlights is a guess until that direction has actually been
+     * shot. The measurement that settles it is the capture. Re-shot immediately
+     * because the person is still pointing at it: coming back to a direction
+     * later means finding it again, and finding it again by hand is what the
+     * plan exists to avoid.
+     *
+     * The whole bracket is fired again rather than the new rung alone. The merge
+     * combines a direction's rungs pixel for pixel with no alignment of its own,
+     * which is exactly what makes a burst a burst; a rung shot a second later,
+     * handheld, would ghost against its own siblings in the highlights it was
+     * added to save.
+     *
+     * @return true when the direction is to be shot again.
+     */
+    private fun extendForClippingLocked(t: Int): Boolean {
+        val plan = bracketPlan ?: return false
+        val clipped = clipAtDarkestShot[t]
+        if (!SceneMeter.highlightsClipped(clipped, config.meter)) return false
+        val relative = darkestShotRelative[t]
+        if (!relative.isFinite()) return false
+
+        val grown = if (darkerRungsAdded[t] >= config.maxDarkerRungsPerDirection) null
+                    else BracketPlanner.extendDarker(plan, t, source.profile.exposureLimits,
+                        config.bracket, relative / SceneMeter.clippedStepDown(clipped))
+        if (grown == null) {
+            // Decision 3. Where a shorter exposure is physically impossible -
+            // direct sun in a window is brighter than the shortest exposure the
+            // sensor has - the capture proceeds and the file says so: the flag is
+            // what lets the report call the top of the range a lower bound rather
+            // than a measurement. Nothing is thrown away over it.
+            bracketPlan = plan.withDarkEndClamped()
+            message = "direction ${t + 1} is brighter than this camera can read; " +
+                      "its top value is a lower bound"
+            return false
+        }
+        darkerRungsAdded[t]++
+        bracketPlan = grown
+        framesPlanned = grown.totalShots()
+        message = "direction ${t + 1} came back burnt out; shooting it again " +
+                  "with a shorter exposure"
+        return true
     }
 
     /**
@@ -694,11 +991,21 @@ class CaptureController(
         }
     }
 
+    /** Frames on disk across the whole sphere, counting each direction once. */
+    private fun framesStoredLocked(): Int {
+        var n = 0
+        for (c in storedPerTarget) n += c
+        return n
+    }
+
     private fun buildSnapshot(): Snapshot {
         val measured = perTarget.filterNotNull()
         return Snapshot(state, shot.copyOf(), abandoned.copyOf(), currentTarget, yawOffset, pitchOffset,
-            aligned, steady, framesTaken, framesPlanned, meteredFraction(),
+            aligned, steady, framesStoredLocked(), framesPlanned, meteredFraction(),
             BooleanArray(targetCount) { perTarget[it] != null },
+            darkerRungsAdded.copyOf(),
+            if (pendingTarget >= 0) pendingRungs else 0,
+            if (pendingTarget >= 0) Math.min(pendingReceived, pendingRungs) else 0,
             if (measured.isEmpty()) null else SceneStats.union(measured), message)
     }
 
@@ -733,6 +1040,19 @@ interface FrameSink {
      *   rather than leave a hole.
      */
     fun store(frame: CapturedFrame, pixels: ImageF): Boolean
+
+    /**
+     * The ladder grew, and this is the plan the rest of the capture is on.
+     *
+     * A sink that can be resumed has to be told. It wrote the plan down before
+     * the first frame precisely so that an interrupted capture comes back on the
+     * same ladder; a plan it never heard about is one that comes back a rung
+     * short in the one direction that needed the rung.
+     *
+     * Does nothing by default, because a sink that keeps nothing has nothing to
+     * revise.
+     */
+    fun planChanged(plan: BracketPlan) {}
 }
 
 /** A sink that keeps nothing, for metering-only runs and for tests. */

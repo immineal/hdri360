@@ -127,7 +127,26 @@ class EndToEndSuite : TestCase {
         t.eq(ctrl.plan.targets.size.toLong(), snap.directionsShot.toLong(),
             "with every direction actually shot")
         t.eq(0L, snap.abandoned.count { it }.toLong(), "and none given up on")
-        t.eq(ladder.totalShots().toLong(), snap.framesTaken.toLong(), "and every frame stored")
+
+        // Decision 1, in the scene it was written for. This room has a window in
+        // it, so the ladder the sweep planned is short at the top for the
+        // directions that see the window - a sweep can only bound a clipped
+        // reading from below. Those directions come back on the rail, gain a
+        // shorter rung and are shot again, and the capture ends on a plan that is
+        // not the one it started with.
+        val finalPlan = ctrl.bracketPlan()
+        if (finalPlan == null) { t.fail("the capture ended with no plan"); return }
+        t.greaterThan(finalPlan.totalShots().toDouble(), ladder.totalShots().toDouble(),
+            "a room with a window costs more frames than the sweep alone could plan")
+        t.lessThan(finalPlan.totalShots().toDouble(), ladder.totalShots() * 1.5,
+            "and only in the directions that needed them, not everywhere")
+        t.greaterThan(sink.plansForwarded.toDouble(), 0.0, "the store was told each time")
+        t.eq(finalPlan.totalShots().toLong(), snap.framesTaken.toLong(),
+            "and every frame the grown plan asks for is on disk")
+        t.eq(finalPlan.ladder.size().toLong(), store.session.plan.ladder.size().toLong(),
+            "the session header on disk is the plan the frames were shot on")
+        t.note("ladder grew from " + ladder.ladder.size() + " rungs / " + ladder.totalShots() +
+                " frames to " + finalPlan.ladder.size() + " / " + finalPlan.totalShots())
         store.close()
 
         // --- reading it back -------------------------------------------------
@@ -204,9 +223,9 @@ class EndToEndSuite : TestCase {
             val p = Equirect.pixel(d, pano.width, pano.height)
             if (p[0] < 1 || p[1] < 1 || p[0] > pano.width - 2 || p[1] > pano.height - 2) continue
             val truth = world.luminance(d)
-            val got = (0.2126 * pano.sampleBilinear(p[0], p[1], 0) +
-                       0.7152 * pano.sampleBilinear(p[0], p[1], 1) +
-                       0.0722 * pano.sampleBilinear(p[0], p[1], 2)).toDouble()
+            val got = 0.2126 * pano.sampleBilinear(p[0], p[1], 0) +
+                      0.7152 * pano.sampleBilinear(p[0], p[1], 1) +
+                      0.0722 * pano.sampleBilinear(p[0], p[1], 2)
             if (truth > 1e-4 && got > 1e-9) ratios.add(got / truth)
         }
         t.note("ladder: " + ladder.ladder.steps.joinToString(" | ") { it.toString() })
@@ -295,8 +314,18 @@ class EndToEndSuite : TestCase {
     /** Lets the controller be built before the store exists, as the app does. */
     private class DeferredSink : com.immineal.hdri360.core.capture.FrameSink {
         @JvmField var delegate: com.immineal.hdri360.core.capture.FrameSink? = null
+        @JvmField var plansForwarded = 0
         override fun store(frame: CapturedFrame, pixels: ImageF): Boolean =
             delegate?.store(frame, pixels) ?: true
+        /**
+         * Forwarded, as the app forwards it. A ladder that grew and a store that
+         * was not told is a direction read back a rung short - and the rung
+         * missing is the shortest one, which is the only one holding the window.
+         */
+        override fun planChanged(plan: com.immineal.hdri360.core.hdr.BracketPlan) {
+            plansForwarded++
+            delegate?.planChanged(plan)
+        }
     }
 
     /**

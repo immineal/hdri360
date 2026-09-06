@@ -5,3 +5,10 @@ local.properties
 .idea/
 .kotlin/
 *.apk
+
+# Release signing. The keystore and its passwords are the one thing in this
+# repository that cannot be regenerated if lost and must never be committed if
+# kept - see app/build.gradle.kts.
+keystore.properties
+*.jks
+*.keystore

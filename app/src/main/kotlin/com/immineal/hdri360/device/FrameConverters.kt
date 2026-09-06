@@ -7,6 +7,8 @@ import android.hardware.camera2.params.LensShadingMap
 import android.media.Image
 import com.immineal.hdri360.core.image.CfaPattern
 import com.immineal.hdri360.core.image.ImageF
+import com.immineal.hdri360.core.image.RawPlane
+import com.immineal.hdri360.core.image.ShadingMap
 import java.nio.ByteOrder
 
 /**
@@ -27,40 +29,56 @@ object FrameConverters {
      * whole 2x2 blocks so the mosaic phase survives - a frame subsampled off
      * phase is not a Bayer image any more, it is four interleaved wrong ones.
      */
+    /**
+     * Everything about a RAW frame that outlives the camera's own buffer.
+     *
+     * The `Image` has to be closed promptly - there are eight buffers and a burst
+     * of five - and until it is closed the camera cannot fill the next one. So the
+     * camera thread does the one thing that has to happen there, a bulk copy of
+     * the plane, and hands this on. The arithmetic that follows is in
+     * [RawPlane.convert], in the core, off this thread and under test.
+     */
+    class RawFrame(
+        @JvmField val shorts: ShortArray,
+        @JvmField val rowStrideShorts: Int,
+        @JvmField val width: Int,
+        @JvmField val height: Int,
+        @JvmField val black: DoubleArray,
+        @JvmField val white: Double,
+        @JvmField val pattern: CfaPattern,
+        @JvmField val shading: ShadingMap?
+    ) {
+        fun convert(subsample: Int): ImageF = RawPlane.convert(
+            shorts, rowStrideShorts, width, height, subsample, black, white, pattern, shading)
+    }
+
+    /**
+     * Copies a RAW plane out of the camera's buffer, so the image can be closed.
+     *
+     * A bulk `get` and not three million indexed ones: the strided per-sample
+     * read of a direct buffer measured 109 ms a frame on a Pixel 9a, and this is
+     * a memcpy.
+     */
+    @JvmStatic
+    fun rawFrameOf(image: Image, c: CameraCharacteristics, result: TotalCaptureResult,
+                   applyShading: Boolean = true): RawFrame {
+        val plane = image.planes[0]
+        val buf = plane.buffer.order(ByteOrder.nativeOrder()).asShortBuffer()
+        val shorts = ShortArray(buf.remaining())
+        buf.get(shorts)
+        return RawFrame(shorts, plane.rowStride / 2, image.width, image.height,
+            blackLevelOf(c, result),
+            (c.get(CameraCharacteristics.SENSOR_INFO_WHITE_LEVEL) ?: 1023).toDouble(),
+            CameraProbe.cfaOf(c),
+            if (applyShading) shadingOf(result) else null)
+    }
+
     @JvmStatic
     @JvmOverloads
     fun rawPlane(image: Image, c: CameraCharacteristics, result: TotalCaptureResult,
-                 subsample: Int, applyShading: Boolean = true): ImageF {
-        if (subsample < 1 || (subsample and (subsample - 1)) != 0)
-            throw IllegalArgumentException("subsample must be a power of two")
-        val plane = image.planes[0]
-        val shorts = plane.buffer.order(ByteOrder.nativeOrder()).asShortBuffer()
-        val rowStrideShorts = plane.rowStride / 2
+                 subsample: Int, applyShading: Boolean = true): ImageF =
+        rawFrameOf(image, c, result, applyShading).convert(subsample)
 
-        val outW = (image.width / (2 * subsample)) * 2
-        val outH = (image.height / (2 * subsample)) * 2
-        if (outW <= 0 || outH <= 0) throw IllegalArgumentException("subsampling leaves no image")
-        val out = ImageF(outW, outH, 1)
-
-        val black = blackLevelOf(c, result)
-        val white = (c.get(CameraCharacteristics.SENSOR_INFO_WHITE_LEVEL) ?: 1023).toDouble()
-        val shading = if (applyShading) shadingOf(c, result, image.width, image.height) else null
-        val pattern = CameraProbe.cfaOf(c)
-
-        for (y in 0 until outH) {
-            // Whole blocks in, whole blocks out: the 2x2 phase is preserved.
-            val sy = (y / 2) * 2 * subsample + (y and 1)
-            for (x in 0 until outW) {
-                val sx = (x / 2) * 2 * subsample + (x and 1)
-                val raw = shorts.get(sy * rowStrideShorts + sx).toInt() and 0xFFFF
-                val b = black[(sy and 1) * 2 + (sx and 1)]
-                var v = (raw - b) / Math.max(1.0, white - b)
-                if (shading != null) v *= shading.gainAt(pattern, sx, sy)
-                out.data[y * outW + x] = Math.max(0.0, Math.min(1.0, v)).toFloat()
-            }
-        }
-        return out
-    }
 
     /** Luma only, normalised. Cheap enough to run on every metering frame. */
     @JvmStatic
@@ -144,8 +162,16 @@ object FrameConverters {
      * polynomial: it is per-channel, it captures decentring a symmetric model
      * cannot, and it has already been computed.
      */
-    private fun shadingOf(c: CameraCharacteristics, result: TotalCaptureResult,
-                          width: Int, height: Int): Shading? {
+    /**
+     * The camera's lens shading correction, in the core's own type.
+     *
+     * Public because the map has to be *recorded* as well as applied: it is a
+     * factory measurement the camera reports at capture time and nowhere else,
+     * and the DNG bundle is raw - so a capture whose map was not written down
+     * cannot be reproduced off the phone.
+     */
+    @JvmStatic
+    fun shadingOf(result: TotalCaptureResult): ShadingMap? {
         val map: LensShadingMap = result.get(CaptureResult.STATISTICS_LENS_SHADING_CORRECTION_MAP)
             ?: return null
         val mw = map.columnCount
@@ -153,49 +179,7 @@ object FrameConverters {
         if (mw < 2 || mh < 2) return null
         val gains = FloatArray(mw * mh * 4)
         map.copyGainFactors(gains, 0)
-        return Shading(gains, mw, mh, width, height)
-    }
-
-    private class Shading(
-        private val gains: FloatArray,
-        private val mw: Int,
-        private val mh: Int,
-        private val width: Int,
-        private val height: Int
-    ) {
-        fun gainAt(pattern: CfaPattern, x: Int, y: Int): Double {
-            val fx = (x / Math.max(1, width - 1).toDouble()) * (mw - 1)
-            val fy = (y / Math.max(1, height - 1).toDouble()) * (mh - 1)
-            return bilinear(planeOf(pattern, x, y), fx, fy)
-        }
-
-        /** Shading maps are ordered R, Gr, Gb, B whatever the CFA phase happens to be. */
-        private fun planeOf(pattern: CfaPattern, x: Int, y: Int): Int {
-            val colour = pattern.colorAt(x, y)
-            if (colour == 0) return 0
-            if (colour == 2) return 3
-            // Two greens: the one sharing a row with red is Gr.
-            val redRow = pattern.colorAt(x + 1, y) == 0 ||
-                pattern.colorAt(if (x - 1 < 0) x + 1 else x - 1, y) == 0
-            return if (redRow) 1 else 2
-        }
-
-        private fun bilinear(plane: Int, fx: Double, fy: Double): Double {
-            var x0 = Math.floor(fx).toInt()
-            var y0 = Math.floor(fy).toInt()
-            val x1 = Math.min(mw - 1, x0 + 1)
-            val y1 = Math.min(mh - 1, y0 + 1)
-            x0 = Math.max(0, Math.min(mw - 1, x0))
-            y0 = Math.max(0, Math.min(mh - 1, y0))
-            val tx = fx - x0
-            val ty = fy - y0
-            val g00 = gains[(y0 * mw + x0) * 4 + plane]
-            val g10 = gains[(y0 * mw + x1) * 4 + plane]
-            val g01 = gains[(y1 * mw + x0) * 4 + plane]
-            val g11 = gains[(y1 * mw + x1) * 4 + plane]
-            val top = g00 + (g10 - g00) * tx
-            val bot = g01 + (g11 - g01) * tx
-            return top + (bot - top) * ty
-        }
+        return try { ShadingMap(DoubleArray(gains.size) { gains[it].toDouble() }, mw, mh) }
+               catch (e: Exception) { null }
     }
 }

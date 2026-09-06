@@ -137,21 +137,45 @@ object Diagnostics {
         try {
             val manager = context.getSystemService(android.hardware.camera2.CameraManager::class.java)
             for (lens in CameraProbe.lenses(manager)) {
-                b.append("camera ").append(lens.cameraId).append(": ").append(lens).append('\n')
-                val c = manager.getCameraCharacteristics(lens.cameraId)
+                b.append("lens ").append(lens.id).append(": ")
+                    .append(com.immineal.hdri360.core.capture.LensChooser.describe(lens))
+                    .append('\n')
+                val c = CameraProbe.characteristicsFor(manager, lens)
                 val report = CameraProbe.reportFor(c)
                 b.append("  ").append(report).append('\n')
                 // What sits behind a logical camera. The other lenses on a modern
                 // phone are here rather than in the top level id list.
-                if (Build.VERSION.SDK_INT >= 28) try {
+                if (Build.VERSION.SDK_INT >= 28 && !lens.isPhysical) try {
                     for (pid in c.physicalCameraIds) {
                         val pc = manager.getCameraCharacteristics(pid)
+                        // Focal length and field of view first: they are what
+                        // decides which of these is the ultrawide, and the whole
+                        // reason for reading them at all.
                         b.append("    physical ").append(pid).append(": ")
+                            .append(String.format(java.util.Locale.US, "%.2f mm, %.1f deg, ",
+                                CameraProbe.focalLengthOf(pc), CameraProbe.horizontalFovOf(pc)))
                             .append(CameraProbe.reportFor(pc)).append('\n')
                     }
                 } catch (e: Exception) {
                     b.append("    physical cameras unreadable: ").append(e).append('\n')
                 }
+                // What the lens says about itself. The pipeline currently solves a
+                // shared radial coefficient from the correspondences, which on one
+                // real bundle landed anywhere between 0.14 and 0.26 depending only
+                // on how the poses were initialised. If the device reports its own
+                // distortion there is nothing to solve.
+                if (Build.VERSION.SDK_INT >= 28) {
+                    val d = c.get(android.hardware.camera2.CameraCharacteristics.LENS_DISTORTION)
+                    b.append("    lens distortion: ")
+                        .append(d?.joinToString(", ") { String.format(java.util.Locale.US, "%.5f", it) }
+                            ?: "not reported")
+                        .append('\n')
+                }
+                val intr = c.get(android.hardware.camera2.CameraCharacteristics.LENS_INTRINSIC_CALIBRATION)
+                b.append("    lens intrinsics: ")
+                    .append(intr?.joinToString(", ") { String.format(java.util.Locale.US, "%.3f", it) }
+                        ?: "not reported")
+                    .append('\n')
                 for (plan in com.immineal.hdri360.core.capture.StreamLadder.plansFor(report))
                     b.append("    ").append(plan).append('\n')
             }

@@ -16,6 +16,10 @@ import com.immineal.hdri360.core.capture.CapturedFrame
 import com.immineal.hdri360.core.capture.FrameSink
 import com.immineal.hdri360.core.capture.FrameStore
 import com.immineal.hdri360.core.capture.StoredSession
+import com.immineal.hdri360.core.capture.Lens
+import com.immineal.hdri360.core.capture.LensChooser
+import com.immineal.hdri360.core.capture.SphereLibrary
+import com.immineal.hdri360.core.hdr.BracketPlan
 import com.immineal.hdri360.core.image.ImageF
 import com.immineal.hdri360.core.math.Mat3
 import com.immineal.hdri360.core.pano.CaptureTarget
@@ -37,7 +41,7 @@ class CaptureUiState(
     @JvmField val pose: Mat3? = null,
     @JvmField val intrinsics: Intrinsics? = null,
     @JvmField val sessionDir: File? = null,
-    @JvmField val lenses: List<LensOption> = emptyList(),
+    @JvmField val lenses: List<Lens> = emptyList(),
     @JvmField val chosenLens: String? = null,
     @JvmField val warning: String? = null,
     @JvmField val resumable: File? = null,
@@ -79,7 +83,7 @@ class CaptureSession(
     /** Where captures live. Internal storage, so nothing else can half-delete one. */
     private val root = File(context.filesDir, "captures")
 
-    val lenses: List<LensOption> by lazy {
+    val lenses: List<Lens> by lazy {
         val m = context.getSystemService(Context.CAMERA_SERVICE) as? CameraManager
         if (m == null) emptyList() else try { CameraProbe.lenses(m) } catch (e: Exception) { emptyList() }
     }
@@ -87,14 +91,64 @@ class CaptureSession(
     init {
         CaptureLog.start(context)
         publishIdle()
+        sweepAbandonedCaptures()
+    }
+
+    /**
+     * Clears out captures that failed early enough to be worth nothing.
+     *
+     * Once a day at most, off the main thread, and narrow: unfinished, not one
+     * whole direction in it, and more than a day old. See
+     * [SphereLibrary.deleteAbandoned] for why each of those conditions is there.
+     * Without it a failed capture is a directory that no screen will ever show
+     * and nothing will ever remove.
+     */
+    private fun sweepAbandonedCaptures() {
+        Thread({
+            try {
+                val gone = SphereLibrary(root).deleteAbandoned(
+                    System.currentTimeMillis(), ABANDONED_AFTER_MS)
+                if (gone > 0) CaptureLog.log("removed $gone capture(s) that never got a " +
+                    "whole direction and were more than a day old")
+            } catch (e: Exception) {
+                CaptureLog.warn("could not sweep abandoned captures", e)
+            }
+        }, "hdri-sweep").apply { isDaemon = true }.start()
     }
 
     private fun publishIdle() {
+        // Which lens the app will start on, and what it had to choose from. One
+        // line, once, because a start screen that highlights the wrong lens is
+        // not something to reason about from a screenshot.
+        CaptureLog.log("lenses: " + lenses.joinToString(" | ") { it.toString() } +
+            " -> default " + (LensChooser.default(lenses)?.id ?: "none"))
         flow.value = CaptureUiState(
             lenses = lenses,
-            chosenLens = CameraProbe.defaultLens(lenses)?.cameraId,
+            chosenLens = LensChooser.default(lenses)?.id,
             resumable = unfinishedCapture(),
             finished = finishedCapture())
+    }
+
+    /**
+     * Throws away an unfinished capture the person has changed their mind about.
+     *
+     * Distinct from [cancel], which stops a capture that is running and keeps its
+     * frames precisely so they can be resumed. This is the other end of that: the
+     * frames are gone and the offer to resume goes with them. Without it the only
+     * ways past an unfinished capture were to finish it or to leave it on the
+     * start screen for ever.
+     */
+    fun discard(dir: File) {
+        val current = synchronized(lock) { store?.dir }
+        // Never the capture that is open. There is a camera writing into it.
+        if (current != null && current.absolutePath == dir.absolutePath) return
+        try {
+            SphereLibrary(root).delete(dir)
+            CaptureLog.log("discarded unfinished capture ${dir.name}")
+        } catch (e: Exception) {
+            CaptureLog.warn("could not discard ${dir.name}", e)
+        }
+        publishIdle()
     }
 
     /**
@@ -124,10 +178,29 @@ class CaptureSession(
      */
     fun unfinishedCapture(): File? {
         val dirs = root.listFiles() ?: return null
-        return dirs.filter { it.isDirectory && File(it, FrameStore.SESSION).isFile &&
+        val candidates = dirs.filter { it.isDirectory && File(it, FrameStore.SESSION).isFile &&
                              !File(it, DONE).isFile &&
                              File(it, FrameStore.JOURNAL).length() > 0 }
-            .maxByOrNull { it.lastModified() }
+            .sortedByDescending { it.lastModified() }
+        // A journal with something in it is not the same as a capture worth
+        // going back to. A capture that never completed a single direction has
+        // nothing to resume - resuming it starts the sweep over anyway - and
+        // offering it is worse than not: a failed evening leaves a row on the
+        // start screen saying there is work to continue, and there is not.
+        for (d in candidates) if (hasACompleteDirection(d)) return d
+        return null
+    }
+
+    /** Whether any one direction in [dir] has all of its rungs on disk. */
+    private fun hasACompleteDirection(dir: File): Boolean {
+        val store = try { FrameStore.open(dir) } catch (e: Exception) { null } ?: return false
+        return try {
+            store.shotMask().any { it }
+        } catch (e: Exception) {
+            false
+        } finally {
+            try { store.close() } catch (e: Exception) { /* nothing left to do about it */ }
+        }
     }
 
     /**
@@ -174,6 +247,11 @@ class CaptureSession(
         // this way is not a sphere.
         if (java.io.File("/data/local/tmp/hdri360-anyaim").exists()) {
             cfg.alignmentToleranceDeg = 180.0
+            // Roll as well as aim. Aim alone leaves a phone lying on a bench
+            // unable to fire at all: it holds one roll angle and the plan's
+            // directions want thirty-four different ones, so the shutter never
+            // came and the hatch looked broken rather than partial.
+            cfg.rollToleranceDeg = 180.0
             CaptureLog.warn("aim check disabled by /data/local/tmp/hdri360-anyaim; " +
                 "this capture will not be a real sphere")
         }
@@ -224,8 +302,21 @@ class CaptureSession(
     private fun tryResume(ctrl: CaptureController, dir: File, profile: CameraProfile): Boolean {
         val existing = FrameStore.open(dir) ?: return false
         val mask = existing.shotMask()
-        if (mask.size != ctrl.plan.targets.size) {
-            // A capture started on a different lens cannot be finished on this one.
+        // A capture started on a different lens cannot be finished on this one:
+        // the frames carry that lens's intrinsics and its ladder, and mixing two
+        // sets of intrinsics into one sphere is a sphere that cannot be solved.
+        //
+        // Judged on the camera the capture recorded rather than on how many
+        // directions it planned. The count was a proxy - two lenses can want the
+        // same number - and it is the one that changed under us: the app used to
+        // start on the ultrawide, so every capture from that period is a 21
+        // direction bundle that the main lens will now refuse. Better to say so
+        // than to silently drop into a fresh sweep and look broken.
+        val was = existing.session.cameraId
+        if (was != profile.id || mask.size != ctrl.plan.targets.size) {
+            CaptureLog.log("not resuming ${dir.name}: shot on camera $was " +
+                "(${mask.size} directions), this is ${profile.id} " +
+                "(${ctrl.plan.targets.size} directions)")
             existing.close()
             return false
         }
@@ -255,6 +346,12 @@ class CaptureSession(
         CaptureLog.log("white balance: " +
             (src.neutralGains()?.joinToString(", ") { String.format(Locale.US, "%.3f", it) }
              ?: "none reported"))
+        // Without this the EXR is in the sensor's own primaries with a grey point
+        // moved - which is a space with no name, and reads green.
+        CaptureLog.log("shading: " + (src.shadingMap()?.toString() ?: "none reported"))
+        CaptureLog.log("colour matrix: " +
+            (src.colorTransform()?.joinToString(", ") { String.format(Locale.US, "%.3f", it) }
+             ?: "none reported; the output will be in camera RGB"))
         ladder?.let { l ->
             CaptureLog.log("ladder: " + l.ladder.steps.joinToString(" | ") { it.toString() })
         }
@@ -295,7 +392,9 @@ class CaptureSession(
             baseIso = src.profile.exposureLimits.baseIso,
             plan = ctrl.bracketPlan() ?: return false,
             note = src.profile.note,
-            neutralGains = src.neutralGains())
+            neutralGains = src.neutralGains(),
+            colorMatrix = src.colorTransform(),
+            shadingMap = src.shadingMap())
         val dir = File(root, String.format(Locale.US, "capture-%d", System.currentTimeMillis()))
         return try {
             synchronized(lock) { store = FrameStore.create(dir, session) }
@@ -343,6 +442,27 @@ class CaptureSession(
             }
         }
         return ok
+    }
+
+    /**
+     * The ladder grew because a direction came back burnt out.
+     *
+     * Passed straight through to the store, which rewrites the session header:
+     * the frames about to be written are the ones this plan describes, and a
+     * capture resumed on the older plan would come back a rung short in exactly
+     * the direction that needed the rung.
+     */
+    override fun planChanged(plan: BracketPlan) {
+        val s = synchronized(lock) { store } ?: return
+        s.planChanged(plan)
+        // Not "the ladder grew": most of the time it does not. A direction whose
+        // run started above the ladder's dark end reaches its shorter rung by
+        // moving down into one that was already there, and only a direction
+        // already at the bottom makes the ladder itself longer. Saying the wrong
+        // one of those in the log is how the next capture gets misread.
+        CaptureLog.log("plan revised: ${plan.ladder.size()} rungs from " +
+            "${plan.ladder.steps[0]}, ${plan.totalShots()} frames" +
+            (if (plan.ladder.clampedLow) ", dark end at the camera's limit" else ""))
     }
 
     /**
@@ -499,6 +619,15 @@ class CaptureSession(
          * giving up and planning what it has.
          */
         private const val MAX_SCAN_MS = 60_000L
+        /**
+         * How old a capture with nothing in it has to be before it is swept.
+         *
+         * A day, which is long enough that it cannot be the one somebody is
+         * standing in the middle of, and short enough that an evening of failed
+         * attempts is not still on the phone next week.
+         */
+        private const val ABANDONED_AFTER_MS = 24L * 60 * 60 * 1000
+
         private const val MIN_FREE_BYTES = 1500L * 1024 * 1024
     }
 }

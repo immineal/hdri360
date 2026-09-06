@@ -7,6 +7,7 @@ import com.immineal.hdri360.core.capture.CaptureController
 import com.immineal.hdri360.core.capture.CaptureTier
 import com.immineal.hdri360.core.capture.CapturedFrame
 import com.immineal.hdri360.core.capture.FrameSink
+import com.immineal.hdri360.core.hdr.BracketPlan
 import com.immineal.hdri360.core.hdr.DeviceExposureLimits
 import com.immineal.hdri360.core.hdr.ExposureSettings
 import com.immineal.hdri360.core.image.CfaPattern
@@ -67,13 +68,19 @@ class CaptureSuite : TestCase {
             return true
         }
 
+        /**
+         * What a delivered frame contains, chosen by the test from the direction
+         * and the exposure it was shot at. A room that burns out at one direction
+         * and not at another is the whole of decision 1.
+         */
+        var pixelsFor: (Int, ExposureSettings) -> ImageF = { _, _ -> ImageF(4, 4, 1) }
+
         /** Delivers [frames] of the last requested burst, then completes it. */
         fun deliver(frames: Int, complete: Boolean = true) {
             val l = bound ?: return
-            val px = ImageF(4, 4, 1)
             for (i in 0 until frames) {
                 l.onFrameCaptured(CapturedFrame(lastBurst, lastTarget, i, lastRungs[i],
-                    Mat3.IDENTITY, 1000L + i, true), px)
+                    Mat3.IDENTITY, 1000L + i, true), pixelsFor(lastTarget, lastRungs[i]))
             }
             if (complete) {
                 inFlight = false
@@ -88,10 +95,17 @@ class CaptureSuite : TestCase {
     private class CountingSink : FrameSink {
         var stored = 0
         var refuse = false
+        /** Plans the controller revised mid-capture; a store has to be told of each. */
+        var plans = 0
+        var lastPlan: BracketPlan? = null
         override fun store(frame: CapturedFrame, pixels: ImageF): Boolean {
             if (refuse) return false
             stored++
             return true
+        }
+        override fun planChanged(plan: BracketPlan) {
+            plans++
+            lastPlan = plan
         }
     }
 
@@ -339,6 +353,60 @@ class CaptureSuite : TestCase {
                 "frames that could not be written do not count as a captured direction")
             t.eq(0L, c.snapshot().framesTaken.toLong(), "and are not counted as taken")
             t.check(c.snapshot().message != null, "the failure is reported rather than swallowed")
+
+            // And it keeps saying it, in the words that are true. A disk that
+            // will not take a frame is not a direction that was aimed badly, and
+            // working through the sphere blaming one direction after another -
+            // which is what "direction 5 kept failing; moving on" does - sends
+            // somebody back out to hold the phone steadier at a problem no
+            // steadiness can reach. The camera is delivering perfectly here; it
+            // is the writing that fails.
+            var guard = 0
+            while (c.snapshot().state == CaptureController.State.CAPTURING && guard++ < 200) {
+                val next = c.snapshot().currentTarget
+                if (next < 0) break
+                now = settleOn(c, next, now + 300_000_000L)
+                if (cam.lastTarget == next) cam.deliver(cam.lastRungs.size)
+            }
+            val stuck = c.snapshot()
+            t.check(stuck.state == CaptureController.State.FAILED,
+                "a sink that will not take a frame stops the capture")
+            val said = stuck.message ?: ""
+            t.check(said.contains("stor") || said.contains("space") || said.contains("writ"),
+                "and says the frames cannot be written: " + said)
+            t.check(!said.contains("direction "),
+                "rather than blaming a direction for it: " + said)
+            t.eq(0L, stuck.directionsShot.toLong(), "nothing was captured")
+            t.check(guard < 200, "and it stops rather than grinding through the sphere")
+
+            // A sink that refuses a couple of writes and then works is not a
+            // broken sink. A failed write is a thing that happens, the retry is
+            // what this controller is for, and only a whole burst's worth in a
+            // row means the disk itself has stopped taking frames.
+            val cam2 = FakeCamera(profile())
+            val sink2 = CountingSink()
+            val c2 = CaptureController(cam2, sink2)
+            cam2.setListener(c2)
+            c2.beginScan()
+            var now2 = scanEverything(c2, cam2, 1_000_000_000L)
+            c2.finishScanAndPlan()
+            sink2.refuse = true
+            val first = aimAtNext(c2, now2 + 300_000_000L)
+            now2 = first.second
+            t.eq(first.first.toLong(), cam2.lastTarget.toLong(), "a burst was taken")
+            // Two failures, one short of the burst that would condemn the disk.
+            cam2.deliver(2, complete = false)
+            t.check(c2.snapshot().state == CaptureController.State.CAPTURING,
+                "writes failing but fewer than a whole burst do not end a capture")
+
+            // The rest of the burst goes through, and the run of failures is
+            // cleared by the first that lands rather than accumulating for ever.
+            sink2.refuse = false
+            cam2.deliver(cam2.lastRungs.size)
+            t.check(c2.snapshot().state == CaptureController.State.CAPTURING,
+                "and a sink that starts working again is not condemned for its past")
+            t.check(c2.snapshot().shot[first.first], "the direction lands")
+            t.greaterThan(sink2.stored.toDouble(), 0.0, "and the frames really were written")
         }
 
         // --- stillness has to persist ------------------------------------------------
@@ -492,6 +560,11 @@ class CaptureSuite : TestCase {
         // shot[t] on the way out and never write settled[t], which both reported a
         // direction the app did not have and left the guide offering it forever -
         // a capture that could not finish.
+        //
+        // One direction goes silent in a capture that is otherwise working, which
+        // is what makes this a direction's problem rather than the lens's. A
+        // camera that has never delivered anything at all is a different fault
+        // with a different answer, and is tested on its own further down.
         run {
             val cam = FakeCamera(profile())
             val c = CaptureController(cam, CountingSink())
@@ -499,6 +572,12 @@ class CaptureSuite : TestCase {
             c.beginScan()
             var now = scanEverything(c, cam, 1_000_000_000L)
             c.finishScanAndPlan()
+
+            val working = aimAtNext(c, now + 300_000_000L)
+            now = working.second
+            if (cam.lastTarget == working.first) cam.deliver(cam.lastRungs.size)
+            t.check(c.snapshot().shot[working.first],
+                "the capture is under way and this camera does deliver")
 
             val silent = aimAtNext(c, now + 300_000_000L).first
             t.greaterThan(silent.toDouble(), -1.0, "a direction is chosen")
@@ -512,7 +591,8 @@ class CaptureSuite : TestCase {
             val after = c.snapshot()
             t.check(after.abandoned[silent], "repeated timeouts give up on the direction")
             t.check(!after.shot[silent], "without claiming it was captured")
-            t.eq(0L, after.directionsShot.toLong(), "so the sphere is still empty")
+            t.eq(1L, after.directionsShot.toLong(),
+                "so the sphere holds only what actually arrived")
 
             var guard = 0
             while (c.snapshot().state == CaptureController.State.CAPTURING && guard++ < 300) {
@@ -607,6 +687,348 @@ class CaptureSuite : TestCase {
         theViewfinderIsNotTheLightMeter(t)
         theViewfinderStaysQuick(t)
         stoppingEarlyIsNotFinishing(t)
+        aBurntDirectionGrowsTheLadder(t)
+        progressNeverGoesBackwards(t)
+        aBurstInFlightIsVisible(t)
+        brighterThanTheCameraCanRead(t)
+        aGrownLadderStillFinishes(t)
+    }
+
+    /** Every pixel on the rail. */
+    private fun rail(): ImageF {
+        val im = ImageF(8, 8, 1)
+        java.util.Arrays.fill(im.data, 1.0f)
+        return im
+    }
+
+    /** A frame with something in it. */
+    private fun room(): ImageF {
+        val im = ImageF(8, 8, 1)
+        java.util.Arrays.fill(im.data, 0.35f)
+        return im
+    }
+
+    /** A metered sphere with the ladder committed, ready to shoot. */
+    private fun metered(cam: FakeCamera, sink: CountingSink): Pair<CaptureController, Long> {
+        val c = CaptureController(cam, sink)
+        cam.setListener(c)
+        c.beginScan()
+        val now = scanEverything(c, cam, 1_000_000_000L)
+        c.finishScanAndPlan()
+        return Pair(c, now)
+    }
+
+    /**
+     * Decision 1: the exposure ladder grows during the capture.
+     *
+     * The ladder is planned from a sweep, and a sweep that saw a direction
+     * saturate learned only that the direction is brighter than the sensor could
+     * read at that exposure - never how much brighter. So the rung meant to hold
+     * a direction's highlights is a guess until that direction has actually been
+     * shot, and the measurement that settles it is the capture itself. When the
+     * shortest rung comes back on the rail, a shorter one is added and that
+     * direction is shot again at once, while the person is still pointing at it.
+     *
+     * What this replaced: a sphere off the phone with 100% coverage, 10.4 stops
+     * and ten frames that could not be matched to any neighbour - the floor, the
+     * ceiling and the top ring - because 82%, 78% and 52% of their green samples
+     * were at the white level. Nothing in the capture noticed.
+     */
+    private fun aBurntDirectionGrowsTheLadder(t: TestKit) {
+        val cam = FakeCamera(profile())
+        val sink = CountingSink()
+        val (c, t0) = metered(cam, sink)
+        var now = t0
+
+        val planned = c.bracketPlan()
+        if (planned == null) { t.fail("the sweep produced no ladder"); return }
+        val baseIso = profile().exposureLimits.baseIso
+        val rungsBefore = planned.ladder.size()
+        val darkestBefore = planned.ladder.relativeExposure(0)
+        val exposuresBefore = DoubleArray(rungsBefore) { planned.ladder.relativeExposure(it) }
+
+        // One direction with a window in it: at every exposure the sweep planned
+        // it comes back entirely on the rail, and only something shorter reads.
+        var burnt = -1
+        val readableBelow = darkestBefore / 2.0
+        cam.pixelsFor = { target, e ->
+            if (target == burnt && e.relativeExposure(baseIso) > readableBelow) rail() else room()
+        }
+
+        val (first, then) = aimAtNext(c, now + 300_000_000L)
+        burnt = first
+        now = then
+        t.greaterThan(burnt.toDouble(), -1.0, "a direction is chosen once capturing")
+        val plannedRungs = planned.indicesPerTarget[burnt].size
+        cam.deliver(cam.lastRungs.size)
+
+        val grown = c.bracketPlan()
+        if (grown == null) { t.fail("the plan disappeared"); return }
+        t.eq((rungsBefore + 1).toLong(), grown.ladder.size().toLong(),
+            "a direction that came back burnt out puts a shorter rung on the ladder")
+        t.lessThan(grown.ladder.relativeExposure(0), darkestBefore,
+            "and the new rung really is shorter than anything the sweep planned")
+        t.check(!c.snapshot().shot[burnt],
+            "the direction is not finished with while it is still burning out")
+        t.check(!c.snapshot().abandoned[burnt], "nor is it given up on")
+        t.eq(1L, sink.plans.toLong(),
+            "the store is told, or a resumed capture comes back on the ladder that failed")
+
+        // Every rung the ladder already had is still on it, naming the same
+        // exposure. A capture whose radiance scale moved halfway through is worse
+        // than one that clipped.
+        for (i in 0 until rungsBefore)
+            t.nearRel(exposuresBefore[i], grown.ladder.relativeExposure(i + 1), 1e-12,
+                "rung $i keeps its exposure, one index further up the longer ladder")
+
+        // Decision 1, the second half: directions already finished are left alone.
+        // A direction that did not clip does not need the new rung, and the
+        // rejected alternative - one insurance rung at every direction - is
+        // exactly what this must not turn into.
+        for (i in grown.indicesPerTarget.indices) {
+            if (i == burnt) continue
+            val was = planned.indicesPerTarget[i]
+            val isNow = grown.indicesPerTarget[i]
+            t.eq(was.size.toLong(), isNow.size.toLong(),
+                "direction $i did not clip, so it does not get the new rung")
+            for (k in was.indices)
+                t.nearRel(planned.ladder.relativeExposure(was[k]),
+                    grown.ladder.relativeExposure(isNow[k]), 1e-12,
+                    "and still names exactly the exposures it was planned")
+        }
+        // Decision 2: nothing may clip, at the cost of an extra frame per
+        // direction where needed. One frame, in the direction that needed it.
+        t.eq((plannedRungs + 1).toLong(), grown.indicesPerTarget[burnt].size.toLong(),
+            "the direction that burnt out costs exactly one extra frame")
+        t.eq(0L, grown.indicesPerTarget[burnt][0].toLong(),
+            "and reaches the new darkest rung")
+
+        // "Immediately, while the person is still pointing at it" - not queued for
+        // a second pass round the sphere, which would mean finding it again by hand.
+        now = settleOn(c, burnt, now + 300_000_000L)
+        t.eq(burnt.toLong(), cam.lastTarget.toLong(),
+            "the same direction is shot again at once, not left for later")
+        t.eq(grown.indicesPerTarget[burnt].size.toLong(), cam.lastRungs.size.toLong(),
+            "with the whole bracket, because a merge aligns a direction's rungs by nothing")
+        cam.deliver(cam.lastRungs.size)
+        t.check(c.snapshot().shot[burnt], "and now the direction is done")
+        t.check(!c.bracketPlan()!!.ladder.clampedLow,
+            "nothing is recorded as out of the camera's reach, because it was not")
+
+        // A direction shot twice is one direction's worth of frames on disk, not
+        // two. With a ladder that grows, a re-shoot is ordinary rather than rare.
+        t.eq(grown.indicesPerTarget[burnt].size.toLong(), c.snapshot().framesTaken.toLong(),
+            "the second burst wrote over the first rather than counting on top of it")
+        t.greaterThan(sink.stored.toDouble(), c.snapshot().framesTaken.toDouble(),
+            "even though the sink really was handed both bursts")
+    }
+
+    /**
+     * While a bracket is being taken, the snapshot says so and says how far.
+     *
+     * The one thing the capture screen never showed. A burst is a fifth of a
+     * second on a good direction and two and a half on one that is being shot
+     * again, and throughout it the person has to keep holding still with nothing
+     * on screen to say why. "Hold still" as a line of text is read once; a ring
+     * that fills as the frames land is read every time.
+     *
+     * Exposed as frames rather than as a flag because a flag can only say
+     * "working", and what somebody holding a phone at arm's length wants to know
+     * is how much longer.
+     */
+    private fun aBurstInFlightIsVisible(t: TestKit) {
+        val cam = FakeCamera(profile())
+        val (c, t0) = metered(cam, CountingSink())
+        var now = t0
+
+        t.eq(0L, c.snapshot().burstRungs.toLong(), "nothing is in flight before anything fires")
+
+        val (target, then) = aimAtNext(c, now + 300_000_000L)
+        now = then
+        t.greaterThan(target.toDouble(), -1.0, "a direction was chosen")
+        val rungs = cam.lastRungs.size
+        t.eq(rungs.toLong(), c.snapshot().burstRungs.toLong(),
+            "once a bracket is requested, the snapshot says how many frames it is")
+        t.eq(0L, c.snapshot().burstReceived.toLong(), "and that none of them have landed")
+
+        // Frame by frame, which is what the ring is drawn from.
+        cam.deliver(1, complete = false)
+        t.eq(1L, c.snapshot().burstReceived.toLong(), "the first frame is counted as it lands")
+        t.eq(rungs.toLong(), c.snapshot().burstRungs.toLong(), "the burst is still the same size")
+        cam.deliver(rungs - 1, complete = false)
+        t.eq(rungs.toLong(), c.snapshot().burstReceived.toLong(), "and so is the rest of it")
+
+        // The count is of frames handed over, and a camera that hands over more
+        // than it was asked for is a camera that exists. The ring is drawn from
+        // this, so it is bounded here rather than in the drawing.
+        cam.deliver(2, complete = false)
+        t.check(c.snapshot().burstReceived <= c.snapshot().burstRungs,
+            "the ring never fills past the end of the burst, whatever the camera does")
+
+        cam.bound?.onBurstFinished(cam.lastBurst, target, rungs, rungs)
+        t.eq(0L, c.snapshot().burstRungs.toLong(),
+            "and when the burst is over nothing is in flight again")
+        t.eq(0L, c.snapshot().burstReceived.toLong(), "with nothing left half drawn")
+    }
+
+    /**
+     * Progress has to be monotone, and frames are not.
+     *
+     * The bar was frames stored over frames planned, and decision 1 makes the
+     * denominator grow: a direction that comes back burnt out adds a frame to the
+     * plan, so the fraction drops the instant the app decides to do more work.
+     * On screen that is indistinguishable from a stall, at the exact moment the
+     * capture has started taking longer - which is when a person is most likely
+     * to think it has hung and stop.
+     *
+     * Directions do not grow. There are as many at the end as at the start, each
+     * is settled once, and settled is what the person is counting: how many more
+     * times do I have to stop, aim and hold still.
+     */
+    private fun progressNeverGoesBackwards(t: TestKit) {
+        val cam = FakeCamera(profile())
+        val sink = CountingSink()
+        val (c, t0) = metered(cam, sink)
+        var now = t0
+        val baseIso = profile().exposureLimits.baseIso
+        val darkestBefore = c.bracketPlan()!!.ladder.relativeExposure(0)
+        val readableBelow = darkestBefore / 2.0
+        // Every other direction burns out, so the plan grows repeatedly and the
+        // frame-based fraction would fall repeatedly.
+        cam.pixelsFor = { target, e ->
+            if (target % 2 == 0 && e.relativeExposure(baseIso) > readableBelow) rail() else room()
+        }
+
+        var worstDrop = 0.0
+        var previous = c.snapshot().progress
+        var grew = false
+        var plannedBefore = c.snapshot().framesPlanned
+        var guard = 0
+        while (c.snapshot().state == CaptureController.State.CAPTURING && guard++ < 400) {
+            val (target, then) = aimAtNext(c, now + 300_000_000L)
+            now = then
+            if (target < 0) break
+            if (cam.lastTarget == target) cam.deliver(cam.lastRungs.size)
+            val snap = c.snapshot()
+            if (snap.framesPlanned > plannedBefore) { grew = true; plannedBefore = snap.framesPlanned }
+            worstDrop = Math.max(worstDrop, previous - snap.progress)
+            previous = snap.progress
+        }
+        t.check(grew, "the fixture really did make the plan grow")
+        t.near(0.0, worstDrop, 1e-12,
+            "progress never falls back, however much the plan grows under it")
+        val end = c.snapshot()
+        t.eq(CaptureController.State.FINISHED.toString(), end.state.toString(), "and it finishes")
+        t.near(1.0, end.progress, 1e-12, "at exactly one, with every direction settled")
+
+        // And what the overlay draws instead of a number: which directions cost
+        // an extra rung. Text on a capture screen is read once and then ignored;
+        // a mark on the direction it happened to is still there afterwards.
+        var marked = 0
+        for (i in end.extraRungs.indices) {
+            t.check(end.extraRungs[i] >= 0, "a direction cannot need a negative rung")
+            if (end.extraRungs[i] > 0) marked++
+        }
+        t.greaterThan(marked.toDouble(), 0.0,
+            "the directions that burnt out are marked, one by one")
+        t.eq(end.shot.size.toLong(), end.extraRungs.size.toLong(), "one entry per direction")
+        for (i in end.extraRungs.indices)
+            if (end.extraRungs[i] > 0)
+                t.check(i % 2 == 0, "and only the ones the fixture actually blew out")
+    }
+
+    /**
+     * Decision 3: where a shorter exposure is physically impossible.
+     *
+     * Direct sun in a window is brighter than the shortest exposure the sensor
+     * has. There is nothing to add to the ladder, so the capture proceeds and
+     * what is written down says the top value is a lower bound rather than a
+     * measurement. What must not happen is the capture chasing a rung that does
+     * not exist.
+     */
+    private fun brighterThanTheCameraCanRead(t: TestKit) {
+        val cam = FakeCamera(profile())
+        val sink = CountingSink()
+        val (c, t0) = metered(cam, sink)
+        var now = t0
+        val rungsBefore = c.bracketPlan()!!.ladder.size()
+
+        var burnt = -1
+        cam.pixelsFor = { target, _ -> if (target == burnt) rail() else room() }
+
+        val (first, then) = aimAtNext(c, now + 300_000_000L)
+        burnt = first
+        now = then
+
+        var bursts = 0
+        var guard = 0
+        while (!c.snapshot().shot[burnt] && !c.snapshot().abandoned[burnt] && guard++ < 20) {
+            if (cam.lastTarget != burnt) break
+            cam.deliver(cam.lastRungs.size)
+            bursts++
+            if (c.snapshot().shot[burnt] || c.snapshot().abandoned[burnt]) break
+            now = settleOn(c, burnt, now + 300_000_000L)
+        }
+        t.check(c.snapshot().shot[burnt],
+            "a direction the camera cannot read is still captured, not chased and not dropped")
+        t.lessThan(bursts.toDouble(), 5.0,
+            "and the capture stops asking for a rung the camera does not have")
+        val ended = c.bracketPlan()
+        if (ended == null) { t.fail("the plan disappeared"); return }
+        t.check(ended.ladder.clampedLow,
+            "what is written down says the top of the range is a lower bound")
+        t.greaterThan(ended.ladder.size().toDouble(), (rungsBefore - 1).toDouble(),
+            "the ladder went as short as the camera would go")
+        t.check(sink.lastPlan?.ladder?.clampedLow == true,
+            "and the store was told, because the report is written from the store")
+        t.eq(CaptureController.State.CAPTURING.toString(), c.snapshot().state.toString(),
+            "the rest of the sphere is still there to shoot")
+    }
+
+    /**
+     * A whole sphere with a ladder that grows under it still ends.
+     *
+     * The failure this rules out is the one that costs somebody an afternoon: a
+     * direction that is offered, shot, found wanting and offered again forever,
+     * with no way out but killing the app.
+     */
+    private fun aGrownLadderStillFinishes(t: TestKit) {
+        val cam = FakeCamera(profile())
+        val sink = CountingSink()
+        val (c, t0) = metered(cam, sink)
+        var now = t0
+        val baseIso = profile().exposureLimits.baseIso
+        val darkestBefore = c.bracketPlan()!!.ladder.relativeExposure(0)
+        val plannedBefore = c.snapshot().framesPlanned
+
+        // Half the sphere has a window in it; the other half is an ordinary room.
+        val readableBelow = darkestBefore / 2.0
+        cam.pixelsFor = { target, e ->
+            if (target % 2 == 0 && e.relativeExposure(baseIso) > readableBelow) rail() else room()
+        }
+
+        var guard = 0
+        while (c.snapshot().state == CaptureController.State.CAPTURING && guard++ < 400) {
+            val (target, then) = aimAtNext(c, now + 300_000_000L)
+            now = then
+            if (target < 0) break
+            if (cam.lastTarget == target) cam.deliver(cam.lastRungs.size)
+        }
+        val snap = c.snapshot()
+        t.eq(CaptureController.State.FINISHED.toString(), snap.state.toString(),
+            "a sphere whose ladder grew under it still finishes")
+        t.eq(c.plan.targets.size.toLong(), snap.directionsShot.toLong(),
+            "with every direction shot")
+        val ended = c.bracketPlan()
+        if (ended == null) { t.fail("the plan disappeared"); return }
+        t.greaterThan(ended.ladder.size().toDouble(), 0.0, "on a ladder")
+        t.greaterThan(snap.framesPlanned.toDouble(), plannedBefore.toDouble(),
+            "which cost more frames than the sweep planned, in the directions that needed them")
+        t.eq(snap.framesPlanned.toLong(), snap.framesTaken.toLong(),
+            "and every frame the grown plan asks for is on disk")
+        t.greaterThan(sink.plans.toDouble(), 0.0, "the store heard about the growth")
+        t.note("grown ladder: " + ended.ladder.size() + " rungs, " +
+                snap.framesTaken + " frames vs " + plannedBefore + " planned from the sweep")
     }
 
     /**
@@ -813,6 +1235,154 @@ class CaptureSuite : TestCase {
         t.check(!said.contains("all"), "and it does not report a whole sphere: " + said)
         t.check(said.contains(snap.directionsShot.toString()),
             "it says how many were actually taken: " + said)
+
+        // --- a busy camera is not a bad direction ---------------------------------
+        // Off the phone, in a dim room: a burst outlasted its own twelve second
+        // timeout, the controller expired it and re-fired, and the camera still
+        // had the first one in hand and said no. That refusal was charged to the
+        // direction as a failed attempt - and refusals arrive at whatever rate
+        // the orientation sensor ticks, so three of them landed inside forty
+        // milliseconds and the direction was given up for good. Every direction
+        // in turn, and the capture died with two frames out of eighty-four.
+        //
+        // "The camera is busy" is a fact about timing, not about the direction.
+        // It costs the direction nothing, and it waits the ordinary interval
+        // before trying again rather than spinning at sensor rate.
+        run {
+            val cam = FakeCamera(profile())
+            val c = CaptureController(cam, CountingSink(), CaptureController.Config())
+            cam.setListener(c)
+            c.beginScan()
+            var now = scanEverything(c, cam, 1_000_000_000L)
+            c.finishScanAndPlan()
+
+            c.onOrientation(c.plan.targets[0].rotation, false, now)
+            val target = c.snapshot().currentTarget
+            val pose = c.plan.targets[target].rotation
+
+            cam.refuseBursts = true
+            // Far more refusals than maxBurstAttempts, arriving as fast as the
+            // sensor speaks - which is how the phone met this.
+            for (i in 0 until 40) {
+                now += 20_000_000L
+                c.onOrientation(pose, true, now)
+            }
+            t.eq(0L, cam.burstsRequested.toLong(), "a busy camera takes no bursts")
+            val busy = c.snapshot()
+            t.check(!busy.abandoned[target],
+                "and the direction it was busy during is not given up on")
+            t.check(!busy.shot[target], "nor marked shot by refusals")
+            t.eq(0L, busy.directionsShot.toLong(), "nothing was shot")
+            t.check(busy.state == CaptureController.State.CAPTURING,
+                "and the capture is still running rather than dead")
+
+            // The camera frees up. The very next aim fires, and the direction is
+            // shot exactly as if nothing had happened.
+            cam.refuseBursts = false
+            now += 400_000_000L
+            c.onOrientation(pose, true, now)
+            t.eq(1L, cam.burstsRequested.toLong(),
+                "the moment the camera is free the burst goes")
+            t.eq(target.toLong(), cam.lastTarget.toLong(), "at the same direction")
+            cam.deliver(cam.lastRungs.size)
+            t.check(c.snapshot().shot[target],
+                "and it is shot, having cost it nothing to have been refused")
+        }
+
+        // --- a camera that delivers nothing says so ------------------------------
+        // The other half of the same evening. Once the refusals stopped costing
+        // the direction anything, the capture no longer died in forty
+        // milliseconds - it died in minutes instead, with somebody standing in a
+        // room holding a phone as still as they could while the app abandoned one
+        // direction after another and finally said the burst had timed out.
+        //
+        // Nothing about that is the person's doing and nothing about it is the
+        // direction's. A lens from which not one frame has ever arrived is broken
+        // for this purpose, and the only useful thing to do is stop and say which
+        // it is - the app has another lens to offer.
+        run {
+            val cam = FakeCamera(profile())
+            val c = CaptureController(cam, CountingSink(), CaptureController.Config())
+            cam.setListener(c)
+            c.beginScan()
+            var now = scanEverything(c, cam, 1_000_000_000L)
+            c.finishScanAndPlan()
+
+            c.onOrientation(c.plan.targets[0].rotation, false, now)
+            val target = c.snapshot().currentTarget
+            val pose = c.plan.targets[target].rotation
+            val startedAt = now
+
+            // The camera takes every burst it is handed and never reports one.
+            // This is the physical ultrawide, exactly as the phone behaved.
+            // Time steps forward a tenth of a second at a time rather than
+            // jumping a whole timeout, so what this measures is how long the
+            // controller was actually willing to wait. The camera swallows every
+            // burst it is handed and reports none of them.
+            var guard = 0
+            var seen = 0
+            while (c.snapshot().state == CaptureController.State.CAPTURING && guard++ < 900) {
+                now += 100_000_000L
+                c.onOrientation(pose, true, now)
+                if (cam.burstsRequested > seen) { seen = cam.burstsRequested; cam.abandon() }
+            }
+
+            val dead = c.snapshot()
+            t.check(cam.burstsRequested > 0, "the bursts really were handed over")
+            t.eq(0L, dead.directionsShot.toLong(), "and not one of them came back")
+            t.check(dead.state == CaptureController.State.FAILED,
+                "so the capture stops rather than working through the sphere in vain")
+            val said = dead.message ?: ""
+            t.check(said.contains("frame"),
+                "and the message is about frames not arriving: " + said)
+            t.check(said.contains("lens") || said.contains("camera"),
+                "naming the thing that is actually wrong: " + said)
+            t.check(!said.contains("direction "),
+                "not blaming a direction for a camera that never delivered: " + said)
+            t.check(guard < 900, "and it gives up rather than grinding on for ever")
+
+            // Promptly means something measurable. A whole five rung bracket
+            // takes 0.07 to 0.10 seconds on the phone this was written for, so
+            // waiting the full twelve second burst timeout three times over -
+            // thirty-six seconds of somebody standing still - to learn that a
+            // lens delivers nothing is not patience, it is a hundredfold margin
+            // spent on a question already answered. Until the first frame of a
+            // capture has ever arrived the wait is short; after that it is the
+            // full timeout, because then the camera is known to work and a slow
+            // burst deserves the benefit of the doubt.
+            t.lessThan((now - startedAt) / 1e9, 20.0,
+                "and the whole diagnosis takes under twenty seconds of holding still")
+
+            // It is specifically about never having received anything. A camera
+            // that delivers and then stops keeps the old per-direction handling,
+            // because there the sphere may still be worth finishing.
+            val cam2 = FakeCamera(profile())
+            val c2 = CaptureController(cam2, CountingSink(), CaptureController.Config())
+            cam2.setListener(c2)
+            c2.beginScan()
+            var now2 = scanEverything(c2, cam2, 1_000_000_000L)
+            c2.finishScanAndPlan()
+            val aimed = aimAtNext(c2, now2 + 300_000_000L)
+            val first = aimed.first
+            now2 = aimed.second
+            t.eq(first.toLong(), cam2.lastTarget.toLong(), "the first burst was taken")
+            cam2.deliver(cam2.lastRungs.size)
+            t.check(c2.snapshot().shot[first], "one direction landed")
+
+            var guard2 = 0
+            while (c2.snapshot().state == CaptureController.State.CAPTURING && guard2++ < 12) {
+                val next = c2.snapshot().currentTarget
+                if (next < 0) break
+                now2 = settleOn(c2, next, now2 + 300_000_000L)
+                cam2.abandon()
+                now2 += CaptureController.Config().burstTimeoutNs + 1_000_000L
+                c2.onOrientation(c2.plan.targets[next].rotation, true, now2)
+            }
+            t.check(c2.snapshot().state != CaptureController.State.FAILED,
+                "a camera that has delivered before is given the benefit of the doubt")
+            t.eq(1L, c2.snapshot().directionsShot.toLong(),
+                "and what it did deliver is kept")
+        }
     }
 
     /**

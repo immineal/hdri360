@@ -15,7 +15,7 @@ Licensed under the GNU General Public License v3.0 — see `LICENSE`.
 | Part | State |
 |---|---|
 | `core/` radiance + stitching | **Complete.** Zero dependencies, runs on a bare JVM |
-| `core-tests/` the suite | **Complete.** 29 suites, 512,461 assertions, all passing |
+| `core-tests/` the suite | **Complete.** 33 suites, 513,314 assertions, all passing |
 | `tools/` desktop re-stitch harness | **Complete.** Stitches a folder of ordinary photographs |
 | `app/` Android capture + UI | **Builds and runs.** A whole sphere, on the phone |
 | Release, Play Store, F-Droid | Not yet |

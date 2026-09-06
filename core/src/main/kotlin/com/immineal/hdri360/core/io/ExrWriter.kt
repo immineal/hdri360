@@ -113,12 +113,36 @@ object ExrWriter {
         for (c in 0 until 3) {
             val src = sourceChannel[c]
             for (x in 0 until w) {
-                val hv = Half.fromFloat(image.data[(y * w + x) * ch + src])
+                val hv = Half.fromFloat(writable(image.data[(y * w + x) * ch + src]))
                 raw[p++] = (hv.toInt() and 0xFF).toByte()
                 raw[p++] = ((hv.toInt() ushr 8) and 0xFF).toByte()
             }
         }
         return raw
+    }
+
+    /**
+     * A value the file can actually hold.
+     *
+     * Half float stops at 65504 and the conversion overflows to infinity above
+     * it. That is correct arithmetic and a broken environment map: an infinity is
+     * not a very bright pixel, it is a renderer that returns NaN for everything
+     * the sun touches. An offline re-stitch of a real capture wrote forty of them
+     * into a panorama, every one the sun.
+     *
+     * So it is clamped, and a NaN - which means "no value", not "a large one" -
+     * is written as nothing. The clamp costs something only above 65504
+     * kilocandela, which is sixty-five million cd/m2 and forty times the sun's
+     * own disc; anything reaching it was already beyond what the capture could
+     * measure. `OutputWriter.Stats` counts how often it fires so the report can
+     * say so rather than the number quietly changing.
+     */
+    @JvmStatic
+    fun writable(v: Float): Float {
+        if (v.isNaN()) return 0f
+        if (v > Half.MAX_FINITE) return Half.MAX_FINITE
+        if (v < -Half.MAX_FINITE) return -Half.MAX_FINITE
+        return v
     }
 
     /**

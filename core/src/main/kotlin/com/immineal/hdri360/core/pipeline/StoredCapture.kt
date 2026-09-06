@@ -131,7 +131,52 @@ object StoredCapture {
         val o = HdriPipeline.Options()
         o.panoramaWidth = panoramaWidth
         o.radianceScale = radianceScaleFor(session)
+        // Recorded at capture time and applied here, which is what makes a bundle
+        // reproducible off the phone at all: the DNGs are raw, so a capture whose
+        // map was not written down stitches frames whose corners are a stop dark.
+        o.shading = session.shadingMap
+        o.colorTransform = colorTransformFor(session)
         return o
+    }
+
+    /**
+     * The one 3x3 that takes this capture's merged sensor RGB to linear Rec.709,
+     * or null when the camera gave nothing to build it from.
+     *
+     * Two things composed, in the order the camera defines them: the white
+     * balance gains, then the sensor-RGB to linear-sRGB matrix. sRGB and Rec.709
+     * share primaries and a white point, and differ in a transfer function a
+     * linear file does not have.
+     *
+     * The gains are normalised on green rather than applied outright, because the
+     * absolute cd/m2 scale is calibrated against green: scaling all three
+     * channels would move the luminance the calibration describes, while scaling
+     * relative to green corrects the colour and leaves it alone. The matrix's own
+     * rows sum to one, so a neutral survives the whole composition unmoved.
+     *
+     * Returned as one matrix rather than applied as two steps because it is one
+     * pass over the radiance instead of two, and because there is then a single
+     * object that answers "what space is this file in".
+     */
+    @JvmStatic
+    fun colorTransformFor(session: StoredSession): DoubleArray? {
+        val m = session.colorMatrix
+        val gains = session.neutralGains
+        if (m == null || m.size < 9) return null
+        val gr: Double
+        val gb: Double
+        if (gains != null && gains.size >= 3 && gains[1] > 1e-9) {
+            gr = gains[0] / gains[1]
+            gb = gains[2] / gains[1]
+        } else {
+            gr = 1.0
+            gb = 1.0
+        }
+        // m . diag(gr, 1, gb)
+        return doubleArrayOf(
+            m[0] * gr, m[1], m[2] * gb,
+            m[3] * gr, m[4], m[5] * gb,
+            m[6] * gr, m[7], m[8] * gb)
     }
 
     // ------------------------------------------------------------------ detail
@@ -145,29 +190,6 @@ object StoredCapture {
         val out = ArrayList<FrameRecord>(wanted)
         for (r in found) out.add(r ?: return null)
         return out
-    }
-
-    /**
-     * Applies the capture's one white balance, normalised so green is unchanged.
-     *
-     * Scaling all three channels would move the absolute radiance scale, which
-     * the photometry is anchored to; scaling relative to green corrects the
-     * colour without touching the luminance the calibration describes.
-     */
-    private fun whiteBalance(image: ImageF, gains: DoubleArray?) {
-        if (gains == null || gains.size < 3 || image.channels < 3) return
-        val g = if (gains[1] > 1e-9) gains[1] else 1.0
-        val r = (gains[0] / g).toFloat()
-        val b = (gains[2] / g).toFloat()
-        if (Math.abs(r - 1f) < 1e-6f && Math.abs(b - 1f) < 1e-6f) return
-        val d = image.data
-        val step = image.channels
-        var i = 0
-        while (i < d.size) {
-            d[i] *= r
-            d[i + 2] *= b
-            i += step
-        }
     }
 
     private fun exposuresOf(bracket: List<FrameRecord>, session: StoredSession,
@@ -191,7 +213,6 @@ object StoredCapture {
                 if (f >= 2) { image = Demosaic.halfResolution(mosaic); f /= 2 }
                 else image = Demosaic.malvarHeCutler(mosaic)
             }
-            whiteBalance(image, session.neutralGains)
             // Reduced here, one rung at a time, so the full size copy is collectable
             // before the next rung is read rather than after the whole bracket is.
             while (f > 1) { image = ImageOps.downsample2x(image); f /= 2 }

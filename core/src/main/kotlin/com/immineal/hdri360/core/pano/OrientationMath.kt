@@ -61,6 +61,42 @@ object OrientationMath {
             .orthonormalized()
 
     /**
+     * Device orientation to the pose of the *screen*, for looking at a finished
+     * sphere by turning the phone.
+     *
+     * Not [cameraToWorld]. That gives the pose of the sensor, which is mounted at
+     * some multiple of ninety degrees to the way the phone is held - right for a
+     * capture, wrong for a viewer, and a viewer built on it works in portrait and
+     * lies in landscape.
+     *
+     * The phone is held up as a window with the world behind it, so in device
+     * terms:
+     *
+     *     forward = out of the back of the phone  = -Z of the device
+     *     up      = up the screen                = +Y of the device
+     *     left    = up x forward = (+Y) x (-Z)    = -X of the device
+     *
+     * which is a half turn about the device's own up axis. Determinant +1: a
+     * rotation, not a reflection. This app has already shipped one mirrored
+     * viewer, and it was a sign exactly here.
+     *
+     * The result is in the panorama's own frame, which is why turning the phone
+     * anchors the sphere to the room: the heading the capture recorded and the
+     * heading the viewer reads are the same magnetic north.
+     */
+    @JvmStatic
+    fun screenToWorld(deviceRotation: Quat): Mat3 =
+        ANDROID_TO_WORLD.mul(deviceRotation.toMat3())
+            .mul(SCREEN_TO_DEVICE)
+            .orthonormalized()
+
+    /** A half turn about the device's up axis; see [screenToWorld]. */
+    private val SCREEN_TO_DEVICE = Mat3(doubleArrayOf(
+        -1.0, 0.0, 0.0,
+        0.0, 1.0, 0.0,
+        0.0, 0.0, -1.0))
+
+    /**
      * Camera axes expressed in device coordinates.
      *
      * SENSOR_ORIENTATION is defined as the clockwise rotation needed to make the

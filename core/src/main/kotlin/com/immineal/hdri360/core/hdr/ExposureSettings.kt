@@ -29,8 +29,22 @@ class ExposureSettings(
     /** Nanoseconds, the unit Camera2 wants. */
     fun exposureTimeNs(): Long = Math.round(exposureTimeSec * 1e9)
 
+    /**
+     * The shutter as a photographer writes it, which is a fraction only while a
+     * fraction still says something.
+     *
+     * `1/%.0f` unconditionally is fine to about half a second and nonsense past
+     * it: two seconds rounds to `1/0s` and so does sixteen. That reached the log
+     * of a real capture as `1/3s | 1/0s | 1/0s` on the evening spent working out
+     * why its bursts were timing out - three stops apart and printed the same, in
+     * the one record there was to go on.
+     */
     override fun toString(): String =
-        String.format(Locale.US, "1/%.0fs ISO%d f/%.1f", 1.0 / exposureTimeSec, iso, apertureN)
+        if (exposureTimeSec >= 0.5)
+            String.format(Locale.US, "%.1fs ISO%d f/%.1f", exposureTimeSec, iso, apertureN)
+        else
+            String.format(Locale.US, "1/%.0fs ISO%d f/%.1f",
+                1.0 / exposureTimeSec, iso, apertureN)
 
     companion object {
         @JvmStatic
