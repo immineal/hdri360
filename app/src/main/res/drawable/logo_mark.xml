@@ -1,0 +1,39 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+    The mark, framed for the interface.
+
+    The same curves as the launcher icon and from the same source, play/logo.svg,
+    shifted by 21 units in both axes so that the drawing fills its box. An
+    adaptive icon has to leave a third of the canvas empty on every side because
+    a launcher crops it to a shape of its choosing; beside a line of text that
+    margin is just a small logo in a large hole.
+-->
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="66dp"
+    android:height="66dp"
+    android:viewportWidth="66"
+    android:viewportHeight="66">
+
+    <path
+        android:strokeColor="#ECECEC"
+        android:strokeWidth="2.8"
+        android:pathData="M 3,33 a 30,30 0 1,0 60,0 a 30,30 0 1,0 -60,0 Z" />
+    <path
+        android:strokeColor="#FFC400"
+        android:strokeWidth="2.9"
+        android:strokeLineCap="round"
+        android:strokeLineJoin="round"
+        android:pathData="m 9.949792,23.625071 c 8.731866,-19.214735 19.387675,-1.197027 9.222275,9.104629 9.559362,14.335561 -2.56141,26.192411 -9.7297,7.3874" />
+    <path
+        android:strokeColor="#FFC400"
+        android:strokeWidth="2.9"
+        android:strokeLineCap="round"
+        android:strokeLineJoin="round"
+        android:pathData="m 41.433591,9.475442 c -7.2258,-3.6548 -17.739878,-1.833662 -16.197878,1.301638 13.2835,27.0086 -8.086068,47.457344 7.854387,47.457344 19.376493,0 11.435462,-22.496915 -2.949149,-22.496915" />
+    <path
+        android:strokeColor="#FFC400"
+        android:strokeWidth="2.9"
+        android:strokeLineCap="round"
+        android:strokeLineJoin="round"
+        android:pathData="m 42.779721,16.718032 c -7.0924,9.9293 0.367792,16.525076 6.59487,26.213298 6.227079,9.688223 12.26718,-13.21019 2.946882,-24.847752 -5.058499,-6.316171 -7.217576,-4.350076 -9.541752,-1.365546 z" />
+</vector>

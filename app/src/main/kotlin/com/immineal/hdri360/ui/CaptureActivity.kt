@@ -23,6 +23,8 @@ import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.layout.ContentScale
 import com.immineal.hdri360.core.capture.SphereLibrary
+import androidx.compose.ui.res.painterResource
+import com.immineal.hdri360.R
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.size
@@ -329,7 +331,13 @@ private fun StartScreen(
         // stacked underneath - a tagline, a link on its own row - was text nobody
         // needs twice.
         Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
-            Text("360 HDRI", style = MaterialTheme.typography.headlineMedium,
+            // The mark instead of the digits it is made of. Same drawing as the
+            // launcher icon, from the same source, so the app in the app drawer
+            // and the app on screen are recognisably the one thing.
+            Image(painterResource(R.drawable.logo_mark), "360 HDRI",
+                Modifier.size(46.dp))
+            Spacer(Modifier.width(10.dp))
+            Text("HDRI", style = MaterialTheme.typography.headlineMedium,
                 modifier = Modifier.weight(1f))
             TextButton(onHelp, modifier = Modifier.semantics {
                 contentDescription = "How this works, in four steps"
