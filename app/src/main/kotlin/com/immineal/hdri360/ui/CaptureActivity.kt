@@ -65,6 +65,7 @@ import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.compose.ui.viewinterop.AndroidView
@@ -334,18 +335,17 @@ private fun StartScreen(
             // The mark instead of the digits it is made of. Same drawing as the
             // launcher icon, from the same source, so the app in the app drawer
             // and the app on screen are recognisably the one thing.
-            Image(painterResource(R.drawable.logo_mark), "360 HDRI",
+            Image(painterResource(R.drawable.logo_mark), "360 HDRI Camera",
                 Modifier.size(46.dp))
             Spacer(Modifier.width(10.dp))
-            Text("HDRI", style = MaterialTheme.typography.headlineMedium,
+            Text("HDRI Camera", style = MaterialTheme.typography.headlineMedium,
                 modifier = Modifier.weight(1f))
+            // A question mark, and the only thing in this corner. It is the one
+            // door somebody might want on the way in; the licence and the method
+            // are not, and they went to the foot of the screen.
             TextButton(onHelp, modifier = Modifier.semantics {
                 contentDescription = "How this works, in four steps"
-            }) { Text("How", style = MaterialTheme.typography.labelLarge) }
-            TextButton(onAbout) {
-                Text("About", style = MaterialTheme.typography.labelLarge,
-                    color = Color(0xFF9A9A9A))
-            }
+            }) { Text("?", style = MaterialTheme.typography.titleLarge) }
         }
 
         if (state.lenses.isEmpty()) {
@@ -431,9 +431,9 @@ private fun StartScreen(
             }
         }
 
-        // The one door nobody needs on the way in, at the foot, unexplained.
+        // The doors nobody needs on the way in, at the foot, unexplained.
         Spacer(Modifier.height(28.dp))
-        DiagnosticsRow()
+        FooterLinks(onAbout)
         Spacer(Modifier.height(12.dp))
     }
 }
@@ -526,52 +526,94 @@ private fun LensRow(lens: Lens, selected: Boolean, pickable: Boolean, onPick: ()
  * No frames, no imagery beyond the preview the app already made.
  */
 @Composable
-private fun DiagnosticsRow() {
-    val context = LocalContext.current
+private fun FooterLinks(onAbout: () -> Unit) {
+    // The status line goes *under* the row and not inside it. It used to live in
+    // the diagnostics link's own column, so the moment a report was saved the
+    // column grew wide and shoved "About" off to the side.
     var status by remember { mutableStateOf<String?>(null) }
     var busy by remember { mutableStateOf(false) }
-    // A text link and not a button with a paragraph under it. What the report
-    // contains is worth saying once, in About, where somebody who wants to send
-    // one will read it; on the way in it was two lines of reassurance about a
-    // thing almost nobody presses.
     Column(Modifier.fillMaxWidth(), horizontalAlignment = Alignment.CenterHorizontally) {
-        TextButton(
-            onClick = {
-                if (busy) return@TextButton
-                busy = true
-                status = null
-                val main = android.os.Handler(android.os.Looper.getMainLooper())
-                Thread({
-                    var uri: android.net.Uri? = null
-                    val text = try {
-                        val bundle = Diagnostics.build(context)
-                        uri = Diagnostics.publish(context, bundle)
-                        bundle.name + " - " + Diagnostics.describe(uri)
-                    } catch (e: Exception) {
-                        "could not build a report: " + (e.message ?: e.javaClass.simpleName)
-                    }
-                    val share = uri
-                    main.post {
-                        status = text
-                        busy = false
-                        if (share != null) {
-                            try {
-                                context.startActivity(Intent.createChooser(
-                                    Diagnostics.shareIntent(share), "Send the report"))
-                            } catch (e: Exception) {
-                                status = text + " (nothing on this phone can send it)"
-                            }
+        Row(verticalAlignment = Alignment.CenterVertically) {
+            TextButton(onAbout) {
+                Text("About", style = MaterialTheme.typography.labelLarge,
+                    color = Color(0xFF808080))
+            }
+            Text("·", color = Color(0xFF505050))
+            DiagnosticsButton(busy, { busy = it }, { status = it })
+        }
+        DiagnosticsStatus(status)
+    }
+}
+
+/**
+ * The same offer on its own, for the processing screen.
+ *
+ * There, something has just gone wrong and the report is the thing being held
+ * out; there is no About beside it to be pushed aside.
+ */
+@Composable
+private fun DiagnosticsLink() {
+    var status by remember { mutableStateOf<String?>(null) }
+    var busy by remember { mutableStateOf(false) }
+    Column(Modifier.fillMaxWidth(), horizontalAlignment = Alignment.CenterHorizontally) {
+        DiagnosticsButton(busy, { busy = it }, { status = it })
+        DiagnosticsStatus(status)
+    }
+}
+
+@Composable
+private fun DiagnosticsStatus(status: String?) {
+    status?.let {
+        Text(it, style = MaterialTheme.typography.bodySmall, color = Color(0xFF9A9A9A),
+            textAlign = TextAlign.Center,
+            modifier = Modifier.fillMaxWidth().padding(horizontal = 12.dp))
+    }
+}
+
+/**
+ * Collects the log, the device and what each capture did, and hands it to
+ * whatever on the phone can send it.
+ *
+ * A text link, because what it contains is a paragraph and the paragraph belongs
+ * in About rather than in the way in.
+ */
+@Composable
+private fun DiagnosticsButton(busy: Boolean, onBusy: (Boolean) -> Unit,
+                              onStatus: (String?) -> Unit) {
+    val context = LocalContext.current
+    TextButton(
+        onClick = {
+            if (busy) return@TextButton
+            onBusy(true)
+            onStatus(null)
+            val main = android.os.Handler(android.os.Looper.getMainLooper())
+            Thread({
+                var uri: android.net.Uri? = null
+                val text = try {
+                    val bundle = Diagnostics.build(context)
+                    uri = Diagnostics.publish(context, bundle)
+                    bundle.name + " - " + Diagnostics.describe(uri)
+                } catch (e: Exception) {
+                    "could not build a report: " + (e.message ?: e.javaClass.simpleName)
+                }
+                val share = uri
+                main.post {
+                    onStatus(text)
+                    onBusy(false)
+                    if (share != null) {
+                        try {
+                            context.startActivity(Intent.createChooser(
+                                Diagnostics.shareIntent(share), "Send the report"))
+                        } catch (e: Exception) {
+                            onStatus(text + " (nothing on this phone can send it)")
                         }
                     }
-                }, "hdri-diagnostics").start()
-            },
-        ) {
-            Text(if (busy) "Collecting a diagnostics report..." else "Diagnostics report",
-                style = MaterialTheme.typography.labelLarge, color = Color(0xFF808080))
+                }
+            }, "hdri-diagnostics").start()
         }
-        status?.let {
-            Text(it, style = MaterialTheme.typography.bodySmall, color = Color(0xFF9A9A9A))
-        }
+    ) {
+        Text(if (busy) "Collecting..." else "Diagnostics report",
+            style = MaterialTheme.typography.labelLarge, color = Color(0xFF808080))
     }
 }
 
@@ -873,7 +915,7 @@ private fun ProcessingScreen(p: ProcessingService.State, onReview: (File) -> Uni
                 "started again from the capture screen.",
                 style = MaterialTheme.typography.bodySmall, color = Color(0xFFB0B0B0))
             Spacer(Modifier.height(14.dp))
-            DiagnosticsRow()
+            DiagnosticsLink()
         }
         if (p.finished) {
             Spacer(Modifier.height(22.dp))
