@@ -22,51 +22,96 @@
   30/54.762459 about your circle's centre. The digits are separate paths rather
   than one, so a handle can be moved without disturbing its neighbours.
 -->
+
 <svg
-   xmlns="http://www.w3.org/2000/svg"
-   xmlns:svg="http://www.w3.org/2000/svg"
-   xmlns:inkscape="http://www.inkscape.org/namespaces/inkscape"
-   xmlns:sodipodi="http://sodipodi.sourceforge.net/DTD/sodipodi-0.dtd"
    width="108"
    height="108"
    viewBox="0 0 108 108"
    version="1.1"
-   sodipodi:docname="logo.svg">
-
+   sodipodi:docname="logo.svg"
+   id="svg1"
+   inkscape:version="1.4.4 (unknown)"
+   xmlns:inkscape="http://www.inkscape.org/namespaces/inkscape"
+   xmlns:sodipodi="http://sodipodi.sourceforge.net/DTD/sodipodi-0.dtd"
+   xmlns="http://www.w3.org/2000/svg"
+   xmlns:svg="http://www.w3.org/2000/svg">
+  <defs
+     id="defs1" />
   <sodipodi:namedview
      pagecolor="#101014"
      bordercolor="#666666"
      inkscape:document-units="px"
      inkscape:showpageshadow="0"
-     inkscape:pagecheckerboard="0" />
-
+     inkscape:pagecheckerboard="0"
+     id="namedview1"
+     borderopacity="1"
+     inkscape:pageopacity="0"
+     inkscape:deskcolor="#d1d1d1"
+     inkscape:zoom="4.1805556"
+     inkscape:cx="39.468439"
+     inkscape:cy="27.627907"
+     inkscape:window-width="1920"
+     inkscape:window-height="1132"
+     inkscape:window-x="0"
+     inkscape:window-y="0"
+     inkscape:window-maximized="1"
+     inkscape:current-layer="digits" />
   <!-- Hide this layer to see the mark as a launcher will mask it. -->
-  <g inkscape:label="ground" inkscape:groupmode="layer" id="layer-ground">
-    <rect id="ground" x="0" y="0" width="108" height="108" fill="#101014" />
+  <g
+     inkscape:label="ground"
+     inkscape:groupmode="layer"
+     id="layer-ground">
+    <rect
+       id="ground"
+       x="0"
+       y="0"
+       width="108"
+       height="108"
+       fill="#101014" />
     <!-- The safe zone: nothing outside this circle is promised to be drawn. -->
-    <circle id="safe-zone" cx="54" cy="54" r="36" fill="none"
-            stroke="#FF8A80" stroke-width="0.3" stroke-dasharray="1.5,1.5"
-            opacity="0.5" />
+    <circle
+       id="safe-zone"
+       cx="54"
+       cy="54"
+       r="36"
+       fill="none"
+       stroke="#FF8A80"
+       stroke-width="0.3"
+       stroke-dasharray="1.5,1.5"
+       opacity="0.5" />
   </g>
-
-  <g inkscape:label="mark" inkscape:groupmode="layer" id="layer-mark">
+  <g
+     inkscape:label="mark"
+     inkscape:groupmode="layer"
+     id="layer-mark">
     <!-- The sphere. Lighter than the digits: it is what they sit in. -->
     <circle
        id="sphere"
-       cx="54" cy="54" r="30"
-       fill="none" stroke="#ECECEC" stroke-width="2.8" />
-
-    <g id="digits" fill="none" stroke="#FFC400" stroke-width="2.9"
-       stroke-linecap="round" stroke-linejoin="round">
+       cx="54"
+       cy="54"
+       r="30"
+       fill="none"
+       stroke="#ECECEC"
+       stroke-width="2.8" />
+    <g
+       id="digits"
+       fill="none"
+       stroke="#FFC400"
+       stroke-width="2.9"
+       stroke-linecap="round"
+       stroke-linejoin="round">
       <path
          id="three"
-         d="m 29.7658,44.5405 c 10.0850,-17.8616 19.8951,-7.9627 9.7297,9.1892 10.3205,19.7481 -2.6835,26.9921 -9.7297,7.3874" />
+         d="m 30.949792,44.625071 c 8.731866,-19.214735 19.387675,-1.197027 9.222275,9.104629 9.559362,14.335561 -2.56141,26.192411 -9.7297,7.3874"
+         sodipodi:nodetypes="ccc" />
       <path
          id="six"
-         d="m 63.2793,30.3063 c -7.2258,-3.6548 -18.8393,-2.5948 -17.2973,0.5405 13.2835,27.0086 -9.2376,50.1045 8.1081,49.9099 17.3457,-0.1946 12.1966,-24.8649 -3.9640,-24.8649" />
+         d="m 62.433591,30.475442 c -7.2258,-3.6548 -17.739878,-1.833662 -16.197878,1.301638 13.2835,27.0086 -8.086068,47.457344 7.854387,47.457344 19.376493,0 11.435462,-22.496915 -2.949149,-22.496915"
+         sodipodi:nodetypes="ccsc" />
       <path
          id="zero"
-         d="m 71.2072,35.5315 c -3.5657,-2.0711 -5.3497,-2.0239 -7.5676,1.0811 -7.0924,9.9293 3.2042,16.1579 4.8649,26.4865 1.6147,10.0429 5.0000,11.9470 9.5495,2.1622 5.9425,-12.7807 -0.4539,-23.3367 -6.8468,-29.7297 z" />
+         d="m 63.779721,37.718032 c -7.0924,9.9293 0.367792,16.525076 6.59487,26.213298 6.227079,9.688223 12.26718,-13.21019 2.946882,-24.847752 -5.058499,-6.316171 -7.217576,-4.350076 -9.541752,-1.365546 z"
+         sodipodi:nodetypes="czsc" />
     </g>
   </g>
 </svg>
