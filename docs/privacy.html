@@ -1,0 +1,60 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Privacy policy - 360 HDRI Camera</title>
+<style>
+:root { color-scheme: light dark; }
+body { max-width: 42rem; margin: 0 auto; padding: 2.5rem 1.25rem 5rem;
+       font: 16px/1.6 -apple-system, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+       color: #1c1c1e; background: #fbfbfa; }
+@media (prefers-color-scheme: dark) { body { color: #e6e6e6; background: #16171a; } code { background:#2a2c31; } a { color:#7ab8ff; } }
+h1 { font-size: 1.7rem; line-height: 1.25; margin: 0 0 .3rem; }
+h2 { font-size: 1.12rem; margin: 2.2rem 0 .5rem; }
+p, li { margin: .65rem 0; }
+ul { padding-left: 1.2rem; }
+code { background: #ececec; padding: .1em .35em; border-radius: 3px; font-size: .9em; }
+footer { margin-top: 3rem; font-size: .88rem; opacity: .7; }
+</style>
+</head>
+<body>
+<h1>Privacy policy — 360 HDRI Camera</h1>
+<p>Last updated 2026-09-06.</p>
+<h2>The short version</h2>
+<p>This app collects nothing, sends nothing and has no account. Everything it makes stays on the phone until you move it yourself.</p>
+<p>That is not a promise about intent, it is a property of the build: the app declares <strong>no network permission</strong> in its manifest, so it cannot open a network connection at all. Android will not let it. Every claim below follows from that.</p>
+<h2>What the app stores, and where</h2>
+<p>Captures live in the app&#x27;s own private storage, where only this app can read them. Each one holds:</p>
+<ul>
+<li>the raw frames as DNG files, and the app&#x27;s own working copies of them;</li>
+<li>a record of each frame — the exposure it was shot at and the direction the phone was pointing, from the phone&#x27;s own rotation sensor;</li>
+<li>the finished panorama, its preview image, and a report of what was measured;</li>
+<li>whatever you chose to call the sphere;</li>
+<li>a short capture log, kept so a capture that goes wrong can be explained. It is a text file in the same private storage, it is capped in size, and it never leaves the phone.</li>
+</ul>
+<p>Uninstalling the app deletes all of it. Automatic backup is switched off, so none of it is copied to a cloud backup either.</p>
+<h2>What is not collected</h2>
+<p>No analytics, no crash reporting, no advertising identifier, no device identifier, no contacts, no location. The app requests no location permission and reads no location data; the direction a frame was shot in is a compass and gyroscope reading relative to the room, not a position on the earth.</p>
+<h2>Permissions, and why each one is there</h2>
+<ul>
+<li><strong>Camera</strong> — to take the photographs. This is the app.</li>
+<li><strong>Foreground service</strong> and <strong>data sync</strong> — stitching a sphere takes minutes, and this keeps the work alive while it runs.</li>
+<li><strong>Wake lock</strong> — so that work does not stall when the screen goes off.</li>
+<li><strong>Notifications</strong> — to show the progress of that work. Declining it costs you the notification and nothing else.</li>
+<li><strong>Vibrate</strong> — the zenith is shot with the screen facing away from you, where a buzz is the only feedback you can use.</li>
+</ul>
+<p>There is deliberately no internet permission and no storage permission.</p>
+<h2>What leaves the phone, and only when you say so</h2>
+<p>Exporting a sphere writes an OpenEXR file into your Downloads folder, through Android&#x27;s own media store. That is a file you can then do anything with — it is the point of the app. Nothing else copies anything anywhere, and the app has no way to.</p>
+<h2>Children</h2>
+<p>The app has no accounts, no messaging, no user-generated content shared with anyone, and no data collection, so there is nothing here that treats children differently from anyone else.</p>
+<h2>Changes</h2>
+<p>If this ever changes — if some future version needs the network for something — it will need a new permission, which Android will show you at install or update time, and this document will say what it is used for before that version ships.</p>
+<h2>Contact</h2>
+<p>The app is free software under the GNU General Public License v3. The source is the authoritative answer to any question on this page: if the manifest has no <code>android.permission.INTERNET</code> in it, nothing above can be false.</p>
+<p>Questions about this policy: <a href="mailto:immineal@immineal.com">immineal@immineal.com</a></p>
+<footer>360 HDRI Camera &middot; package <code>com.immineal.hdri360</code> &middot;
+<a href="https://github.com/immineal/hdri360">source on GitHub</a></footer>
+</body>
+</html>
