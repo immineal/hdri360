@@ -64,6 +64,16 @@ android {
             proguardFiles(
                 getDefaultProguardFile("proguard-android-optimize.txt"),
                 "proguard-rules.pro")
+            // Play warns about native code shipped without debug symbols, so a
+            // crash inside a .so reads as an address and nothing else. Switched on
+            // and then measured: the bundle gained no
+            // BUNDLE-METADATA/.../nativeDebugMetadata entry and did not change
+            // size, because the only native code in it is
+            // libandroidx.graphics.path.so - four ABIs, ten kilobytes each -
+            // which arrives from AndroidX already stripped and is not built here.
+            // The warning therefore stays, and this line is here for the day the
+            // project has native code of its own, when it will do the work.
+            ndk { debugSymbolLevel = "FULL" }
         }
     }
     packaging { jniLibs { useLegacyPackaging = false } }
