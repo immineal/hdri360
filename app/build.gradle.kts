@@ -29,7 +29,9 @@ android {
         applicationId = "com.immineal.hdri360"
         minSdk = 26              // Camera2 FULL with RAW is realistic from Oreo up
         targetSdk = 37
-        versionCode = 1
+        // 1 was uploaded to Play before the foreground service came out; a
+        // version code cannot be used twice even for a draft that never rolled.
+        versionCode = 2
         versionName = "1.0"
     }
 

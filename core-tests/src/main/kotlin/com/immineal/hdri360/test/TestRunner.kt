@@ -2,6 +2,7 @@ package com.immineal.hdri360.test
 
 import com.immineal.hdri360.test.suites.BracketPlannerSuite
 import com.immineal.hdri360.test.suites.CameraModelSuite
+import com.immineal.hdri360.test.suites.CaptureStageSuite
 import com.immineal.hdri360.test.suites.CaptureSuite
 import com.immineal.hdri360.test.suites.FrameStoreSuite
 import com.immineal.hdri360.test.suites.TrackingSuite
@@ -57,6 +58,7 @@ object TestRunner {
         "ImageSuite" to ::ImageSuite,
         "CameraModelSuite" to ::CameraModelSuite,
         "MeteringSuite" to ::MeteringSuite,
+        "CaptureStageSuite" to ::CaptureStageSuite,
         "BracketPlannerSuite" to ::BracketPlannerSuite,
         "MergeSuite" to ::MergeSuite,
         "ResponseCurveSuite" to ::ResponseCurveSuite,

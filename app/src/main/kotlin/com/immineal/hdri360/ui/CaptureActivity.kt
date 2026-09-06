@@ -110,6 +110,9 @@ class CaptureActivity : ComponentActivity() {
         // A sphere takes minutes of aiming; the screen going out mid-capture would
         // stop the sensors and lose the pose.
         window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+        // A stitch that was killed rather than finished leaves its progress
+        // notification behind; this is the first code that runs afterwards.
+        ProcessingService.clearStaleProgress(this)
         session = CaptureSession(this) { dir -> pending = dir }
 
         setContent {
@@ -203,7 +206,12 @@ class CaptureActivity : ComponentActivity() {
                         }
                         state.phase == CaptureUiState.Phase.IDLE && wanted == null ->
                             StartScreen(state, ::openReview, ::openLibrary, { intro = true },
-                                ::openAbout, session::discard) { lens, resume ->
+                                ::openAbout, session::discard,
+                                // Straight to the size picker, which is where
+                                // processing starts from. The capture is already
+                                // shot; there is nothing to go back to the camera
+                                // for.
+                                onProcess = { dir -> pending = dir }) { lens, resume ->
                                 wanted = Pair(lens, resume)
                             }
                         else -> {
@@ -300,6 +308,7 @@ private fun StartScreen(
     onHelp: () -> Unit,
     onAbout: () -> Unit,
     onDiscard: (File) -> Unit,
+    onProcess: (File) -> Unit,
     onStart: (String, File?) -> Unit
 ) {
     // The person's own choice if they made one, and otherwise whatever the app
@@ -380,6 +389,25 @@ private fun StartScreen(
             Spacer(Modifier.height(12.dp))
             Text(state.message, color = Color(0xFFFF8A80),
                 style = MaterialTheme.typography.bodySmall)
+        }
+
+        // Shot in full, never stitched. Since the foreground service went (decision
+        // 15) this is what closing the app during processing leaves behind, so it
+        // says what happened and offers the door that actually helps.
+        state.unprocessed?.let { dir ->
+            Spacer(Modifier.height(18.dp))
+            Card(Modifier.fillMaxWidth()) {
+                Row(Modifier.padding(start = 14.dp, end = 6.dp, top = 6.dp, bottom = 6.dp),
+                    verticalAlignment = Alignment.CenterVertically) {
+                    Column(Modifier.weight(1f)) {
+                        Text("Shot, not processed", style = MaterialTheme.typography.titleSmall)
+                        Text("every frame is on the phone",
+                            style = MaterialTheme.typography.bodySmall,
+                            color = Color(0xFF9A9A9A))
+                    }
+                    TextButton({ onProcess(dir) }) { Text("Continue processing") }
+                }
+            }
         }
 
         state.resumable?.let { dir ->
@@ -859,6 +887,12 @@ private fun ReadyScreen(dir: File, onChoose: (Int) -> Unit) {
         Text("Every frame is already on the phone. Pick an output size; the times " +
             "below were measured on this device just now.",
             style = MaterialTheme.typography.bodyMedium, color = Color(0xFFB0B0B0))
+        Spacer(Modifier.height(12.dp))
+        // Said here, before the choice, because the choice is how long the app
+        // has to stay open for. See decision 15.
+        Text("Keep the app open while it works. The screen may go off, but " +
+            "closing the app stops the sphere being built.",
+            style = MaterialTheme.typography.bodySmall, color = Color(0xFFFFC400))
         Spacer(Modifier.height(20.dp))
         val list = options
         if (list == null) {
@@ -907,12 +941,26 @@ private fun ProcessingScreen(p: ProcessingService.State, onReview: (File) -> Uni
         if (!p.finished && p.remainingText.isNotEmpty())
             Text(p.remainingText, style = MaterialTheme.typography.bodySmall,
                 color = Color(0xFFB0B0B0))
+        if (!p.finished) {
+            Spacer(Modifier.height(18.dp))
+            // The whole of the promise, in the place where somebody is deciding
+            // whether they can put the phone down: what stops it, what survives,
+            // and where to pick it up. Decision 15.
+            Text("Leave the app open", style = MaterialTheme.typography.titleSmall,
+                color = Color(0xFFFFC400))
+            Spacer(Modifier.height(4.dp))
+            Text("The screen can go off and this carries on. Closing the app stops " +
+                "it, and then nothing is lost but the arithmetic: every frame stays " +
+                "on the phone, and the start screen offers to continue processing " +
+                "from them.",
+                style = MaterialTheme.typography.bodySmall, color = Color(0xFFB0B0B0))
+        }
         if (p.error != null) {
             Spacer(Modifier.height(12.dp))
             Text(p.error, color = Color(0xFFFF8A80), style = MaterialTheme.typography.bodySmall)
             Spacer(Modifier.height(6.dp))
-            Text("The frames are still on the phone; nothing was lost. Processing can be " +
-                "started again from the capture screen.",
+            Text("The frames are still on the phone; nothing was lost. The start screen " +
+                "offers to continue processing them.",
                 style = MaterialTheme.typography.bodySmall, color = Color(0xFFB0B0B0))
             Spacer(Modifier.height(14.dp))
             DiagnosticsLink()

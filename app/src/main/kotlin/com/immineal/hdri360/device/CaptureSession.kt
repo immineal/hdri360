@@ -22,6 +22,7 @@ import com.immineal.hdri360.core.capture.SphereLibrary
 import com.immineal.hdri360.core.hdr.BracketPlan
 import com.immineal.hdri360.core.image.ImageF
 import com.immineal.hdri360.core.math.Mat3
+import com.immineal.hdri360.core.pipeline.CaptureStage
 import com.immineal.hdri360.core.pano.CaptureTarget
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
@@ -50,7 +51,16 @@ class CaptureUiState(
     /** The most recent sphere that has been built, if there is one to look at. */
     @JvmField val finished: File? = null,
     /** True while the sweep is holding on for an unclipped look at the bright end. */
-    @JvmField val waitingForHighlights: Boolean = false
+    @JvmField val waitingForHighlights: Boolean = false,
+    /**
+     * A capture that is shot in full and has no sphere yet, if there is one.
+     *
+     * Its own field rather than a flag on [resumable] because the two lead to
+     * different doors: this one wants processing, that one wants the sweep. Last
+     * in the list because the positional callers above it were written before it
+     * existed.
+     */
+    @JvmField val unprocessed: File? = null
 ) {
     enum class Phase { IDLE, OPENING, SCANNING, CAPTURING, FINISHED, FAILED }
 }
@@ -126,6 +136,7 @@ class CaptureSession(
             lenses = lenses,
             chosenLens = LensChooser.default(lenses)?.id,
             resumable = unfinishedCapture(),
+            unprocessed = unprocessedCapture(),
             finished = finishedCapture())
     }
 
@@ -176,28 +187,48 @@ class CaptureSession(
      * on from where it stopped, which for an empty capture means starting over
      * while sounding like it will not.
      */
-    fun unfinishedCapture(): File? {
+    fun unfinishedCapture(): File? = mostRecent(CaptureStage.PARTLY_SHOT)
+
+    /**
+     * A capture that was shot in full and has no sphere: the stitch never ran, or
+     * ran and was interrupted.
+     *
+     * Since decision 15 took the foreground service away this is an ordinary
+     * outcome rather than a rare one - close the app during processing and the
+     * arithmetic stops - so it gets its own offer. Before this it wore the
+     * unfinished capture's label and the only route back was into the sweep,
+     * which for a sphere that is already completely shot is the wrong door.
+     */
+    fun unprocessedCapture(): File? = mostRecent(CaptureStage.SHOT_NOT_PROCESSED)
+
+    private fun mostRecent(want: CaptureStage): File? {
         val dirs = root.listFiles() ?: return null
-        val candidates = dirs.filter { it.isDirectory && File(it, FrameStore.SESSION).isFile &&
-                             !File(it, DONE).isFile &&
-                             File(it, FrameStore.JOURNAL).length() > 0 }
+        return dirs.filter { it.isDirectory }
             .sortedByDescending { it.lastModified() }
-        // A journal with something in it is not the same as a capture worth
-        // going back to. A capture that never completed a single direction has
-        // nothing to resume - resuming it starts the sweep over anyway - and
-        // offering it is worse than not: a failed evening leaves a row on the
-        // start screen saying there is work to continue, and there is not.
-        for (d in candidates) if (hasACompleteDirection(d)) return d
-        return null
+            .firstOrNull { stageOf(it) == want }
     }
 
-    /** Whether any one direction in [dir] has all of its rungs on disk. */
-    private fun hasACompleteDirection(dir: File): Boolean {
-        val store = try { FrameStore.open(dir) } catch (e: Exception) { null } ?: return false
+    /**
+     * The three facts on disk, handed to [CaptureStage].
+     *
+     * A journal with something in it is not the same as a capture worth going
+     * back to, which is why the mask is read rather than the file sizes: a
+     * capture that never completed a single direction has nothing to resume, and
+     * offering it leaves a row on the start screen promising work to continue
+     * where there is none.
+     */
+    private fun stageOf(dir: File): CaptureStage {
+        val hasSession = File(dir, FrameStore.SESSION).isFile
+        val hasDone = File(dir, DONE).isFile
+        if (!hasSession) return CaptureStage.NOTHING_SHOT
+        if (hasDone) return CaptureStage.PROCESSED
+        if (File(dir, FrameStore.JOURNAL).length() <= 0) return CaptureStage.NOTHING_SHOT
+        val store = try { FrameStore.open(dir) } catch (e: Exception) { null }
+            ?: return CaptureStage.NOTHING_SHOT
         return try {
-            store.shotMask().any { it }
+            CaptureStage.of(true, false, store.shotMask())
         } catch (e: Exception) {
-            false
+            CaptureStage.NOTHING_SHOT
         } finally {
             try { store.close() } catch (e: Exception) { /* nothing left to do about it */ }
         }

@@ -1083,3 +1083,100 @@ pairs, which is the shading map that was never recorded and is now asked for on
 the right request; that half is waiting on a capture to confirm.
 
 The suite stands at 33 suites and 513,314 assertions.
+
+# Decision 15: the foreground service goes, and the way back is made plain
+
+**2026-09-06, while the first release was being filed.**
+
+Play refused the closed testing release with one error: an app that declares
+`FOREGROUND_SERVICE_DATA_SYNC` must fill in a Foreground service permissions
+declaration, and every branch of that form - media transcoding, importing and
+exporting, "other" - requires **a link to a video demonstrating the use**. Not a
+text explanation. A video, hosted somewhere Google can open it. The Save button
+stays dead without one.
+
+That is a strange price for a service whose whole job is to survive the screen
+going off, so the service goes instead.
+
+## What changes
+
+`FOREGROUND_SERVICE` and `FOREGROUND_SERVICE_DATA_SYNC` leave the manifest,
+`android:foregroundServiceType` leaves the `<service>`, and `ProcessingService`
+no longer calls `startForeground`. It stays a started service with an ordinary
+progress notification and it keeps its partial wake lock, so processing still
+runs with the screen off for as long as the process lives. What it loses is the
+protection: swipe the app away and the process goes with it, and the stitch stops
+where it stopped.
+
+## What that costs, honestly
+
+Nothing that was already on disk. The frames are written during the capture and
+`store.deleteWorkingFiles()` only runs after the EXR is finished, so an
+interrupted run leaves every DNG exactly where it was. What is lost is the
+arithmetic already done: the run starts again from the frames.
+
+Resuming the arithmetic itself was considered and deferred. The merged
+directions are already parked one file at a time in `FrameSpool`, written to a
+`.part` and renamed, so the ones finished before the kill survive - but each
+frame's `FrameOptics` lives only in the heap, and the `finally` deletes the
+directory. Persisting the optics beside each frame and skipping the merged
+directions on a second run would save **about half the total time**: merging was
+9406 ms of a 13.6 s solve on the measured 34-direction bundle, and the solve is
+about 70% of the bar. That is a change to `core`, and it is the next version's
+work, not this one's.
+
+## What the person sees
+
+Three places, because the promise has to be visible before, during and after:
+
+  - **Before.** The ready screen, where the output size is picked, says that
+    processing needs the app open.
+  - **During.** The processing screen says it again, with what happens if it is
+    interrupted: nothing is lost, it starts again from the frames.
+  - **After.** The start screen tells a capture that was fully shot but never
+    processed apart from one that was never finished shooting, and offers
+    **Continue processing** rather than sending the person back into the sweep.
+    That was the real gap: before this, an interrupted stitch looked exactly like
+    an abandoned capture and the only offered route was to shoot it again.
+
+## The classification, and why it is in core
+
+`CaptureStage.of(hasSession, hasDone, shot)` is a pure function of three facts:
+whether the capture directory has a session header, whether the `processed`
+marker is there, and which directions have all their rungs on disk. It returns
+NOTHING_SHOT, PARTLY_SHOT, SHOT_NOT_PROCESSED or PROCESSED. It sits in `core`
+rather than in `CaptureSession` so the suite can pin every case without an
+Android device; `CaptureSession` reads the three facts off the store and asks it.
+
+## What the phone actually did
+
+Measured on the Pixel 9a with the service already gone, on a fresh 21-direction
+ultrawide capture, 95 frames, output 8192 x 4096. Progress read off the
+notification's own `android.progress` field out of 1000, CPU off `top`:
+
+| Interrupted how | What happened |
+|---|---|
+| Back, out of the processing screen | keeps running; stage moved merging -> blending |
+| Home, app backgrounded 90 s | keeps running; 71 -> 129 of 1000, CPU 300-330% |
+| Screen off, 50 s | keeps running; 856 -> 904 of 1000, CPU 130-290% |
+| Process killed, as swiping it away does | stops at once |
+
+So the wake lock does its job and the ordinary process survives being put down;
+what kills the stitch is the app being taken away, which is what the three
+notices say.
+
+Two things the kill left behind, both found by running it rather than by reading
+the code, and both now cleared:
+
+  - **The progress notification outlived its job.** The service cancels it in a
+    `finally`, and a killed process never reaches one, so "Building the sphere"
+    sat on the shade with the bar frozen where it stopped. `clearStaleProgress`
+    runs at the next start of the app, before anything else, and takes it down.
+  - **262 MB of scratch.** The merged frames are parked in `work/` and deleted in
+    that same `finally`: 21 frames after the first kill, 19 after the second, plus
+    a zero-byte `panorama.exr.part` where the writer had just opened its file. The
+    next run clears them before it parks its own, and says so in the log:
+    `clearing 21 parked frames from an interrupted run`.
+
+The route back was walked end to end: kill mid-stitch, reopen, **Shot, not
+processed / Continue processing**, size picker, and the sphere comes out.

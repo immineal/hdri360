@@ -2,12 +2,11 @@
 <manifest xmlns:android="http://schemas.android.com/apk/res/android">
 
     <uses-permission android:name="android.permission.CAMERA" />
-    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
-    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_DATA_SYNC" />
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
-    <!-- Stitching a sphere is minutes of solid arithmetic, and a foreground
-         service does not by itself stop the device suspending when the screen
-         goes off - which is exactly when somebody pockets the phone. -->
+    <!-- Stitching a sphere is minutes of solid arithmetic and the process is
+         an ordinary one now - see decision 15 - so the wake lock is what keeps it
+         moving when the screen goes off. It does not survive the app being swiped
+         away, and the app says so before, during and after. -->
     <uses-permission android:name="android.permission.WAKE_LOCK" />
     <!-- The zenith is shot with the screen facing the floor; the only feedback
          a person can use up there is one they can feel. -->
@@ -56,9 +55,12 @@
             android:exported="false"
             android:configChanges="orientation|screenSize|keyboardHidden" />
 
+        <!-- Not a foreground service. Play requires a demonstration video for
+             every branch of the FOREGROUND_SERVICE_DATA_SYNC declaration, which is
+             a strange price for keeping arithmetic alive; decision 15 has the
+             reasoning and what the app shows the person instead. -->
         <service
             android:name=".device.ProcessingService"
-            android:exported="false"
-            android:foregroundServiceType="dataSync" />
+            android:exported="false" />
     </application>
 </manifest>

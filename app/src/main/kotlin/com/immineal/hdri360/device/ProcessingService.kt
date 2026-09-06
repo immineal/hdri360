@@ -6,7 +6,6 @@ import android.app.NotificationManager
 import android.app.Service
 import android.content.Context
 import android.content.Intent
-import android.content.pm.ServiceInfo
 import android.graphics.Bitmap
 import android.os.Build
 import android.os.IBinder
@@ -38,13 +37,20 @@ import java.util.Locale
 import java.util.concurrent.atomic.AtomicBoolean
 
 /**
- * Builds the sphere, in the foreground, with a real estimate attached.
+ * Builds the sphere, with a real estimate attached.
  *
- * A foreground service rather than a background thread because this runs for
- * minutes on a hot phone with the screen off, and anything less gets killed
- * partway through - which on the predecessor meant losing the whole capture,
- * since nothing was written until the end. Here the frames are already safely on
- * disk, so the worst case is that the processing has to be started again.
+ * This was a foreground service, for the obvious reason: it runs for minutes on
+ * a hot phone with the screen off. Play will not take one without a video
+ * demonstrating the permission, so decision 15 gave it up. What is left is an
+ * ordinary started service with a progress notification and a partial wake lock,
+ * which keeps the arithmetic moving while the screen is off but not once the
+ * person swipes the app away.
+ *
+ * The cost of that is bounded and the app says so in three places: the frames are
+ * on disk from the moment they were shot and `deleteWorkingFiles` only runs after
+ * the EXR is renamed into place, so an interrupted run loses the arithmetic and
+ * nothing else. The start screen then offers to process the capture rather than
+ * to shoot it again - see [CaptureStage].
  */
 class ProcessingService : Service() {
 
@@ -72,7 +78,7 @@ class ProcessingService : Service() {
         if (path == null) { stopSelf(); return START_NOT_STICKY }
         if (!running.compareAndSet(false, true)) return START_NOT_STICKY
 
-        startForegroundSafely()
+        startNotifying()
         Thread({ run(File(path), width) }, "hdri-processing").apply { isDaemon = false }.start()
         return START_NOT_STICKY
     }
@@ -128,6 +134,15 @@ class ProcessingService : Service() {
             // working at an eighth of the sensor to hold data the renderer only ever
             // reads one frame at a time.
             val workDir = File(dir, WORK)
+            // Scratch from a run that was killed rather than finished.
+            //
+            // The finally below clears this, and a killed process never reaches
+            // its finally: measured on the phone, swiping the app away mid-stitch
+            // left 21 merged frames and 262 MB behind, plus a zero-byte
+            // panorama.exr.part where the writer had just opened its file. Both
+            // are dead weight the moment the run they belong to is gone, and the
+            // next run is exactly the moment somebody is here to clear them.
+            clearScratch(dir, workDir)
             val needed = FrameSpool.bytesNeeded(inputs.size, workingPixels, 3)
             val free = dir.usableSpace
             CaptureLog.log("parking ${inputs.size} merged frames in $workDir: " +
@@ -256,9 +271,18 @@ class ProcessingService : Service() {
             try { if (wake?.isHeld == true) wake.release() }
             catch (e: Exception) { CaptureLog.warn("wake lock: " + e) }
             running.set(false)
-            stopForegroundCompat()
+            clearProgressNotification()
             stopSelf()
         }
+    }
+
+    /** Removes what a killed run left behind, before a new one writes over it. */
+    private fun clearScratch(dir: File, workDir: File) {
+        val stale = workDir.listFiles()?.size ?: 0
+        if (stale > 0) CaptureLog.log("clearing $stale parked frames from an interrupted run")
+        workDir.listFiles()?.forEach { it.delete() }
+        workDir.delete()
+        File(dir, "panorama.exr.part").delete()
     }
 
     private fun writePreview(dir: File, result: HdriPipeline.Result) {
@@ -324,29 +348,31 @@ class ProcessingService : Service() {
 
     // ------------------------------------------------------------ notification
 
-    private fun startForegroundSafely() {
+    /**
+     * The progress notification, without the foreground promise behind it.
+     *
+     * It is the same notification it always was and it is still worth having -
+     * it is where the person watches a job they have left running - it just no
+     * longer keeps the process alive.
+     */
+    private fun startNotifying() {
         val nm = getSystemService(NotificationManager::class.java)
         if (Build.VERSION.SDK_INT >= 26 && nm?.getNotificationChannel(CHANNEL) == null) {
             nm?.createNotificationChannel(NotificationChannel(CHANNEL, "Processing",
                 NotificationManager.IMPORTANCE_LOW))
         }
-        val n = build("Preparing", 0.0)
-        if (Build.VERSION.SDK_INT >= 34)
-            startForeground(NOTIFICATION_ID, n, ServiceInfo.FOREGROUND_SERVICE_TYPE_DATA_SYNC)
-        else startForeground(NOTIFICATION_ID, n)
+        nm?.notify(NOTIFICATION_ID, build("Preparing", 0.0))
     }
 
     /**
-     * Takes the progress notification away with the service.
+     * Takes the progress notification away with the job.
      *
-     * Detaching left it on the shade with a full progress bar and no job behind
-     * it, which is a notification that lies about the state of the phone. What is
-     * worth leaving is a single line saying it finished - and that one dismisses
-     * itself.
+     * Leaving it behind puts a full progress bar and no job on the shade, which
+     * is a notification that lies about the state of the phone. What is worth
+     * leaving is a single line saying it finished, and that one dismisses itself.
      */
-    private fun stopForegroundCompat() {
-        if (Build.VERSION.SDK_INT >= 24) stopForeground(Service.STOP_FOREGROUND_REMOVE)
-        else @Suppress("DEPRECATION") stopForeground(true)
+    private fun clearProgressNotification() {
+        getSystemService(NotificationManager::class.java)?.cancel(NOTIFICATION_ID)
     }
 
     private fun notify(stage: String, fraction: Double) {
@@ -465,6 +491,21 @@ class ProcessingService : Service() {
         @JvmStatic
         fun acknowledge() { flow.value = State() }
 
+        /**
+         * Takes down a progress notification whose job is not there any more.
+         *
+         * The service clears its own notification in a finally, and a process
+         * that is killed never runs one: measured on the phone, swiping the app
+         * away mid-stitch left "Building the sphere" on the shade for ever, with
+         * a bar frozen at whatever fraction it had reached. The next start of the
+         * app is the first moment anything is running that can take it down.
+         */
+        @JvmStatic
+        fun clearStaleProgress(context: Context) {
+            if (flow.value.active) return
+            context.getSystemService(NotificationManager::class.java)?.cancel(NOTIFICATION_ID)
+        }
+
         @JvmStatic
         @JvmOverloads
         fun start(context: Context, dir: File, width: Int = 8192) {
@@ -472,8 +513,10 @@ class ProcessingService : Service() {
                 .putExtra(EXTRA_DIR, dir.absolutePath)
                 .putExtra(EXTRA_WIDTH, width)
             publish(State(true, "Queued", 0.0))
-            if (Build.VERSION.SDK_INT >= 26) context.startForegroundService(i)
-            else context.startService(i)
+            // An ordinary started service now. startForegroundService would
+            // promise a startForeground within five seconds and crash the app
+            // when it never came.
+            context.startService(i)
         }
 
         /**
