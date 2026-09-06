@@ -1,0 +1,20 @@
+<?xml version="1.0" encoding="UTF-8" standalone="no"?>
+<!--
+  The store icon. Same mark as logo.svg, but scaled up: the Play listing is not
+  an adaptive icon, so the launcher's 72-unit safe zone does not apply here and
+  the ring can run out to 81% of the canvas instead of 56%. Google masks this to
+  a rounded square, which a circle of this diameter sits comfortably inside.
+  Render: inkscape -w 512 -h 512 icon-store.svg -o icon-512.png
+-->
+<svg width="512" height="512" viewBox="0 0 108 108" version="1.1"
+     xmlns="http://www.w3.org/2000/svg">
+  <rect x="0" y="0" width="108" height="108" fill="#101014"/>
+  <g transform="translate(54,54) scale(1.45) translate(-54,-54)">
+    <circle cx="54" cy="54" r="30" fill="none" stroke="#ECECEC" stroke-width="2.8"/>
+    <g fill="none" stroke="#FFC400" stroke-width="2.9" stroke-linecap="round" stroke-linejoin="round">
+      <path d="m 30.949792,44.625071 c 8.731866,-19.214735 19.387675,-1.197027 9.222275,9.104629 9.559362,14.335561 -2.56141,26.192411 -9.7297,7.3874"/>
+      <path d="m 62.433591,30.475442 c -7.2258,-3.6548 -17.739878,-1.833662 -16.197878,1.301638 13.2835,27.0086 -8.086068,47.457344 7.854387,47.457344 19.376493,0 11.435462,-22.496915 -2.949149,-22.496915"/>
+      <path d="m 63.779721,37.718032 c -7.0924,9.9293 0.367792,16.525076 6.59487,26.213298 6.227079,9.688223 12.26718,-13.21019 2.946882,-24.847752 -5.058499,-6.316171 -7.217576,-4.350076 -9.541752,-1.365546 z"/>
+    </g>
+  </g>
+</svg>

@@ -1,0 +1,27 @@
+<?xml version="1.0" encoding="UTF-8" standalone="no"?>
+<!--
+  The lockup: the mark and the name, in the proportions they should always keep.
+
+  The mark draws the 360, so the words beside it are only "HDRI Camera" - read
+  together they are the app's full name, "360 HDRI Camera", with nothing said
+  twice. Do not set the digits again in type next to this.
+
+  Geometry: the ring's outer edge is the left edge of the box, the cap height of
+  the name is centred on the ring's centre, and the gap between them is a quarter
+  of the ring's diameter. Scale the whole file; do not move the parts.
+
+  The type is Roboto Medium, the same family the app itself draws in.
+-->
+<svg width="403.8" height="62.8" viewBox="0 0 403.8 62.8" version="1.1"
+     xmlns="http://www.w3.org/2000/svg">
+  <g transform="translate(-22.6,-22.6)">
+    <circle cx="54" cy="54" r="30" fill="none" stroke="#ECECEC" stroke-width="2.8"/>
+    <g fill="none" stroke="#FFC400" stroke-width="2.9" stroke-linecap="round" stroke-linejoin="round">
+      <path d="m 30.949792,44.625071 c 8.731866,-19.214735 19.387675,-1.197027 9.222275,9.104629 9.559362,14.335561 -2.56141,26.192411 -9.7297,7.3874"/>
+      <path d="m 62.433591,30.475442 c -7.2258,-3.6548 -17.739878,-1.833662 -16.197878,1.301638 13.2835,27.0086 -8.086068,47.457344 7.854387,47.457344 19.376493,0 11.435462,-22.496915 -2.949149,-22.496915"/>
+      <path d="m 63.779721,37.718032 c -7.0924,9.9293 0.367792,16.525076 6.59487,26.213298 6.227079,9.688223 12.26718,-13.21019 2.946882,-24.847752 -5.058499,-6.316171 -7.217576,-4.350076 -9.541752,-1.365546 z"/>
+    </g>
+  </g>
+  <text x="77.8" y="50.6" font-family="Roboto" font-weight="500"
+        font-size="54" fill="#F2F2F2">HDRI Camera</text>
+</svg>

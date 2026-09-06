@@ -7,9 +7,9 @@ Last updated 2026-09-06.
 This app collects nothing, sends nothing and has no account. Everything it makes
 stays on the phone until you move it yourself.
 
-That is not a promise about intent, it is a property of the build: the app
-declares **no network permission** in its manifest, so it cannot open a network
-connection at all. Android will not let it. Every claim below follows from that.
+The app declares **no network permission** in its manifest, so it cannot open a
+network connection at all. Android will not let it. Every claim below follows
+from that one fact about the build.
 
 ## What the app stores, and where
 
